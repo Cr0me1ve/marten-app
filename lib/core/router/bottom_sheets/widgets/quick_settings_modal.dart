@@ -1,0 +1,58 @@
+import 'package:flutter/material.dart';
+import 'package:gap/gap.dart';
+import 'package:marten/core/localization/translations.dart';
+import 'package:marten/features/settings/data/config_option_repository.dart';
+import 'package:marten/singbox/model/singbox_config_enum.dart';
+import 'package:hooks_riverpod/hooks_riverpod.dart';
+
+class QuickSettingsModal extends HookConsumerWidget {
+  const QuickSettingsModal({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final t = ref.watch(translationsProvider).requireValue;
+
+    return SafeArea(
+      child: SingleChildScrollView(
+        child: Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16).copyWith(top: 16),
+              child: SegmentedButton(
+                showSelectedIcon: false,
+                segments: ServiceMode.choices
+                    .map(
+                      (e) => ButtonSegment(
+                        value: e,
+                        label: Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 8),
+                          child: Text(e.presentShort(t), textAlign: TextAlign.center),
+                        ),
+                        // tooltip: e.isExperimental ? t.settings.experimental : null,
+                      ),
+                    )
+                    .toList(),
+                selected: {ref.watch(ConfigOptions.serviceMode)},
+                onSelectionChanged: (newSet) => ref.read(ConfigOptions.serviceMode.notifier).update(newSet.first),
+              ),
+            ),
+            // ListTile(
+
+            //   leading: const Icon(Icons.content_cut_rounded),
+            //   title: Text(t.pages.settings.tlsTricks.title),
+            //   onTap: () {
+            //     context.pop();
+            //     context.goNamed('tlsTricks');
+            //   },
+            //   trailing: Switch.adaptive(
+            //     value: ref.watch(ConfigOptions.enableTlsFragment),
+            //     onChanged: ref.read(ConfigOptions.enableTlsFragment.notifier).update,
+            //   ),
+            // ),
+            const Gap(16),
+          ],
+        ),
+      ),
+    );
+  }
+}

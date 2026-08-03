@@ -1,0 +1,52 @@
+enum ProxyType {
+  direct("Direct"),
+  block("Block"),
+  dns("DNS"),
+  socks("SOCKS"),
+  http("HTTP"),
+  shadowsocks("Shadowsocks"),
+  vmess("VMess"),
+  trojan("Trojan"),
+  naive("Naive"),
+  wireguard("WireGuard"),
+  awg("AWG"),
+  hysteria("Hysteria"),
+  tor("Tor"),
+  ssh("SSH"),
+  shadowtls("ShadowTLS"),
+  shadowsocksr("ShadowsocksR"),
+  vless("vless"),
+  tuic("TUIC"),
+  hysteria2("Hysteria2"),
+  mieru("Mieru"),
+  turncoat("TURNcoat"),
+  icmp("ICMP/WireGuard"),
+
+  selector("Selector"),
+  urltest("URLTest"),
+  balancer("Balancer"),
+
+  xvless("vless"),
+  xvmess("xVMess"),
+  xtrojan("xTrojan"),
+  xfreedom("xFragment"),
+  xshadowsocks("xShadowsocks"),
+  xsocks("xSocks"),
+  invalid("Invalid"),
+  unknown("Unknown");
+
+  const ProxyType(this.label);
+
+  final String label;
+
+  String get key => name;
+
+  static List<ProxyType> groupValues = [selector, urltest, balancer];
+
+  bool get isGroup => ProxyType.groupValues.contains(this);
+  static final Map<String, ProxyType> _keyMap = {
+    ...Map.fromEntries(ProxyType.values.map((e) => MapEntry(e.key, e))),
+    "amneziawg": awg,
+  };
+  static ProxyType fromJson(dynamic type) => _keyMap[(type as String?)?.toLowerCase()] ?? ProxyType.unknown;
+}

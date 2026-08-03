@@ -1,0 +1,157 @@
+
+plugins { 
+    id "com.android.application" 
+    id "com.google.gms.google-services" apply false
+    id "org.jetbrains.kotlin.android" 
+    id "dev.flutter.flutter-gradle-plugin" 
+    id "com.google.protobuf" version "0.9.4" 
+    id "com.squareup.wire" version "5.3.1"
+}
+
+if (file("google-services.json").exists()) {
+    apply plugin: "com.google.gms.google-services"
+}
+
+wire {
+    kotlin {
+        android = true
+    }
+    protoPath {
+        srcDir 'src/main/protos'
+    }
+    sourcePath {
+        srcDir 'src/main/protos/'
+        include '**'
+    }
+}
+
+
+def localProperties = new Properties()
+def localPropertiesFile = rootProject.file('local.properties')
+if (localPropertiesFile.exists()) {
+    localPropertiesFile.withReader('UTF-8') { reader ->
+        localProperties.load(reader)
+    }
+}
+
+boolean hasKeyStore = false
+
+def keystoreProperties = new Properties()
+def keystorePropertiesFile = rootProject.file('key.properties')
+if (keystorePropertiesFile.exists()) {
+    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+    hasKeyStore = true
+} else {
+    println "+++"
+    println "No keystore defined. The app will not be signed."
+    println "Create a android/key.properties file with the following properties:"
+    println "storePassword"
+    println "keyPassword"
+    println "keyAlias"
+    println "storeFile"
+    println "+++"
+}
+
+def flutterVersionCode = localProperties.getProperty('flutter.versionCode')?: '1'
+
+def flutterVersionName = localProperties.getProperty('flutter.versionName') ?: '1.0'
+
+android {
+    namespace 'app.marten.client'
+    testNamespace "test.app.marten.client"
+    compileSdkVersion 36
+    ndkVersion "28.2.13676358"
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+
+    sourceSets {
+        main.java.srcDirs += 'src/main/kotlin'
+    }
+
+    defaultConfig {
+        applicationId "app.marten.client"
+        minSdkVersion flutter.minSdkVersion
+        targetSdkVersion 36
+        versionCode flutterVersionCode.toInteger()
+        versionName flutterVersionName
+        multiDexEnabled true
+    }
+
+    packagingOptions {
+        jniLibs {
+            //noinspection ChromeOsAbiSupport
+            excludes += ["lib/x86_64/**", "lib/x86/**", "lib/armeabi-v7a/**"]
+            useLegacyPackaging = true
+        }
+    }
+
+    if (hasKeyStore) {
+        signingConfigs {
+            release {
+                keyAlias keystoreProperties['keyAlias']
+                keyPassword keystoreProperties['keyPassword']
+                storeFile file(keystoreProperties['storeFile'])
+                storePassword keystoreProperties['storePassword']
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            if (hasKeyStore) {
+                signingConfig signingConfigs.release
+            } else {
+                signingConfig signingConfigs.debug
+            }
+            ndk {
+                debugSymbolLevel 'SYMBOL_TABLE'
+            }
+        }
+    }
+
+    buildFeatures {
+        viewBinding true
+        aidl true
+    }
+
+}
+
+android.applicationVariants.all { variant ->
+    variant.outputs.each { output ->
+        output.versionCodeOverride = android.defaultConfig.versionCode
+    }
+}
+
+flutter {
+    source '../..'
+}
+
+dependencies {
+    implementation fileTree(dir: 'libs', include: ['*.jar', '*.aar'])
+
+    implementation 'com.google.code.gson:gson:2.11.0'
+    implementation 'androidx.core:core-ktx:1.16.0'
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'androidx.lifecycle:lifecycle-livedata-ktx:2.8.7'
+    implementation "androidx.compose.ui:ui:1.7.8"
+    implementation("com.squareup.wire:wire-grpc-client:5.3.1")
+
+    implementation 'io.grpc:grpc-okhttp:1.64.0'
+    implementation 'io.grpc:grpc-protobuf-lite:1.64.0'
+    implementation 'io.grpc:grpc-stub:1.64.0'
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.robolectric:robolectric:4.14.1'
+//    protoPath(project(':marten_api'))
+//    implementation project(':marten_api')
+
+
+
+
+}

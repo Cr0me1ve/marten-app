@@ -1,0 +1,57 @@
+display_name: Marten
+package_name: marten
+maintainer:
+  name: marten
+  email: linux@marten.app
+
+priority: optional
+section: x11
+installed_size: 6604
+essential: false
+icon: assets/images/source/ic_launcher_border.png
+
+# Post-installation tasks:
+# 1. Inject StartupWMClass into the system .desktop file for correct icon association
+# 2. Remove conflicting marten.desktop files from users' .local directories (cleanup AppImage artifacts)
+# 3. Update the desktop database to apply changes immediately
+postinstall_scripts:
+  - echo "Setting up Marten..."
+  - sudo sed -i '/^\[Desktop Entry\]/a StartupWMClass=app.marten.client' "/usr/share/applications/marten.desktop"
+  - echo "Search and remove marten.desktop from .local"
+  - for user_dir in /home/*; do if [ -f "$user_dir/.local/share/applications/marten.desktop" ]; then rm -f "$user_dir/.local/share/applications/marten.desktop"; echo "Found and removed marten.desktop from $user_dir .local"; fi; done
+  - update-desktop-database /usr/share/applications
+  - echo "Marten is ready to use :)"
+
+# Post-uninstallation tasks:
+# 1. Iterate through all user directories to remove Marten configuration and data
+# 2. Clean up root user data to ensure a clean removal
+postuninstall_scripts:
+  - echo "Removing Marten user data..."
+  - for user_dir in /home/*; do if [ -d "$user_dir/.local/share/marten" ]; then rm -rf "$user_dir/.local/share/marten"; echo "Removed data from $user_dir"; fi; done
+  - rm -rf /root/.local/share/marten
+  - echo "Marten data cleanup complete."
+
+keywords:
+  - Marten
+  - V2ray
+  - Nekoray
+  - Xray
+  - Sing-box
+generic_name: Marten
+
+categories:
+  - Network
+
+startup_notify: true
+# app_links setup for Linux
+# https://github.com/llfbandit/app_links/blob/master/doc/README_linux.md
+supported_mime_type:
+  - x-scheme-handler/marten
+  - x-scheme-handler/v2ray
+  - x-scheme-handler/v2rayn
+  - x-scheme-handler/v2rayng
+  - x-scheme-handler/clash
+  - x-scheme-handler/clashmeta
+  - x-scheme-handler/sing-box
+
+metainfo: linux/packaging/app.marten.client.appdata.xml

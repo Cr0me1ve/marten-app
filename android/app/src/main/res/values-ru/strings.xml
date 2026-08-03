@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="stop">Отключить</string>
+    <string name="connect">Подключить</string>
+    <string name="quick_toggle">Переключить</string>
+    <string name="status_starting">Подключение…</string>
+    <string name="status_recovering">Восстановление соединения…</string>
+    <string name="status_started">Подключено</string>
+    <string name="status_stopping">Отключение…</string>
+    <string name="status_stopped">Отключено</string>
+    <string name="notification_channel_name">Подключение Marten</string>
+</resources>
