@@ -3,13 +3,13 @@ import 'package:flutter/services.dart';
 
 abstract class Constants {
   static const appName = "Marten";
-  static const githubUrl = "https://github.com/Cr0me1ve/marten-client";
-  static const licenseUrl = "https://github.com/Cr0me1ve/marten-client/blob/main/LICENSE.md";
-  static const githubReleasesApiUrl = "https://api.github.com/repos/Cr0me1ve/marten-client/releases";
-  static const githubLatestReleaseUrl = "https://github.com/Cr0me1ve/marten-client/releases/latest";
-  static const appCastUrl = "https://raw.githubusercontent.com/Cr0me1ve/marten-client/main/appcast.xml";
-  static const privacyPolicyUrl = "https://github.com/Cr0me1ve/marten-client#privacy";
-  static const termsAndConditionsUrl = "https://github.com/Cr0me1ve/marten-client/blob/main/LICENSE.md";
+  static const githubUrl = "https://github.com/Cr0me1ve/marten-app";
+  static const licenseUrl = "https://github.com/Cr0me1ve/marten-app/blob/main/LICENSE.md";
+  static const githubReleasesApiUrl = "https://api.github.com/repos/Cr0me1ve/marten-app/releases";
+  static const githubLatestReleaseUrl = "https://github.com/Cr0me1ve/marten-app/releases/latest";
+  static const appCastUrl = "https://raw.githubusercontent.com/Cr0me1ve/marten-app/main/appcast.xml";
+  static const privacyPolicyUrl = "https://github.com/Cr0me1ve/marten-app#privacy";
+  static const termsAndConditionsUrl = "https://github.com/Cr0me1ve/marten-app/blob/main/LICENSE.md";
 }
 
 const kAnimationDuration = Duration(milliseconds: 250);

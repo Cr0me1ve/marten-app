@@ -2,7 +2,11 @@
 
 Marten is a cross-platform, bring-your-own-configuration network client built with Flutter. It lets you import and manage connection profiles, select an available endpoint, check reachability, and connect through the native runtime on supported platforms.
 
+The app source is published at [Cr0me1ve/marten-app](https://github.com/Cr0me1ve/marten-app).
+
 The app supports common proxy and tunnel configuration formats, including WireGuard, AmneziaWG, VLESS/Xray, Hysteria2, and configurations that use a WebRTC TURN transport. Marten does not ship with connection profiles or operate network infrastructure; you provide the configuration you are authorized to use.
+
+Marten is developed alongside [marten-core](https://github.com/Cr0me1ve/marten-core) and [marten-sing-box](https://github.com/Cr0me1ve/marten-sing-box). Those repositories provide the native runtime and networking engine used by the app.
 
 ## Features
 
@@ -34,7 +38,7 @@ More detail for contributors is in [docs/development.md](docs/development.md). F
 
 ## Native runtime artifacts
 
-Native builds, including `flutter run`, need the separately maintained `marten-core` runtime artifacts for the target platform. They are intentionally not included in this repository, so a fresh clone is sufficient for Flutter and Dart work but not for running or packaging a native build. The platform preparation targets in [Makefile](Makefile) show where those artifacts are expected during an authorized release build.
+Native builds, including `flutter run`, need separately built artifacts from [marten-core](https://github.com/Cr0me1ve/marten-core) and its [marten-sing-box](https://github.com/Cr0me1ve/marten-sing-box) dependency. Native artifacts are intentionally not committed here, so a fresh clone is sufficient for Flutter and Dart work but not for running or packaging a native build. The platform preparation targets in [Makefile](Makefile) show where those artifacts are expected during a release build.
 
 ## Android push setup
 

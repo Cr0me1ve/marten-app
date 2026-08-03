@@ -74,15 +74,6 @@ app.*.map.json
 /ios/Frameworks/*.zip
 /marten-core/
 
-# Local project metadata and diagnostics.
-.codegraph/
-.claude/
-AGENTS.md
-CLAUDE.md
-goals.md
-audit.md
-silent-push.md
-test_harness/
 out/
 
 /data

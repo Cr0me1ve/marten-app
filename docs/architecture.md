@@ -10,7 +10,7 @@ Marten is a Flutter application with native platform integrations for connection
 - `assets/` contains application images, fonts, and translations.
 - `test/` contains Dart and Flutter tests.
 
-The UI coordinates imports, profile selection, connection state, and diagnostics. When a connection is requested, the platform layer starts the native runtime and reports status back to Flutter. The runtime is responsible for the protocol implementation and network tunnel work; it is maintained separately and is not part of this source tree.
+The UI coordinates imports, profile selection, and connection state. When a connection is requested, the platform layer starts the native runtime and reports status back to Flutter. The runtime is provided by [marten-core](https://github.com/Cr0me1ve/marten-core), which integrates [marten-sing-box](https://github.com/Cr0me1ve/marten-sing-box) for protocol and tunnel work. Native artifacts are built separately and are not committed to this source tree.
 
 ## Profiles and local data
 

@@ -52,9 +52,9 @@
     <mime-type>x-scheme-handler/sing-box</mime-type>
   </mime-types>
 
-  <url type="homepage">https://github.com/Cr0me1ve/marten-client</url>
-  <url type="bugtracker">https://github.com/Cr0me1ve/marten-client/issues</url>
-  <url type="help">https://github.com/Cr0me1ve/marten-client</url>
+  <url type="homepage">https://github.com/Cr0me1ve/marten-app</url>
+  <url type="bugtracker">https://github.com/Cr0me1ve/marten-app/issues</url>
+  <url type="help">https://github.com/Cr0me1ve/marten-app</url>
 
   <provides>
     <binary>marten</binary>

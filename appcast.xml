@@ -2,7 +2,7 @@
 <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
   <channel>
     <title>Marten releases</title>
-    <link>https://github.com/Cr0me1ve/marten-client/releases</link>
+    <link>https://github.com/Cr0me1ve/marten-app/releases</link>
     <description>Published Marten client releases.</description>
   </channel>
 </rss>
