@@ -44,34 +44,25 @@ void main() {
   test('post-release input settle keeps Connect semantically unavailable for 750ms', () {
     expect(manualDisconnectInputSettleDelay, const Duration(milliseconds: 750));
 
-    final settlingStatus = visibleStatusDuringManualButtonDisconnect(
-      const Disconnected(),
-      disconnectInProgress: true,
-    );
+    final settlingStatus = visibleStatusDuringManualButtonDisconnect(const Disconnected(), disconnectInProgress: true);
     expect(settlingStatus, const Disconnecting());
     final capturedDuringSettle = manualConnectionCommandForStatus(settlingStatus);
     expect(capturedDuringSettle, ManualConnectionCommand.disconnect);
     expect(canExecuteManualConnectionCommand(capturedDuringSettle, settlingStatus), isFalse);
 
-    final releasedStatus = visibleStatusDuringManualButtonDisconnect(
-      const Disconnected(),
-      disconnectInProgress: false,
-    );
+    final releasedStatus = visibleStatusDuringManualButtonDisconnect(const Disconnected(), disconnectInProgress: false);
     expect(releasedStatus, const Disconnected());
-    expect(
-      canExecuteManualConnectionCommand(
-        manualConnectionCommandForStatus(releasedStatus),
-        releasedStatus,
-      ),
-      isTrue,
-    );
+    expect(canExecuteManualConnectionCommand(manualConnectionCommandForStatus(releasedStatus), releasedStatus), isTrue);
   });
 
   test('normal disconnect and abort settle input before publishing reconnect availability', () {
     final source = File('lib/features/connection/notifier/connection_notifier.dart').readAsStringSync();
     final normalDisconnect = _extractFunctionBlock(source, 'Future<void> _disconnectFromManualCommand() async {');
     final abortCleanup = _extractFunctionBlock(source, 'Future<void> _disconnectAfterAbort(int token) async {');
-    final visibleStream = _extractFunctionBlock(source, 'ConnectionStatus _visibleConnectionStatus(ConnectionStatus event) {');
+    final visibleStream = _extractFunctionBlock(
+      source,
+      'ConnectionStatus _visibleConnectionStatus(ConnectionStatus event) {',
+    );
 
     expect(normalDisconnect, isNotEmpty);
     expect(abortCleanup, isNotEmpty);
@@ -123,6 +114,33 @@ void main() {
     expect(canExecuteManualConnectionCommand(ManualConnectionCommand.abort, const Disconnected()), isFalse);
   });
 
+  test('manual haptic feedback is dispatched without delaying lifecycle commands', () {
+    final source = File('lib/features/connection/notifier/connection_notifier.dart').readAsStringSync();
+    final commandBlock = _extractFunctionBlock(
+      source,
+      'Future<void> executeManualCommand(ManualConnectionCommand command) async {',
+    );
+    final hapticBlock = _extractFunctionBlock(source, 'void _sendManualHaptic(Future<void> feedback) {');
+
+    expect(commandBlock, isNotEmpty);
+    expect(hapticBlock, isNotEmpty);
+    expect(commandBlock, isNot(contains('await haptic.')));
+    expect(
+      commandBlock.indexOf('_sendManualHaptic(haptic.lightImpact())'),
+      lessThan(commandBlock.indexOf('await _connect()')),
+    );
+    expect(
+      commandBlock.indexOf('_sendManualHaptic(haptic.mediumImpact())'),
+      lessThan(commandBlock.indexOf('await _disconnectFromManualCommand()')),
+    );
+    expect(
+      commandBlock.lastIndexOf('_sendManualHaptic(haptic.mediumImpact())'),
+      lessThan(commandBlock.indexOf('await abortConnection()')),
+    );
+    expect(hapticBlock, contains('unawaited('));
+    expect(hapticBlock, contains('feedback.catchError'));
+  });
+
   test('manual connect is not queued behind an occupied lifecycle gate', () async {
     final gate = SingleCall();
     final releaseRunningOperation = Completer<void>();
@@ -161,7 +179,10 @@ void main() {
     expect(connectBlock, contains('return _singleStart.run('));
     expect(connectBlock, isNot(contains('waitForCurrent:')));
     expect(connectBlock, isNot(contains('supersedeQueued:')));
-    expect(connectBlock.indexOf('() async {'), lessThan(connectBlock.indexOf('state = const AsyncData(Connecting());')));
+    expect(
+      connectBlock.indexOf('() async {'),
+      lessThan(connectBlock.indexOf('state = const AsyncData(Connecting());')),
+    );
     expect(commandBlock, contains('canExecuteManualConnectionCommand(command, currentStatus)'));
     expect(commandBlock, contains(r'stale manual $command ignored'));
   });
@@ -581,15 +602,9 @@ void main() {
   });
 
   test('connecting abort remains fail closed until the platform stop succeeds', () {
-    final prematureRepositoryDisconnect = visibleStatusAfterAbort(
-      const Disconnected(),
-      showIdleDuringAbort: true,
-    );
+    final prematureRepositoryDisconnect = visibleStatusAfterAbort(const Disconnected(), showIdleDuringAbort: true);
     expect(
-      visibleStatusDuringManualButtonDisconnect(
-        prematureRepositoryDisconnect,
-        disconnectInProgress: true,
-      ),
+      visibleStatusDuringManualButtonDisconnect(prematureRepositoryDisconnect, disconnectInProgress: true),
       const Disconnecting(),
       reason: 'a repository Disconnected event must not expose Connect during abort cleanup',
     );
@@ -749,107 +764,35 @@ void main() {
     expect(cleanup, lessThan(terminalState));
   });
 
-  test('cold attach marks Android first-connecting status only under exact conditions', () {
-    final coldAttach = visibleStatusForColdAttach(
-      const Connecting(),
-      isAndroid: true,
-      coldAttachStatusPending: true,
-      coreStarted: true,
-      operationInProgress: false,
-    );
-    expect(coldAttach.status, const Connecting(existingSessionVerification: true));
-    expect(coldAttach.pending, isTrue);
+  test('connection_notifier.dart no longer contains removed cold-attach helpers or verification flag', () {
+    final source = File('lib/features/connection/notifier/connection_notifier.dart').readAsStringSync();
+    expect(source, isNot(contains('visibleStatusForColdAttach')));
+    expect(source, isNot(contains('_coldAttachStatusPending')));
+    expect(source, isNot(contains('existingSessionVerification: true')));
   });
 
-  test('cold attach does not mark manual/recovery-style connecting status', () {
-    const input = Connecting();
+  test(
+    'visible status reductions keep ordinary Connecting actionable after abort/auto-reconnect/manual-disconnect paths',
+    () {
+      final afterAbort = visibleStatusAfterAbort(const Connecting(), showIdleDuringAbort: false);
+      final duringAutoReconnect = visibleStatusDuringAutoReconnect(
+        afterAbort,
+        autoReconnectActive: true,
+        startedByUser: true,
+        manualDisconnectRequested: false,
+      );
+      final afterManualDisconnect = visibleStatusDuringManualButtonDisconnect(
+        duringAutoReconnect,
+        disconnectInProgress: false,
+      );
 
-    expect(
-      visibleStatusForColdAttach(
-        input,
-        isAndroid: true,
-        coldAttachStatusPending: false,
-        coreStarted: true,
-        operationInProgress: false,
-      ),
-      (status: input, pending: false),
-    );
-
-    expect(
-      visibleStatusForColdAttach(
-        input,
-        isAndroid: false,
-        coldAttachStatusPending: true,
-        coreStarted: true,
-        operationInProgress: false,
-      ),
-      (status: input, pending: false),
-    );
-
-    expect(
-      visibleStatusForColdAttach(
-        input,
-        isAndroid: true,
-        coldAttachStatusPending: true,
-        coreStarted: false,
-        operationInProgress: false,
-      ),
-      (status: input, pending: false),
-    );
-
-    expect(
-      visibleStatusForColdAttach(
-        input,
-        isAndroid: true,
-        coldAttachStatusPending: true,
-        coreStarted: true,
-        operationInProgress: true,
-      ),
-      (status: input, pending: false),
-    );
-  });
-
-  test('cold attach pending status is consumed only after terminal/non-eligible status', () {
-    final firstPass = visibleStatusForColdAttach(
-      const Connecting(),
-      isAndroid: true,
-      coldAttachStatusPending: true,
-      coreStarted: true,
-      operationInProgress: false,
-    );
-    final secondPass = visibleStatusForColdAttach(
-      firstPass.status,
-      isAndroid: true,
-      coldAttachStatusPending: firstPass.pending,
-      coreStarted: true,
-      operationInProgress: false,
-    );
-    final afterTerminal = visibleStatusForColdAttach(
-      const Connected(),
-      isAndroid: true,
-      coldAttachStatusPending: secondPass.pending,
-      coreStarted: true,
-      operationInProgress: false,
-    );
-    final afterReset = visibleStatusForColdAttach(
-      const Connecting(),
-      isAndroid: true,
-      coldAttachStatusPending: afterTerminal.pending,
-      coreStarted: true,
-      operationInProgress: false,
-    );
-
-    expect(firstPass.pending, isTrue);
-    expect(firstPass.status, const Connecting(existingSessionVerification: true));
-    expect(secondPass.pending, isTrue);
-    expect(secondPass.status, const Connecting(existingSessionVerification: true));
-
-    expect(afterTerminal.pending, isFalse);
-    expect(afterTerminal.status, const Connected());
-
-    expect(afterReset.pending, isFalse);
-    expect(afterReset.status, const Connecting());
-  });
+      expect(afterAbort, const Connecting());
+      expect(duringAutoReconnect, const Connecting());
+      expect(afterManualDisconnect, const Connecting());
+      expect(manualConnectionCommandForStatus(afterManualDisconnect), ManualConnectionCommand.abort);
+      expect(canExecuteManualConnectionCommand(ManualConnectionCommand.abort, afterManualDisconnect), isTrue);
+    },
+  );
 
   test('cold attach does not preserve an unverified or timed-out TURNcoat carrier', () {
     expect(
@@ -1147,4 +1090,33 @@ void main() {
       isFalse,
     );
   });
+
+  test(
+    'delegated selected-route startup failure keeps ConnectionNotifier from invoking immediate disconnect cleanup',
+    () {
+      final source = File('lib/features/connection/notifier/connection_notifier.dart').readAsStringSync();
+      final connectStart = source.indexOf(
+        'Future<bool> _connectThrottled({bool silent = false, int? requestToken}) async {',
+      );
+      expect(connectStart, isNonNegative);
+      final nextConnectFn = source.indexOf('\n  Future<bool> _disconnect', connectStart);
+      expect(nextConnectFn, isNonNegative);
+      final connectThrottled = source.substring(connectStart, nextConnectFn);
+
+      final delegateStart = connectThrottled.indexOf('if (shouldDelegateFailedConnectionToAndroidRecovery(');
+      expect(delegateStart, isNonNegative, reason: 'delegate branch should be present');
+      final silentStart = connectThrottled.indexOf('if (silent) {', delegateStart);
+      final delegateEnd = silentStart == -1 ? connectThrottled.length : silentStart;
+      expect(delegateEnd, greaterThan(delegateStart));
+
+      final delegateBlock = connectThrottled.substring(delegateStart, delegateEnd);
+      expect(delegateBlock, contains('state = const AsyncData(Connecting());'));
+      expect(delegateBlock, contains('return;'));
+      expect(delegateBlock, isNot(contains('AsyncError(')));
+      expect(delegateBlock, isNot(contains('_disconnect(')));
+      expect(delegateBlock, isNot(contains('_disconnectAfterAbort')));
+      expect(delegateBlock, isNot(contains('showCustomAlertFromErr')));
+      expect(delegateBlock, isNot(contains('Preferences.startedByUser.notifier).update(false)')));
+    },
+  );
 }

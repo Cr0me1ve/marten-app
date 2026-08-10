@@ -1,8 +1,8 @@
 import 'dart:async';
-import 'dart:ui' show FrameTiming;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter_displaymode/flutter_displaymode.dart';
 import 'package:flutter_native_splash/flutter_native_splash.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
@@ -45,11 +45,12 @@ Future<void> lazyBootstrap(WidgetsBinding widgetsBinding, Environment env) async
     observers: [RiverpodObserver()],
   );
 
-  await _init("directories", () => container.read(appDirectoriesProvider.future));
-  LoggerController.init(container.read(logPathResolverProvider).appFile().path, debugConsole: !PlatformUtils.isMobile);
+  final directoriesFuture = _init("directories", () => container.read(appDirectoriesProvider.future));
+  final appInfoFuture = _init("app info", () => container.read(appInfoProvider.future));
+  final preferencesFuture = _init("preferences", () => container.read(sharedPreferencesProvider.future));
 
-  final appInfo = await _init("app info", () => container.read(appInfoProvider.future));
-  await _init("preferences", () => container.read(sharedPreferencesProvider.future));
+  final (_, appInfo, _) = await (directoriesFuture, appInfoFuture, preferencesFuture).wait;
+  LoggerController.init(container.read(logPathResolverProvider).appFile().path, debugConsole: !PlatformUtils.isMobile);
 
   await _init("preferences migration", () async {
     try {
@@ -128,7 +129,6 @@ Future<void> _warmUpAfterFirstFrame(ProviderContainer container, AppInfoEntity a
     await _safeInit("auto start service", () => container.read(autoStartNotifierProvider.future));
   }
 
-  await _safeInit("logs repository", () => container.read(logRepositoryProvider.future));
   await _safeInit("logger controller", () => LoggerController.postInit(debug));
   Logger.bootstrap.info(appInfo.format());
 
@@ -148,8 +148,17 @@ Future<void> _warmUpAfterFirstFrame(ProviderContainer container, AppInfoEntity a
 
   Logger.bootstrap.info("post-frame warm-up took [${stopWatch.elapsedMilliseconds}ms]");
   stopWatch.stop();
+  unawaited(_warmUpDeferredLogServices(container));
   unawaited(_warmUpDeferredProfileServices(container, debug));
   unawaited(_warmUpDeferredPlatformServices(debug));
+}
+
+Future<void> _warmUpDeferredLogServices(ProviderContainer container) async {
+  // Loading and indexing historical logs is useful after launch, but it is
+  // unrelated to the first interaction and may contend with early frames.
+  await Future<void>.delayed(const Duration(seconds: 3));
+  await _waitForUiIdle("deferred logs repository");
+  await _safeInit("deferred logs repository", () => container.read(logRepositoryProvider.future));
 }
 
 Future<void> _warmUpDeferredProfileServices(ProviderContainer container, bool debug) async {
@@ -157,6 +166,7 @@ Future<void> _warmUpDeferredProfileServices(ProviderContainer container, bool de
   // showing the authoritative VPN state, or using an already working
   // subscription. Keep it outside the first-interaction launch window.
   await Future<void>.delayed(const Duration(seconds: 30));
+  await _waitForUiIdle("deferred subscription push refresh");
   await _safeInit(
     "deferred subscription push refresh",
     () => container.read(subscriptionPushRefreshServiceProvider).initialize(debug: debug),
@@ -164,17 +174,19 @@ Future<void> _warmUpDeferredProfileServices(ProviderContainer container, bool de
 }
 
 Future<void> _warmUpDeferredPlatformServices(bool debug) async {
-  // Workmanager registration and display-mode negotiation both cross the
-  // Android main thread. They are maintenance tasks, not launch prerequisites.
+  // These calls cross the Android main thread. Admit each one only when the
+  // frame scheduler is idle so a fixed timer cannot interrupt interaction.
   await Future<void>.delayed(const Duration(seconds: 10));
-  await Future.wait([
-    _safeInit("deferred background subscription refresh", () => initializeProfilesBackgroundRefresh(debug: debug)),
-    if (!kIsWeb && PlatformUtils.isAndroid)
-      _safeInit("deferred android display mode", () async {
-        await FlutterDisplayMode.setHighRefreshRate();
-      }),
-  ]);
+  await _waitForUiIdle("deferred background subscription refresh");
+  await _safeInit("deferred background subscription refresh", () => initializeProfilesBackgroundRefresh(debug: debug));
+  if (!kIsWeb && PlatformUtils.isAndroid) {
+    await _waitForUiIdle("deferred android display mode");
+    await _safeInit("deferred android display mode", FlutterDisplayMode.setHighRefreshRate);
+  }
 }
+
+Future<void> _waitForUiIdle(String debugLabel) =>
+    SchedulerBinding.instance.scheduleTask<void>(() {}, Priority.idle, debugLabel: debugLabel);
 
 Future<T> _init<T>(String name, Future<T> Function() initializer, {int? timeout}) async {
   final stopWatch = Stopwatch()..start();

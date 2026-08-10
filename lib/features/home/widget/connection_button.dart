@@ -31,7 +31,6 @@ class ConnectionButton extends HookConsumerWidget {
     final label = switch (status) {
       Connected() when requiresReconnect == true => t.connection.reconnect,
       Connected() => t.connection.connected,
-      Connecting(existingSessionVerification: true) => t.connection.checking,
       Connecting() => t.connection.connecting,
       Disconnecting() => t.connection.disconnecting,
       Disconnected() => t.connection.connect,
@@ -45,7 +44,6 @@ class ConnectionButton extends HookConsumerWidget {
               final activeProfile = await ref.read(activeProfileProvider.future);
               await ref.read(connectionNotifierProvider.notifier).reconnect(activeProfile);
             },
-            Connecting(existingSessionVerification: true) => null,
             Connecting() => () async {
               await ref.read(connectionNotifierProvider.notifier).executeManualCommand(manualCommand);
             },
@@ -119,39 +117,48 @@ class _ConnectionCircle extends HookWidget {
           child: InkWell(
             onTap: onTap,
             customBorder: const CircleBorder(),
-            child: AnimatedBuilder(
-              animation: controller,
-              builder: (context, _) {
-                return CustomPaint(
-                  painter: _CirclePainter(
-                    color: borderColor,
-                    progress: controller.value,
-                    splitting: isSwitching,
-                    glowOpacity: glowOpacity,
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                RepaintBoundary(
+                  child: CustomPaint(
+                    painter: _CircleGlowPainter(color: borderColor, glowOpacity: glowOpacity),
                   ),
-                  child: Center(
-                    child: Padding(
-                      padding: EdgeInsets.symmetric(horizontal: size * 0.16),
-                      child: FittedBox(
-                        fit: BoxFit.scaleDown,
-                        child: Text(
-                          label,
-                          maxLines: 1,
-                          softWrap: false,
-                          overflow: TextOverflow.visible,
-                          textAlign: TextAlign.center,
-                          style: TextStyle(
-                            color: Colors.white.withValues(alpha: 0.92),
-                            fontSize: size * 0.13,
-                            fontWeight: FontWeight.w500,
-                            letterSpacing: 0.2,
-                          ),
+                ),
+                RepaintBoundary(
+                  child: AnimatedBuilder(
+                    animation: controller,
+                    builder: (context, _) => CustomPaint(
+                      painter: _CircleStrokePainter(
+                        color: borderColor,
+                        progress: controller.value,
+                        splitting: isSwitching,
+                      ),
+                    ),
+                  ),
+                ),
+                Center(
+                  child: Padding(
+                    padding: EdgeInsets.symmetric(horizontal: size * 0.16),
+                    child: FittedBox(
+                      fit: BoxFit.scaleDown,
+                      child: Text(
+                        label,
+                        maxLines: 1,
+                        softWrap: false,
+                        overflow: TextOverflow.visible,
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          color: Colors.white.withValues(alpha: 0.92),
+                          fontSize: size * 0.13,
+                          fontWeight: FontWeight.w500,
+                          letterSpacing: 0.2,
                         ),
                       ),
                     ),
                   ),
-                );
-              },
+                ),
+              ],
             ),
           ),
         ),
@@ -160,12 +167,10 @@ class _ConnectionCircle extends HookWidget {
   }
 }
 
-class _CirclePainter extends CustomPainter {
-  _CirclePainter({required this.color, required this.progress, required this.splitting, required this.glowOpacity});
+class _CircleGlowPainter extends CustomPainter {
+  _CircleGlowPainter({required this.color, required this.glowOpacity});
 
   final Color color;
-  final double progress;
-  final bool splitting;
   final double glowOpacity;
 
   @override
@@ -181,6 +186,24 @@ class _CirclePainter extends CustomPainter {
       ..strokeWidth = stroke * 4
       ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 12);
     canvas.drawCircle(center, radius, glow);
+  }
+
+  @override
+  bool shouldRepaint(covariant _CircleGlowPainter old) => old.color != color || old.glowOpacity != glowOpacity;
+}
+
+class _CircleStrokePainter extends CustomPainter {
+  _CircleStrokePainter({required this.color, required this.progress, required this.splitting});
+
+  final Color color;
+  final double progress;
+  final bool splitting;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = Offset(size.width / 2, size.height / 2);
+    final stroke = size.shortestSide * 0.012;
+    final radius = size.shortestSide / 2 - stroke;
 
     final paint = Paint()
       ..color = color
@@ -207,6 +230,6 @@ class _CirclePainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(covariant _CirclePainter old) =>
-      old.color != color || old.progress != progress || old.splitting != splitting || old.glowOpacity != glowOpacity;
+  bool shouldRepaint(covariant _CircleStrokePainter old) =>
+      old.color != color || old.progress != progress || old.splitting != splitting;
 }

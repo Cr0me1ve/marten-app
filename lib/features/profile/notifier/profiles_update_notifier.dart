@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/scheduler.dart';
 import 'package:marten/core/localization/translations.dart';
 import 'package:marten/core/notification/in_app_notification_controller.dart';
 import 'package:marten/core/preferences/general_preferences.dart';
@@ -42,10 +43,18 @@ class ForegroundProfilesUpdateNotifier extends _$ForegroundProfilesUpdateNotifie
     if (ref.watch(Preferences.introCompleted)) {
       loggy.debug("intro done, deferring startup maintenance");
       _initialStartTimer = Timer(initialStartupDelay, () {
-        final scheduler = _scheduler;
-        if (scheduler == null || _schedulerStarted) return;
-        _schedulerStarted = true;
-        scheduler.start();
+        unawaited(
+          SchedulerBinding.instance.scheduleTask<void>(
+            () {
+              final scheduler = _scheduler;
+              if (scheduler == null || _schedulerStarted) return;
+              _schedulerStarted = true;
+              scheduler.start();
+            },
+            Priority.idle,
+            debugLabel: 'foreground profile maintenance',
+          ),
+        );
       });
     } else {
       loggy.debug("intro in process, skipping");

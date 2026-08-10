@@ -90,7 +90,7 @@ void main() {
 
   test('manual setup reads authoritative platform status before conditionally attaching background gRPC', () {
     final source = File('lib/martencore/core_interface/core_interface_mobile.dart').readAsStringSync();
-    final start = source.indexOf('Future<CoreStatus> setupBackground(String path, String name) async {');
+    final start = source.indexOf('Future<BackgroundCoreSetupResult> setupBackground(String path, String name) async {');
     final end = source.indexOf('Future<void> _invokeBackgroundStartAndWait', start);
     final setupBackground = start < 0 || end < 0 ? '' : source.substring(start, end);
 
@@ -98,9 +98,52 @@ void main() {
     expect(setupBackground, contains('final platformStatus = await readPlatformServiceStatus();'));
     expect(setupBackground, contains('final shouldProbeExisting = shouldProbeExistingBackgroundCoreForManualStart('));
     expect(setupBackground, contains('backgroundChannelKnownAvailable: _isBgClientAvailable'));
-    expect(setupBackground, contains('var attachedExisting = false;'));
+    expect(setupBackground, contains('_BackgroundCoreEndpoint? attachedExisting;'));
     expect(setupBackground, contains('if (shouldProbeExisting) {'));
-    expect(setupBackground, contains('attachedExisting = await _attachExistingBackgroundCore('));
+    expect(
+      setupBackground,
+      contains('if (attachedExisting?.status case CoreStarting() || CoreStarted()) {'),
+      reason: 'background attach should return attached result for starting/started background core',
+    );
+    expect(setupBackground, contains('return BackgroundCoreSetupResult.attached(attachedExisting.status);'));
+    expect(setupBackground, contains('final setupResult = BackgroundCoreSetupResult.fromStatus(startStatus);'));
+    expect(setupBackground, contains('if (setupResult is! BackgroundCoreSetupFailed) {'));
+    expect(setupBackground, contains('return setupResult;'));
+    expect(setupBackground, contains('final lateAttached = await _attachExistingBackgroundCore('));
+    expect(setupBackground, contains('if (lateAttached != null) {'));
+    expect(setupBackground, contains('return BackgroundCoreSetupResult.attached(lateAttached.status);'));
+  });
+
+  group('BackgroundCoreSetupResult.fromStatus', () {
+    test('maps stopped (without alert) to ready-to-start', () {
+      final result = BackgroundCoreSetupResult.fromStatus(const CoreStatus.stopped());
+      expect(result, isA<BackgroundCoreReadyToStart>());
+    });
+
+    test('maps starting core status to attached', () {
+      final starting = BackgroundCoreSetupResult.fromStatus(const CoreStatus.starting());
+      expect(starting, isA<BackgroundCoreAttached>());
+      expect((starting as BackgroundCoreAttached).status, const CoreStatus.starting());
+
+      final started = BackgroundCoreSetupResult.fromStatus(const CoreStatus.started());
+      expect(started, isA<BackgroundCoreAttached>());
+      expect((started as BackgroundCoreAttached).status, const CoreStatus.started());
+    });
+
+    test('maps stopping and alert-bearing stopped status to setup failed', () {
+      final stopping = BackgroundCoreSetupResult.fromStatus(const CoreStatus.stopping());
+      expect(stopping, isA<BackgroundCoreSetupFailed>());
+      expect((stopping as BackgroundCoreSetupFailed).status, const CoreStatus.stopping());
+
+      final stoppedWithAlert = BackgroundCoreSetupResult.fromStatus(
+        const CoreStatus.stopped(alert: CoreAlert.startService, message: 'already running'),
+      );
+      expect(stoppedWithAlert, isA<BackgroundCoreSetupFailed>());
+      expect(
+        (stoppedWithAlert as BackgroundCoreSetupFailed).status,
+        const CoreStatus.stopped(alert: CoreAlert.startService, message: 'already running'),
+      );
+    });
   });
 
   group('background start cancellation', () {

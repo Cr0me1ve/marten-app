@@ -14,6 +14,7 @@ import 'package:marten/core/notification/in_app_notification_controller.dart';
 import 'package:marten/core/preferences/general_preferences.dart';
 import 'package:marten/features/connection/model/connection_failure.dart';
 import 'package:marten/features/log/model/log_level.dart' as config_log_level;
+import 'package:marten/martencore/core_interface/core_interface.dart';
 import 'package:marten/martencore/core_interface/core_interface_wrapper_stub.dart'
     if (dart.library.io) 'package:marten/martencore/core_interface/core_interface_wrapper.dart';
 import 'package:marten/martencore/core_log_deduplicator.dart';
@@ -43,6 +44,9 @@ bool shouldApplyNativeRecoverySnapshot({
   required int currentRevision,
   required CoreStatus currentStatus,
 }) => requestRevision == currentRevision && currentStatus is CoreStarted;
+
+bool shouldAttachBackgroundCoreDuringSetup({required bool isAndroid, required CoreStatus? platformStatus}) =>
+    !isAndroid || platformStatus is! CoreStopped;
 
 class MartenCoreService with InfraLogger {
   MartenCoreService(this.ref);
@@ -203,13 +207,26 @@ class MartenCoreService with InfraLogger {
 
       await startListeningLogs("fg", core.fgClient);
       // await startListeningStatus("fg", core.fgClient);
-      if (!core.isSingleChannel()) {
-        await startListeningLogs("bg", core.bgClient);
-      }
       await startListeningPlatformStatus();
-      await _refreshBackgroundCoreStatusSnapshot(reason: "setup");
+      var platformStatus = _latestPlatformServiceStatus;
+      if (PlatformUtils.isAndroid && platformStatus == null) {
+        try {
+          platformStatus = await readPlatformServiceStatus();
+          if (platformStatus != null) _applyPlatformServiceStatus(platformStatus);
+        } catch (error) {
+          loggy.debug("platform status unavailable during setup: $error");
+        }
+      }
+      if (shouldAttachBackgroundCoreDuringSetup(isAndroid: PlatformUtils.isAndroid, platformStatus: platformStatus)) {
+        if (!core.isSingleChannel()) {
+          await startListeningLogs("bg", core.bgClient);
+        }
+        await _refreshBackgroundCoreStatusSnapshot(reason: "setup");
+        await startListeningStatus("bg", core.bgClient);
+      } else {
+        loggy.debug("skipping stopped Android background core listeners during setup");
+      }
       statusController.add(currentState);
-      await startListeningStatus("bg", core.bgClient);
       // ref.read(coreRestartSignalProvider.notifier).restart();
       return right(unit);
     } catch (e) {
@@ -271,17 +288,24 @@ class MartenCoreService with InfraLogger {
       _setCurrentState(const CoreStatus.starting());
       loggy.debug("starting");
       final background = await core.setupBackground(path, name);
-      if (background != const CoreStatus.started()) {
+      if (background case BackgroundCoreSetupFailed(:final status)) {
         _setCurrentState(const CoreStatus.stopped());
-        return left(background.getCoreAlert() ?? const ConnectionFailure.unexpected("failed to start core"));
+        return _settleFailedStart(status.getCoreAlert() ?? const ConnectionFailure.unexpected("failed to start core"));
       }
       if (!core.isSingleChannel()) {
         await startListeningLogs("bg", core.bgClient);
         await startListeningStatus("bg", core.bgClient);
       }
+      if (background case BackgroundCoreAttached(:final status)) {
+        _setCurrentState(
+          coreStatusAfterRuntimeEvent(status, nativeRecoveryInProgress: _nativePlatformRecoveryInProgress),
+        );
+        loggy.info("adopted existing background core; skipping fresh-start cleanup and duplicate start RPC");
+        return right(unit);
+      }
       if (!await _waitForCoreLocalPortsRelease()) {
         loggy.warning("force-stopping previous core before retrying local port release");
-        await stop().run();
+        await stop(forcePlatformCleanup: PlatformUtils.isAndroid).run();
         if (!await _waitForCoreLocalPortsRelease()) {
           currentState = const CoreStatus.stopped(
             alert: CoreAlert.startFailed,
@@ -320,8 +344,7 @@ class MartenCoreService with InfraLogger {
           _statusRevision++;
           statusController.add(currentState);
 
-          unawaited(stop().run());
-          return left(
+          return _settleFailedStart(
             currentState.getCoreAlert() ??
                 ConnectionFailure.unexpected("failed to start core ${res.messageType} ${res.message}"),
           );
@@ -330,8 +353,7 @@ class MartenCoreService with InfraLogger {
           currentState = responseStatus;
           _statusRevision++;
           statusController.add(currentState);
-          unawaited(stop().run());
-          return left(
+          return _settleFailedStart(
             responseStatus.getCoreAlert() ??
                 ConnectionFailure.unexpected("failed to start core ${res.messageType} ${res.message}".trim()),
           );
@@ -349,15 +371,14 @@ class MartenCoreService with InfraLogger {
           );
           _statusRevision++;
           statusController.add(currentState);
-          unawaited(stop().run());
-          return left(const ConnectionFailure.unexpected("connection timed out while starting core"));
+          return _settleFailedStart(const ConnectionFailure.unexpected("connection timed out while starting core"));
         }
         if (e.code == StatusCode.unavailable) {
-          return left(const ConnectionFailure.unexpected("background core is not started yet!"));
+          return _settleFailedStart(const ConnectionFailure.unexpected("background core is not started yet!"));
         }
         final message = e.message?.trim();
         if (message != null && message.isNotEmpty) {
-          return left(
+          return _settleFailedStart(
             _looksLikeInvalidConfigStartError(message)
                 ? ConnectionFailure.invalidConfig(message)
                 : ConnectionFailure.unexpected(message),
@@ -367,7 +388,7 @@ class MartenCoreService with InfraLogger {
         // throw DioException.connectionError(requestOptions: RequestOptions(), reason: e.codeName, error: e);
 
         // throw DioException(requestOptions: RequestOptions(), error: e);
-        return left(const ConnectionFailure.unexpected("failed to start background core"));
+        return _settleFailedStart(const ConnectionFailure.unexpected("failed to start background core"));
       }
 
       if (!await _waitForBackgroundCoreStarted()) {
@@ -377,14 +398,23 @@ class MartenCoreService with InfraLogger {
         );
         _statusRevision++;
         statusController.add(currentState);
-        unawaited(stop().run());
-        return left(const ConnectionFailure.unexpected("background core did not reach started state"));
+        return _settleFailedStart(const ConnectionFailure.unexpected("background core did not reach started state"));
       }
       _setCurrentState(const CoreStatus.started());
       // if (res.messageType != MessageType.EMPTY) return left(res);
 
       return right(unit);
     });
+  }
+
+  Future<Either<ConnectionFailure, Unit>> _settleFailedStart(ConnectionFailure failure) async {
+    // Android's VpnService retains the framework ParcelFileDescriptor even
+    // after a partially-started native Box has closed its duplicate. Do not
+    // expose a retry until the authoritative platform stop has released both
+    // sides of that TUN generation and the background core setup.
+    final cleanup = await stop(forcePlatformCleanup: PlatformUtils.isAndroid).run();
+    cleanup.match((error) => loggy.warning("start failure cleanup also reported an error: $error"), (_) {});
+    return left(failure);
   }
 
   bool _looksLikeInvalidConfigStartError(String message) {
@@ -423,20 +453,22 @@ class MartenCoreService with InfraLogger {
 
     const maxAttempts = 40;
     for (var attempt = 0; attempt < maxAttempts; attempt++) {
-      final busyPorts = <int>[];
-      for (final port in ports) {
-        if (await _isLocalPortOpen(port)) busyPorts.add(port);
-      }
+      final open = await Future.wait(ports.map(_isLocalPortOpen));
+      final busyPorts = [
+        for (var index = 0; index < ports.length; index++)
+          if (open[index]) ports[index],
+      ];
       if (busyPorts.isEmpty) return true;
       if (attempt == 0) {
         loggy.warning("waiting for previous local ports to be released: $busyPorts");
       }
       await Future.delayed(const Duration(milliseconds: 250));
     }
-    final busyPorts = <int>[];
-    for (final port in ports) {
-      if (await _isLocalPortOpen(port)) busyPorts.add(port);
-    }
+    final open = await Future.wait(ports.map(_isLocalPortOpen));
+    final busyPorts = [
+      for (var index = 0; index < ports.length; index++)
+        if (open[index]) ports[index],
+    ];
     loggy.warning("local ports are still busy before start: $busyPorts");
     return false;
   }
@@ -453,14 +485,22 @@ class MartenCoreService with InfraLogger {
     }
   }
 
-  TaskEither<String, Unit> stop() {
+  TaskEither<String, Unit> stop({bool forcePlatformCleanup = false}) {
     return TaskEither(() async {
+      // An explicit Flutter stop supersedes Android's automatic recovery. If
+      // the recovery flag survives the authoritative platform stop, later
+      // stopped-status replays are translated back to Starting and the idle
+      // UI spins forever even though the core and VPN are already gone.
+      if (_nativePlatformRecoveryInProgress) {
+        _nativePlatformRecoveryInProgress = false;
+        loggy.info("explicit core stop canceled Android native recovery");
+      }
       final runningStop = _stopFuture;
       if (runningStop != null) {
         loggy.debug("joining in-flight core stop");
         return runningStop;
       }
-      if (isRedundantCoreStop(currentState, _latestPlatformServiceStatus)) {
+      if (!forcePlatformCleanup && isRedundantCoreStop(currentState, _latestPlatformServiceStatus)) {
         loggy.debug("core and Android service are already stopped");
         return right(unit);
       }

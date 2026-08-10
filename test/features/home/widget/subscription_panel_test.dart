@@ -11,6 +11,7 @@ import 'package:marten/features/home/data/local_outbounds_provider.dart';
 import 'package:marten/features/home/widget/subscription_panel.dart';
 import 'package:marten/features/profile/model/profile_entity.dart';
 import 'package:marten/features/profile/notifier/active_profile_notifier.dart';
+import 'package:marten/features/profile/notifier/profile_notifier.dart';
 import 'package:marten/features/profile/overview/profiles_notifier.dart';
 import 'package:marten/features/proxy/overview/proxies_overview_notifier.dart';
 import 'package:marten/martencore/generated/v2/hcore/hcore.pb.dart';
@@ -101,8 +102,17 @@ void main() {
     profileState.dispose();
   });
 
-  testWidgets('connected показывает compact panel и игнорирует выбор неактивных', (tester) async {
-    final profileState = _ProfileSwitchHarness(baseProfiles);
+  testWidgets('non-disconnected phases show only the current selected server in a compact panel', (tester) async {
+    final remoteProfile = ProfileEntity.remote(
+      id: 'connected-refresh-profile-id',
+      active: true,
+      name: 'Connected Refresh Profile',
+      url: 'https://subscription.invalid/connected',
+      lastUpdate: DateTime.utc(2026, 8, 7),
+    );
+    final profileState = _ProfileSwitchHarness([remoteProfile]);
+    final transition = _ConnectionStateHarness(const Connected());
+    const selectedTag = 'Beta';
 
     await _pumpPanel(
       tester,
@@ -110,67 +120,171 @@ void main() {
       outbounds: baseOutbounds,
       profileState: profileState,
       allowProfileSwitch: false,
-      proxiesOverview: _connectedOverview(baseOutbounds),
+      proxiesOverview: _connectedOverview(baseOutbounds, selectedTag: selectedTag),
+      connectionHarness: transition,
+      updateState: const AsyncLoading(),
+      pendingSelection: selectedTag,
+      settle: false,
     );
+    await tester.pump(const Duration(milliseconds: 250));
+    final compactHeight = _panelHeight(tester, profileState.activeProfile.id);
+    expect(find.text(selectedTag), findsOneWidget);
+    for (final outbound in baseOutbounds.where((outbound) => outbound.tag != selectedTag)) {
+      expect(find.text(outbound.tag), findsNothing, reason: 'Connected must show only the selected server');
+    }
 
+    for (final status in const <ConnectionStatus>[Disconnecting(), Disconnected(), Connecting()]) {
+      transition.emit(status);
+      await tester.pump(const Duration(milliseconds: 250));
+
+      expect(find.text(selectedTag), findsOneWidget);
+      for (final outbound in baseOutbounds.where((outbound) => outbound.tag != selectedTag)) {
+        expect(find.text(outbound.tag), findsNothing, reason: '$status must retain the selected-only reconnect view');
+      }
+      expect(_panelHeight(tester, profileState.activeProfile.id), closeTo(compactHeight, 1));
+    }
+
+    transition.dispose();
+    profileState.dispose();
+  });
+
+  testWidgets('disconnected panel height follows actual server count and caps at the viewport maximum', (tester) async {
+    const viewportSize = Size(400, 1000);
+    final profileState = _ProfileSwitchHarness(baseProfiles);
+    final oneServer = [baseOutbounds.first];
+    final refreshedServers = _outbounds('Refreshed', 18);
+    final outboundsHarness = _OutboundsHarness(oneServer);
+
+    await _pumpPanel(
+      tester,
+      connectionStatus: const Disconnected(),
+      outbounds: oneServer,
+      profileState: profileState,
+      mediaQuerySize: viewportSize,
+      outboundsHarness: outboundsHarness,
+    );
+    final oneServerHeight = _panelHeight(tester, profileState.activeProfile.id);
+    outboundsHarness.beginRefresh();
+    _invalidateLocalOutbounds(tester);
+    await tester.pump();
+
+    expect(find.text(oneServer.single.tag), findsOneWidget, reason: 'loading keeps the previous rows visible');
+    expect(_panelHeight(tester, profileState.activeProfile.id), closeTo(oneServerHeight, 1));
+
+    outboundsHarness.complete(baseOutbounds);
+    await tester.pumpAndSettle();
     for (final outbound in baseOutbounds) {
       expect(find.text(outbound.tag), findsOneWidget);
     }
+    final threeServerHeight = _panelHeight(tester, profileState.activeProfile.id);
 
-    await tester.tap(_serverRow(tester, baseOutbounds[1].tag));
+    outboundsHarness.beginRefresh();
+    _invalidateLocalOutbounds(tester);
+    await tester.pump();
+    outboundsHarness.complete(refreshedServers);
     await tester.pumpAndSettle();
+    final refreshedHeight = _panelHeight(tester, profileState.activeProfile.id);
 
-    expect(_serverMaterial(tester, baseOutbounds[0].tag).color, _selectedServerColor);
-    expect(_serverMaterial(tester, baseOutbounds[1].tag).color, Colors.transparent);
-    expect(_serverMaterial(tester, baseOutbounds[2].tag).color, Colors.transparent);
+    expect(oneServerHeight, lessThan(threeServerHeight - 20));
+    expect(threeServerHeight, lessThan(refreshedHeight));
+    expect(refreshedHeight, lessThanOrEqualTo(560));
+    expect(tester.takeException(), isNull, reason: 'a refreshed server count must settle without overflow');
 
     profileState.dispose();
   });
 
-  testWidgets('три профиля: expanded один сверху, collapsed-элементы ниже, клик по collapsed переключает active только при Disconnected', (
+  testWidgets('manual refresh from disconnected keeps the previous list and geometry while its header shows progress', (
     tester,
   ) async {
-    final profileState = _ProfileSwitchHarness(baseProfiles);
+    final remoteProfile = ProfileEntity.remote(
+      id: 'refresh-profile-id',
+      active: true,
+      name: 'Refresh Profile',
+      url: 'https://subscription.invalid/config',
+      lastUpdate: DateTime.utc(2026, 8, 7),
+    );
+    final profileState = _ProfileSwitchHarness([remoteProfile]);
+    final outboundsHarness = _OutboundsHarness(baseOutbounds);
 
     await _pumpPanel(
       tester,
       connectionStatus: const Disconnected(),
       outbounds: baseOutbounds,
       profileState: profileState,
+      updateState: const AsyncLoading(),
+      outboundsHarness: outboundsHarness,
+      settle: false,
     );
+    await tester.pump(const Duration(milliseconds: 250));
+    final idleHeight = _panelHeight(tester, remoteProfile.id);
+    outboundsHarness.beginRefresh();
+    _invalidateLocalOutbounds(tester);
+    await tester.pump();
 
-    final active = profileState.activeProfile;
-    final profileB = baseProfiles[1];
-    final profileC = baseProfiles[2];
+    expect(find.byKey(const ValueKey('subscription-refresh-loading')), findsOneWidget);
+    for (final outbound in baseOutbounds) {
+      expect(find.text(outbound.tag), findsOneWidget);
+    }
+    expect(_panelHeight(tester, remoteProfile.id), closeTo(idleHeight, 1));
 
-    final activeHeaderKey = ValueKey('subscription-profile-${active.id}-expanded');
-    final activeBodyKey = ValueKey('subscription-profile-body-${active.id}');
-    final collapsedHeaderKeyB = ValueKey('subscription-profile-${profileB.id}-collapsed');
-    final collapsedHeaderKeyC = ValueKey('subscription-profile-${profileC.id}-collapsed');
-    final expandedHeaderKeyB = ValueKey('subscription-profile-${profileB.id}-expanded');
-    final expandedHeaderKeyC = ValueKey('subscription-profile-${profileC.id}-expanded');
-
-    expect(find.byKey(activeHeaderKey), findsOneWidget);
-    expect(find.byKey(activeBodyKey), findsOneWidget);
-    expect(find.byKey(collapsedHeaderKeyB), findsOneWidget);
-    expect(find.byKey(collapsedHeaderKeyC), findsOneWidget);
-    expect(find.byKey(expandedHeaderKeyB), findsNothing);
-    expect(find.byKey(expandedHeaderKeyC), findsNothing);
-
-    final activeHeaderY = tester.getTopLeft(find.byKey(activeHeaderKey)).dy;
-    expect(tester.getTopLeft(find.byKey(collapsedHeaderKeyB)).dy > activeHeaderY, isTrue);
-    expect(tester.getTopLeft(find.byKey(collapsedHeaderKeyC)).dy > activeHeaderY, isTrue);
-
-    await tester.tap(find.byKey(collapsedHeaderKeyB));
-    await tester.pumpAndSettle();
-
-    expect(find.byKey(ValueKey('subscription-profile-${profileB.id}-expanded')), findsOneWidget);
-    expect(find.byKey(ValueKey('subscription-profile-${active.id}-expanded')), findsNothing);
-    expect(find.byKey(ValueKey('subscription-profile-${active.id}-collapsed')), findsOneWidget);
-    expect(find.byKey(ValueKey('subscription-profile-body-${profileB.id}')), findsOneWidget);
+    outboundsHarness.complete([baseOutbounds.first]);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 250));
+    expect(find.text(baseOutbounds.first.tag), findsOneWidget);
+    for (final outbound in baseOutbounds.skip(1)) {
+      expect(find.text(outbound.tag), findsNothing);
+    }
+    expect(_panelHeight(tester, remoteProfile.id), lessThan(idleHeight - 20));
+    expect(tester.takeException(), isNull);
 
     profileState.dispose();
   });
+
+  testWidgets(
+    'три профиля: expanded один сверху, collapsed-элементы ниже, клик по collapsed переключает active только при Disconnected',
+    (tester) async {
+      final profileState = _ProfileSwitchHarness(baseProfiles);
+
+      await _pumpPanel(
+        tester,
+        connectionStatus: const Disconnected(),
+        outbounds: baseOutbounds,
+        profileState: profileState,
+      );
+
+      final active = profileState.activeProfile;
+      final profileB = baseProfiles[1];
+      final profileC = baseProfiles[2];
+
+      final activeHeaderKey = ValueKey('subscription-profile-${active.id}-expanded');
+      final activeBodyKey = ValueKey('subscription-profile-body-${active.id}');
+      final collapsedHeaderKeyB = ValueKey('subscription-profile-${profileB.id}-collapsed');
+      final collapsedHeaderKeyC = ValueKey('subscription-profile-${profileC.id}-collapsed');
+      final expandedHeaderKeyB = ValueKey('subscription-profile-${profileB.id}-expanded');
+      final expandedHeaderKeyC = ValueKey('subscription-profile-${profileC.id}-expanded');
+
+      expect(find.byKey(activeHeaderKey), findsOneWidget);
+      expect(find.byKey(activeBodyKey), findsOneWidget);
+      expect(find.byKey(collapsedHeaderKeyB), findsOneWidget);
+      expect(find.byKey(collapsedHeaderKeyC), findsOneWidget);
+      expect(find.byKey(expandedHeaderKeyB), findsNothing);
+      expect(find.byKey(expandedHeaderKeyC), findsNothing);
+
+      final activeHeaderY = tester.getTopLeft(find.byKey(activeHeaderKey)).dy;
+      expect(tester.getTopLeft(find.byKey(collapsedHeaderKeyB)).dy > activeHeaderY, isTrue);
+      expect(tester.getTopLeft(find.byKey(collapsedHeaderKeyC)).dy > activeHeaderY, isTrue);
+
+      await tester.tap(find.byKey(collapsedHeaderKeyB));
+      await tester.pumpAndSettle();
+
+      expect(find.byKey(ValueKey('subscription-profile-${profileB.id}-expanded')), findsOneWidget);
+      expect(find.byKey(ValueKey('subscription-profile-${active.id}-expanded')), findsNothing);
+      expect(find.byKey(ValueKey('subscription-profile-${active.id}-collapsed')), findsOneWidget);
+      expect(find.byKey(ValueKey('subscription-profile-body-${profileB.id}')), findsOneWidget);
+
+      profileState.dispose();
+    },
+  );
 
   testWidgets('при Connected tap по collapsed профилю не меняет active profile', (tester) async {
     final profileState = _ProfileSwitchHarness(baseProfiles);
@@ -196,14 +310,15 @@ void main() {
   });
 }
 
-OutboundGroup _connectedOverview(List<LocalOutbound> outbounds) {
+OutboundGroup _connectedOverview(List<LocalOutbound> outbounds, {String? selectedTag}) {
+  final selected = selectedTag ?? outbounds.first.tag;
   final items = outbounds
       .map(
         (outbound) => OutboundInfo(
           tag: outbound.tag,
           type: outbound.type,
           tagDisplay: outbound.tag,
-          isSelected: outbound.tag == outbounds[0].tag,
+          isSelected: outbound.tag == selected,
         ),
       )
       .toList(growable: false);
@@ -212,9 +327,9 @@ OutboundGroup _connectedOverview(List<LocalOutbound> outbounds) {
     tag: 'group-0',
     type: 'selector',
     selected: OutboundInfo(
-      tag: outbounds[0].tag,
-      type: outbounds[0].type,
-      tagDisplay: outbounds[0].tag,
+      tag: selected,
+      type: outbounds.firstWhere((outbound) => outbound.tag == selected).type,
+      tagDisplay: selected,
       isSelected: true,
     ),
     items: items,
@@ -228,31 +343,75 @@ Future<void> _pumpPanel(
   required _ProfileSwitchHarness profileState,
   OutboundGroup? proxiesOverview,
   bool allowProfileSwitch = true,
+  Size mediaQuerySize = const Size(800, 600),
+  _ConnectionStateHarness? connectionHarness,
+  AsyncValue<Unit?>? updateState,
+  String? pendingSelection,
+  _OutboundsHarness? outboundsHarness,
+  bool settle = true,
 }) async {
   profileState.allowSwitch = allowProfileSwitch;
 
   final overrides = <Override>[
-    connectionNotifierProvider.overrideWith(() => _FixedConnectionNotifier(connectionStatus)),
+    connectionNotifierProvider.overrideWith(
+      () => connectionHarness == null
+          ? _FixedConnectionNotifier(connectionStatus)
+          : _StreamingConnectionNotifier(connectionHarness),
+    ),
     activeProfileProvider.overrideWith(() => _FixedActiveProfileNotifier(profileState)),
     profilesNotifierProvider.overrideWith(() => _FixedProfilesNotifier(profileState)),
     translationsProvider.overrideWith((_) => Translations()),
     selectedProxyByProfileProvider.overrideWith((_) => _FixedSelectedProxyByProfileNotifier(sharedPreferences)),
-    localOutboundsProvider.overrideWith((_) => Future.value(outbounds)),
+    pendingProxySelectionProvider.overrideWith(() => _FixedPendingProxySelectionNotifier(pendingSelection)),
+    localOutboundsProvider.overrideWith((_) => outboundsHarness?.load() ?? Future.value(outbounds)),
   ];
 
   if (proxiesOverview != null) {
+    overrides.add(proxiesOverviewNotifierProvider.overrideWith(() => _FixedProxiesOverviewNotifier(proxiesOverview)));
+  }
+  if (updateState != null) {
     overrides.add(
-      proxiesOverviewNotifierProvider.overrideWith(() => _FixedProxiesOverviewNotifier(proxiesOverview)),
+      updateProfileNotifierProvider(
+        profileState.activeProfile.id,
+      ).overrideWith(() => _FixedUpdateProfileNotifier(updateState)),
     );
   }
 
   await tester.pumpWidget(
     ProviderScope(
       overrides: overrides,
-      child: const MaterialApp(home: Scaffold(body: SubscriptionPanel())),
+      child: MaterialApp(
+        home: MediaQuery(
+          data: MediaQueryData(size: mediaQuerySize),
+          child: const Scaffold(body: SubscriptionPanel()),
+        ),
+      ),
     ),
   );
-  await tester.pumpAndSettle();
+  if (settle) {
+    await tester.pumpAndSettle();
+  } else {
+    await tester.pump();
+  }
+}
+
+double _panelHeight(WidgetTester tester, String profileId) {
+  final panel = find.ancestor(
+    of: find.byKey(ValueKey('subscription-profile-$profileId-expanded')),
+    matching: find.byType(ConstrainedBox),
+  );
+  expect(panel, findsOneWidget);
+  return tester.getSize(panel).height;
+}
+
+List<LocalOutbound> _outbounds(String prefix, int count) => [
+  for (var index = 0; index < count; index++)
+    LocalOutbound(tag: '$prefix ${index + 1}', type: 'vless', server: 'server-$index.example', serverPort: 443),
+];
+
+void _invalidateLocalOutbounds(WidgetTester tester) {
+  final context = tester.element(find.byType(SubscriptionPanel));
+  ProviderScope.containerOf(context).invalidate(localOutboundsProvider);
 }
 
 Finder _serverRow(WidgetTester tester, String tag) {
@@ -308,10 +467,15 @@ class _ProfileSwitchHarness {
   }
 
   void _normalizeActiveProfile() {
-    _profiles = _profiles.map((profile) {
-      return profile.copyWith(active: profile.id == _activeProfile.id);
-    }).toList(growable: false);
-    final normalizedActive = _profiles.firstWhere((profile) => profile.id == _activeProfile.id, orElse: () => _activeProfile);
+    _profiles = _profiles
+        .map((profile) {
+          return profile.copyWith(active: profile.id == _activeProfile.id);
+        })
+        .toList(growable: false);
+    final normalizedActive = _profiles.firstWhere(
+      (profile) => profile.id == _activeProfile.id,
+      orElse: () => _activeProfile,
+    );
     _activeProfile = normalizedActive;
   }
 
@@ -330,6 +494,68 @@ class _FixedConnectionNotifier extends ConnectionNotifier {
   Stream<ConnectionStatus> build() {
     state = AsyncData(status);
     return Stream.fromIterable([status]);
+  }
+}
+
+class _FixedPendingProxySelectionNotifier extends PendingProxySelectionNotifier {
+  _FixedPendingProxySelectionNotifier(this.selection);
+
+  final String? selection;
+
+  @override
+  String? build() => selection;
+}
+
+class _ConnectionStateHarness {
+  _ConnectionStateHarness(this._current);
+
+  ConnectionStatus _current;
+  final _controller = StreamController<ConnectionStatus>.broadcast();
+
+  ConnectionStatus get current => _current;
+  Stream<ConnectionStatus> get stream => _controller.stream;
+
+  void emit(ConnectionStatus status) {
+    _current = status;
+    _controller.add(status);
+  }
+
+  void dispose() => _controller.close();
+}
+
+class _OutboundsHarness {
+  _OutboundsHarness(List<LocalOutbound> initial) : _future = Future.value(initial);
+
+  Future<List<LocalOutbound>> _future;
+  Completer<List<LocalOutbound>>? _refresh;
+
+  Future<List<LocalOutbound>> load() => _future;
+
+  void beginRefresh() {
+    _refresh = Completer<List<LocalOutbound>>();
+    _future = _refresh!.future;
+  }
+
+  void complete(List<LocalOutbound> items) {
+    final refresh = _refresh;
+    if (refresh == null) {
+      throw StateError('beginRefresh must be called before complete');
+    }
+    refresh.complete(items);
+    _future = Future.value(items);
+    _refresh = null;
+  }
+}
+
+class _StreamingConnectionNotifier extends ConnectionNotifier {
+  _StreamingConnectionNotifier(this.harness);
+
+  final _ConnectionStateHarness harness;
+
+  @override
+  Stream<ConnectionStatus> build() async* {
+    yield harness.current;
+    yield* harness.stream;
   }
 }
 
@@ -373,6 +599,15 @@ class _FixedProxiesOverviewNotifier extends ProxiesOverviewNotifier {
     state = AsyncData(overview);
     return Stream.fromIterable([overview]);
   }
+}
+
+class _FixedUpdateProfileNotifier extends UpdateProfileNotifier {
+  _FixedUpdateProfileNotifier(this.updateState);
+
+  final AsyncValue<Unit?> updateState;
+
+  @override
+  AsyncValue<Unit?> build(String id) => updateState;
 }
 
 class _FixedSelectedProxyByProfileNotifier extends SelectedProxyByProfileNotifier {

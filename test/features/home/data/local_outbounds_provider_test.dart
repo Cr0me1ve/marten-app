@@ -30,7 +30,7 @@ void main() {
 
       const icmp = LocalOutbound(tag: 'ICMP', type: 'icmp', server: '198.51.100.7', serverPort: 0);
       expect(localOutboundUsesICMPEchoPing(icmp), isTrue);
-      expect(await nativeICMPEchoProbe(' 198.51.100.7 ', channel: methodChannel, isAndroid: true), 27);
+      expect(await nativeICMPEchoProbe(' 198.51.100.7 ', isAndroid: true), 27);
       expect(captured?.method, 'icmp_ping');
       expect(captured?.arguments, {'host': '198.51.100.7', 'timeoutMs': 4000});
     });
@@ -44,7 +44,7 @@ void main() {
       );
     });
 
-    test('parses visible outbounds sorted by display name', () {
+    test('parses visible outbounds in subscription order', () {
       final raw = jsonEncode({
         'servers': [
           {'tag': 'Beta §id:2§'},
@@ -61,7 +61,7 @@ void main() {
 
       final outbounds = parseLocalOutbounds(raw);
 
-      expect(outbounds.map((outbound) => outbound.displayName), ['Alpha', 'Beta']);
+      expect(outbounds.map((outbound) => outbound.displayName), ['Beta', 'Alpha']);
     });
 
     test('parses base64 wrapped JSON configs for the offline server list', () {
@@ -93,7 +93,51 @@ void main() {
       expect(outbounds.single.tag, 'US');
     });
 
-    test('sorts by text name after a leading flag emoji', () {
+    test('keeps the responsive parser policy at a strict 64 KiB boundary', () async {
+      expect(localOutboundsBackgroundParseThreshold, 64 * 1024);
+
+      final belowThreshold = _validLocalOutboundsJsonOfLength(localOutboundsBackgroundParseThreshold - 1);
+      final atThreshold = _validLocalOutboundsJsonOfLength(localOutboundsBackgroundParseThreshold);
+      expect(belowThreshold.length, localOutboundsBackgroundParseThreshold - 1);
+      expect(atThreshold.length, localOutboundsBackgroundParseThreshold);
+
+      expect(
+        _outboundSignatures(await parseLocalOutboundsResponsively(belowThreshold)),
+        _outboundSignatures(parseLocalOutbounds(belowThreshold)),
+      );
+      expect(
+        _outboundSignatures(await parseLocalOutboundsResponsively(atThreshold)),
+        _outboundSignatures(parseLocalOutbounds(atThreshold)),
+      );
+
+      final source = File('lib/features/home/data/local_outbounds_provider.dart').readAsStringSync();
+      expect(
+        RegExp(r'raw\.length\s*<\s*localOutboundsBackgroundParseThreshold').hasMatch(source),
+        isTrue,
+        reason: 'only inputs below 64 KiB stay on the UI isolate; an exact 64 KiB config uses compute',
+      );
+    });
+
+    test('responsive parser is functionally equivalent for small and large valid configs', () async {
+      final small = jsonEncode({
+        'outbounds': [
+          {'type': 'hysteria2', 'tag': 'Beta', 'server': 'beta.example', 'server_port': 443},
+          {'type': 'vless', 'tag': 'Alpha', 'server': 'alpha.example', 'server_port': 443},
+        ],
+      });
+      final large = _validLocalOutboundsJsonOfLength(localOutboundsBackgroundParseThreshold + 2048);
+
+      expect(
+        _outboundSignatures(await parseLocalOutboundsResponsively(small)),
+        _outboundSignatures(parseLocalOutbounds(small)),
+      );
+      expect(
+        _outboundSignatures(await parseLocalOutboundsResponsively(large)),
+        _outboundSignatures(parseLocalOutbounds(large)),
+      );
+    });
+
+    test('preserves subscription order even when flag-prefixed names sort differently', () {
       final raw = jsonEncode({
         'servers': [
           {'tag': '🇦🇱 Beta §id:2§'},
@@ -107,7 +151,26 @@ void main() {
 
       final outbounds = parseLocalOutbounds(raw);
 
-      expect(outbounds.map((outbound) => outbound.displayName), ['🇺🇸 Alpha', '🇦🇱 Beta']);
+      expect(outbounds.map((outbound) => outbound.displayName), ['🇦🇱 Beta', '🇺🇸 Alpha']);
+    });
+
+    test('keeps selectable outbound tags in subscription order', () {
+      final raw = jsonEncode({
+        'outbounds': [
+          {
+            'type': 'selector',
+            'tag': 'select',
+            'outbounds': ['Zulu', 'Alpha', 'Beta'],
+          },
+          {'type': 'vless', 'tag': 'Zulu', 'server': 'zulu.example', 'server_port': 443},
+          {'type': 'hysteria2', 'tag': 'Alpha', 'server': 'alpha.example', 'server_port': 443},
+          {'type': 'wireguard', 'tag': 'Beta', 'server': 'beta.example', 'server_port': 51820},
+          {'type': 'turncoat', 'tag': 'hidden transport §hide§', 'server': 'turn.example', 'server_port': 3478},
+        ],
+      });
+
+      expect(selectableOutboundTagsFromConfig(raw), ['Zulu', 'Alpha', 'Beta']);
+      expect(parseLocalOutbounds(raw).map((outbound) => outbound.tag), ['Zulu', 'Alpha', 'Beta']);
     });
 
     test('marks TURNcoat-backed outbounds and extracts hidden helper call URL', () {
@@ -466,6 +529,28 @@ void main() {
   });
 
   group('config preparation', () {
+    test('keeps unselected selector members in subscription order', () {
+      final raw = jsonEncode({
+        'outbounds': [
+          {
+            'type': 'selector',
+            'tag': 'system routes',
+            'outbounds': ['Zulu direct', 'Alpha direct'],
+          },
+          {'type': 'direct', 'tag': 'Zulu direct'},
+          {'type': 'direct', 'tag': 'Alpha direct'},
+          {'type': 'vless', 'tag': 'Chosen server', 'server': 'chosen.example', 'server_port': 443},
+        ],
+      });
+
+      final prepared = jsonDecode(prepareConfigForSelectedOutbound(raw, 'Chosen server')) as Map<String, dynamic>;
+      final selector = (prepared['outbounds'] as List<dynamic>).whereType<Map>().singleWhere(
+        (outbound) => outbound['tag'] == 'system routes',
+      );
+
+      expect(selector['outbounds'], ['Zulu direct', 'Alpha direct']);
+    });
+
     test('promotes selected outbound before core builds selector default', () {
       final raw = jsonEncode({
         'outbounds': [
@@ -1062,3 +1147,37 @@ void main() {
     });
   });
 }
+
+String _validLocalOutboundsJsonOfLength(int length) {
+  final config = {
+    'outbounds': [
+      {'type': 'vless', 'tag': 'Alpha', 'server': 'alpha.example', 'server_port': 443},
+    ],
+    'padding': '',
+  };
+  final emptyPaddingConfig = jsonEncode(config);
+  final paddingLength = length - emptyPaddingConfig.length;
+  if (paddingLength < 0) {
+    throw ArgumentError.value(length, 'length', 'must fit the valid config envelope');
+  }
+
+  config['padding'] = List<String>.filled(paddingLength, 'x').join();
+  final raw = jsonEncode(config);
+  if (raw.length != length) {
+    throw StateError('expected $length bytes of ASCII JSON, got ${raw.length}');
+  }
+  return raw;
+}
+
+List<({String tag, String type, String server, int port, String? tlsServerName, bool usesTurncoat})>
+_outboundSignatures(List<LocalOutbound> outbounds) => [
+  for (final outbound in outbounds)
+    (
+      tag: outbound.tag,
+      type: outbound.type,
+      server: outbound.server,
+      port: outbound.serverPort,
+      tlsServerName: outbound.tlsServerName,
+      usesTurncoat: outbound.usesTurncoat,
+    ),
+];

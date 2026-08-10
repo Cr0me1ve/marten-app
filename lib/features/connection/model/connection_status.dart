@@ -24,7 +24,7 @@ sealed class ConnectionStatus with _$ConnectionStatus {
   };
 
   bool get isSwitching => switch (this) {
-    Connecting(:final existingSessionVerification) => !existingSessionVerification,
+    Connecting() => true,
     Disconnecting() => true,
     _ => false,
   };
@@ -32,8 +32,7 @@ sealed class ConnectionStatus with _$ConnectionStatus {
   String format() => switch (this) {
     Disconnected(:final connectionFailure) =>
       connectionFailure != null ? "CONNECTION FAILURE: $connectionFailure" : "DISCONNECTED",
-    Connecting(:final existingSessionVerification) =>
-      existingSessionVerification ? "VERIFYING_EXISTING_SESSION" : "CONNECTING",
+    Connecting() => "CONNECTING",
     Connected() => "CONNECTED",
     Disconnecting() => "DISCONNECTING",
   };

@@ -2,6 +2,40 @@ import 'package:marten/core/model/directories.dart';
 import 'package:marten/martencore/generated/v2/hcore/hcore_service.pbgrpc.dart';
 import 'package:marten/singbox/model/core_status.dart';
 
+sealed class BackgroundCoreSetupResult {
+  const BackgroundCoreSetupResult();
+
+  const factory BackgroundCoreSetupResult.readyToStart() = BackgroundCoreReadyToStart;
+
+  const factory BackgroundCoreSetupResult.attached(CoreStatus status) = BackgroundCoreAttached;
+
+  const factory BackgroundCoreSetupResult.failed(CoreStatus status) = BackgroundCoreSetupFailed;
+
+  factory BackgroundCoreSetupResult.fromStatus(CoreStatus status) {
+    return switch (status) {
+      CoreStopped(alert: null) => const BackgroundCoreSetupResult.readyToStart(),
+      CoreStarting() || CoreStarted() => BackgroundCoreSetupResult.attached(status),
+      CoreStopping() || CoreStopped() => BackgroundCoreSetupResult.failed(status),
+    };
+  }
+}
+
+final class BackgroundCoreReadyToStart extends BackgroundCoreSetupResult {
+  const BackgroundCoreReadyToStart();
+}
+
+final class BackgroundCoreAttached extends BackgroundCoreSetupResult {
+  const BackgroundCoreAttached(this.status);
+
+  final CoreStatus status;
+}
+
+final class BackgroundCoreSetupFailed extends BackgroundCoreSetupResult {
+  const BackgroundCoreSetupFailed(this.status);
+
+  final CoreStatus status;
+}
+
 class CoreInterface {
   late CoreClient fgClient;
   late CoreClient bgClient;
@@ -10,8 +44,8 @@ class CoreInterface {
     return "";
   }
 
-  Future<CoreStatus> setupBackground(String path, String name) async {
-    return const CoreStarted();
+  Future<BackgroundCoreSetupResult> setupBackground(String path, String name) async {
+    return const BackgroundCoreSetupResult.readyToStart();
   }
 
   Future<bool> restart(String path, String name) async {

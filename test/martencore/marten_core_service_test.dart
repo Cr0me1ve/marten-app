@@ -171,6 +171,77 @@ void main() {
       }
     });
 
+    test('background core attach skips only an already stopped Android service', () {
+      final cases = [
+        (isAndroid: true, platformStatus: const CoreStatus.stopped(), expected: false),
+        (isAndroid: true, platformStatus: const CoreStatus.starting(), expected: true),
+        (isAndroid: true, platformStatus: const CoreStatus.started(), expected: true),
+        (isAndroid: true, platformStatus: null, expected: true),
+        (isAndroid: false, platformStatus: const CoreStatus.stopped(), expected: true),
+      ];
+
+      for (final testCase in cases) {
+        expect(
+          shouldAttachBackgroundCoreDuringSetup(isAndroid: testCase.isAndroid, platformStatus: testCase.platformStatus),
+          testCase.expected,
+        );
+      }
+    });
+
+    test('deferred maintenance waits for idle after its existing delay without a periodic cadence', () {
+      final bootstrap = File('lib/bootstrap.dart').readAsStringSync();
+      final idleGateStart = bootstrap.indexOf('Future<void> _waitForUiIdle');
+      final initStart = bootstrap.indexOf('Future<T> _init', idleGateStart);
+      final profileStart = bootstrap.indexOf('Future<void> _warmUpDeferredProfileServices');
+      final platformStart = bootstrap.indexOf('Future<void> _warmUpDeferredPlatformServices', profileStart);
+      expect(idleGateStart, isNonNegative);
+      expect(initStart, isNonNegative);
+      expect(profileStart, isNonNegative);
+      expect(platformStart, isNonNegative);
+
+      final idleGate = bootstrap.substring(idleGateStart, initStart);
+      final deferredProfile = bootstrap.substring(profileStart, platformStart);
+      final deferredPlatform = bootstrap.substring(platformStart, idleGateStart);
+      expect(idleGate, contains('SchedulerBinding.instance.scheduleTask<void>'));
+      expect(idleGate, contains('Priority.idle'));
+      expect(deferredProfile.indexOf('Duration(seconds: 30)'), isNonNegative);
+      expect(deferredProfile.indexOf('_waitForUiIdle'), greaterThan(deferredProfile.indexOf('Duration(seconds: 30)')));
+      expect(deferredPlatform.indexOf('Duration(seconds: 10)'), isNonNegative);
+      expect(
+        deferredPlatform.indexOf('_waitForUiIdle'),
+        greaterThan(deferredPlatform.indexOf('Duration(seconds: 10)')),
+      );
+      expect(deferredProfile, isNot(contains('Timer.periodic')));
+      expect(deferredPlatform, isNot(contains('Timer.periodic')));
+
+      final foreground = File('lib/features/profile/notifier/profiles_update_notifier.dart').readAsStringSync();
+      final foregroundBuild = _extractFunctionBlock(foreground, 'Stream<ProfileUpdateStatus?> build()');
+      expect(foregroundBuild, isNotEmpty);
+      expect(foregroundBuild.indexOf('Timer(initialStartupDelay'), isNonNegative);
+      expect(
+        foregroundBuild.indexOf('SchedulerBinding.instance.scheduleTask<void>'),
+        greaterThan(foregroundBuild.indexOf('Timer(initialStartupDelay')),
+      );
+      expect(foregroundBuild, contains('Priority.idle'));
+      expect(foregroundBuild, isNot(contains('Timer.periodic')));
+
+      final perApp = File('lib/features/per_app_proxy/overview/per_app_proxy_service_notifier.dart').readAsStringSync();
+      final perAppBuild = _extractFunctionBlock(perApp, 'Future<void> build() async');
+      expect(perAppBuild, isNotEmpty);
+      final delay = perAppBuild.indexOf('delayed(initialStartupDelay)');
+      final idleTask = perAppBuild.indexOf('SchedulerBinding.instance.scheduleTask<void>');
+      final enumerate = perAppBuild.indexOf('InstalledApps.getInstalledApps');
+      expect(delay, isNonNegative);
+      expect(idleTask, greaterThan(delay));
+      expect(enumerate, greaterThan(idleTask));
+      expect(perAppBuild, contains('Priority.idle'));
+      expect(
+        RegExp(r'Timer\.periodic').allMatches(perAppBuild),
+        hasLength(1),
+        reason: 'the pre-existing daily refresh remains the only periodic cadence',
+      );
+    });
+
     test('initializes an uninitialized core only when the platform starts', () {
       final cases = [
         (platformStatus: const CoreStatus.starting(), coreInitialized: false, expected: true),
@@ -216,6 +287,50 @@ void main() {
         ),
         const CoreStatus.stopped(alert: CoreAlert.startService),
       );
+    });
+
+    test('manual stop clears native recovery before coalesced stop checks', () {
+      final source = File('lib/martencore/marten_core_service.dart').readAsStringSync();
+      const stopSignature = 'TaskEither<String, Unit> stop({bool forcePlatformCleanup = false})';
+      final signatureIndex = source.indexOf(stopSignature);
+      expect(signatureIndex, isNonNegative);
+      final bodyOpen = source.indexOf('}) {', signatureIndex);
+      expect(bodyOpen, isNonNegative);
+      var depth = 0;
+      var bodyClose = -1;
+      for (var index = bodyOpen + 2; index < source.length; index++) {
+        final char = source[index];
+        if (char == '{') depth++;
+        if (char == '}') {
+          depth--;
+          if (depth == 0) {
+            bodyClose = index;
+            break;
+          }
+        }
+      }
+
+      expect(bodyClose, isNonNegative);
+      final stopBlock = source.substring(bodyOpen + 3, bodyClose);
+      expect(stopBlock, isNotEmpty);
+
+      final clearRecovery = stopBlock.indexOf('_nativePlatformRecoveryInProgress = false');
+      final joinCheck = stopBlock.indexOf('if (runningStop != null)');
+      final redundantStopCondition = stopBlock.indexOf(
+        'isRedundantCoreStop(currentState, _latestPlatformServiceStatus)',
+      );
+      final forcePlatformCleanupGuard = stopBlock.indexOf('if (!forcePlatformCleanup &&');
+      final stopOnce = stopBlock.indexOf('final stopFuture = _stopOnce()');
+
+      expect(clearRecovery, isNonNegative);
+      expect(joinCheck, isNonNegative);
+      expect(redundantStopCondition, isNonNegative);
+      expect(forcePlatformCleanupGuard, isNonNegative);
+      expect(stopOnce, isNonNegative);
+      expect(clearRecovery, lessThan(joinCheck));
+      expect(clearRecovery, lessThan(redundantStopCondition));
+      expect(forcePlatformCleanupGuard, lessThan(redundantStopCondition));
+      expect(clearRecovery, lessThan(stopOnce));
     });
 
     test('promotes native recovery only after Android route-verified started', () {
@@ -434,6 +549,108 @@ void main() {
 
       expect(ready, isFalse);
       expect(reads, 1);
+    });
+  });
+
+  group('start settlement', () {
+    test('failed start terminal paths are handled through awaited cleanup and no unawaited stop', () {
+      final source = File('lib/martencore/marten_core_service.dart').readAsStringSync();
+      final startBlock = _extractFunctionBlock(source, 'TaskEither<ConnectionFailure, Unit> start(');
+      expect(startBlock, isNotEmpty);
+      expect(startBlock, contains('return _settleFailedStart('));
+      expect(startBlock, isNot(contains('unawaited(stop().run())')));
+
+      final localPortStart = startBlock.indexOf('if (!await _waitForCoreLocalPortsRelease())');
+      final localPortStop = startBlock.indexOf(
+        'await stop(forcePlatformCleanup: PlatformUtils.isAndroid).run();',
+        localPortStart,
+      );
+      final localPortReturn = startBlock.indexOf('return left(', localPortStart);
+      expect(localPortStart, isNonNegative);
+      expect(localPortStop, isNonNegative);
+      expect(localPortReturn, isNonNegative);
+      expect(localPortStop, lessThan(localPortReturn));
+
+      final returnLeftLines = startBlock
+          .split('\n')
+          .where((line) => line.trimLeft().startsWith('return left('))
+          .toList();
+      expect(
+        returnLeftLines.length,
+        equals(1),
+        reason: 'only local-port pre-start branch should return synchronously left after awaited forced cleanup',
+      );
+
+      final settleBlock = _extractFunctionBlock(source, 'Future<Either<ConnectionFailure, Unit>> _settleFailedStart(');
+      expect(settleBlock, isNotEmpty);
+
+      final cleanupStop = settleBlock.indexOf('await stop(forcePlatformCleanup: PlatformUtils.isAndroid).run()');
+      final terminalReturn = settleBlock.indexOf('return left(failure);');
+
+      expect(cleanupStop, isNonNegative);
+      expect(terminalReturn, isNonNegative);
+      expect(cleanupStop, lessThan(terminalReturn));
+    });
+
+    test('existing attached background core skips port release, forced stop and duplicate bgClient.start', () {
+      final source = File('lib/martencore/marten_core_service.dart').readAsStringSync();
+      final startBlock = _extractFunctionBlock(source, 'TaskEither<ConnectionFailure, Unit> start(');
+      expect(startBlock, isNotEmpty);
+
+      final setupResultIdx = startBlock.indexOf('final background = await core.setupBackground(path, name);');
+      final attachedBranchIdx = startBlock.indexOf('if (background case BackgroundCoreAttached(:final status)) {');
+      final attachedReturnIdx = startBlock.indexOf('return right(unit);', attachedBranchIdx);
+      final portReleaseIdx = startBlock.indexOf('await _waitForCoreLocalPortsRelease()');
+      final forcedStopIdx = startBlock.indexOf('await stop(forcePlatformCleanup: PlatformUtils.isAndroid).run();');
+      final bgStartIdx = startBlock.indexOf('final res = await core.bgClient.start(');
+
+      expect(setupResultIdx, isNonNegative);
+      expect(attachedBranchIdx, isNonNegative);
+      expect(attachedReturnIdx, isNonNegative);
+      expect(startBlock, contains('if (background case BackgroundCoreAttached(:final status)) {'));
+      expect(
+        startBlock,
+        contains('adopted existing background core; skipping fresh-start cleanup and duplicate start RPC'),
+      );
+      expect(portReleaseIdx, isNonNegative);
+      expect(forcedStopIdx, isNonNegative);
+      expect(bgStartIdx, isNonNegative);
+      expect(attachedBranchIdx, lessThan(portReleaseIdx));
+      expect(attachedReturnIdx, lessThan(portReleaseIdx));
+
+      final attachedBranch = startBlock.substring(attachedBranchIdx, attachedReturnIdx);
+      expect(attachedBranch, isNot(contains('await _waitForCoreLocalPortsRelease()')));
+      expect(attachedBranch, isNot(contains('await stop(forcePlatformCleanup: PlatformUtils.isAndroid).run();')));
+      expect(attachedBranch, isNot(contains('final res = await core.bgClient.start(')));
+      expect(
+        startBlock,
+        isNot(contains('if (background != const CoreStatus.started())')),
+        reason: 'old "attach only when not CoreStatus.started" gate is too narrow for race-safe attach',
+      );
+
+      expect(
+        attachedBranch,
+        isNot(contains('force-stopping previous core before retrying local ports')),
+        reason: 'attach branch should not execute forced cleanup',
+      );
+    });
+
+    test('fresh-start path still performs pre-start port quiescence before bgClient.start', () {
+      final source = File('lib/martencore/marten_core_service.dart').readAsStringSync();
+      final startBlock = _extractFunctionBlock(source, 'TaskEither<ConnectionFailure, Unit> start(');
+      expect(startBlock, isNotEmpty);
+
+      final portReleaseStart = startBlock.indexOf('if (!await _waitForCoreLocalPortsRelease())');
+      final portReleaseRetry = startBlock.indexOf('if (!await _waitForCoreLocalPortsRelease())', portReleaseStart + 1);
+      final forcedStop = startBlock.indexOf('await stop(forcePlatformCleanup: PlatformUtils.isAndroid).run();');
+      final bgStart = startBlock.indexOf('final res = await core.bgClient.start(');
+
+      expect(portReleaseStart, isNonNegative);
+      expect(forcedStop, isNonNegative);
+      expect(bgStart, isNonNegative);
+      expect(portReleaseStart, lessThan(forcedStop));
+      expect(forcedStop, lessThan(bgStart));
+      expect(portReleaseRetry, isNonNegative, reason: 'busy-port retry branch should remain for fresh starts');
     });
   });
 

@@ -83,7 +83,6 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
   bool _manualButtonDisconnectInProgress = false;
   bool _manualDisconnectInputSettling = false;
   bool _showIdleDuringAbort = false;
-  bool _coldAttachStatusPending = Platform.isAndroid;
   ConnectionFailure? _lastSilentAutoReconnectFailure;
   int _abortToken = 0;
 
@@ -209,15 +208,23 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
     final haptic = ref.read(hapticServiceProvider.notifier);
     switch (command) {
       case ManualConnectionCommand.connect:
-        await haptic.lightImpact();
+        _sendManualHaptic(haptic.lightImpact());
         await _connect();
       case ManualConnectionCommand.disconnect:
-        await haptic.mediumImpact();
+        _sendManualHaptic(haptic.mediumImpact());
         await _disconnectFromManualCommand();
       case ManualConnectionCommand.abort:
-        await haptic.mediumImpact();
+        _sendManualHaptic(haptic.mediumImpact());
         await abortConnection();
     }
+  }
+
+  void _sendManualHaptic(Future<void> feedback) {
+    unawaited(
+      feedback.catchError((Object error, StackTrace stackTrace) {
+        loggy.debug("haptic feedback failed: $error");
+      }),
+    );
   }
 
   Future<void> _disconnectFromManualCommand() async {
@@ -590,7 +597,6 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
       }
       if (!ownsSession) {
         loggy.warning("started core has no active native user-session intent; stopping stale cold-attach runtime");
-        _coldAttachStatusPending = false;
         await _disconnect(showError: false);
         state = const AsyncData(Disconnected());
         return;
@@ -601,10 +607,6 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
         (err) async {
           loggy.warning("existing started route verification failed", err);
           if (!_manualDisconnectRequested && ref.read(Preferences.startedByUser)) {
-            _coldAttachStatusPending = false;
-            if (state case AsyncData(value: Connecting(existingSessionVerification: true))) {
-              state = const AsyncData(Connecting());
-            }
             if (!_flutterOwnsAutomaticRecovery) {
               _existingStartedRouteVerificationFailures = 0;
               loggy.info("delegating automatic route recovery to the Android service");
@@ -955,16 +957,7 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
       afterAutoReconnect,
       disconnectInProgress: _manualButtonDisconnectInProgress || _manualDisconnectInputSettling,
     );
-    final coldAttach = visibleStatusForColdAttach(
-      afterManualButtonDisconnect,
-      isAndroid: Platform.isAndroid,
-      coldAttachStatusPending: _coldAttachStatusPending,
-      coreStarted: _connectionRepo.isCoreStartedSnapshot,
-      operationInProgress:
-          _singleStart.isRunning || _manualConnectPending || _autoReconnectPending || _autoReconnectRunning,
-    );
-    _coldAttachStatusPending = coldAttach.pending;
-    return coldAttach.status;
+    return afterManualButtonDisconnect;
   }
 
   ConnectionStatus _visibleStatusDuringAutoReconnect(ConnectionStatus event) {
@@ -1076,21 +1069,6 @@ bool shouldVerifyRouteAfterResume(
 
 bool existingStartedSessionIsOwned({required bool flutterStartedByUser, required bool? platformStartedByUser}) =>
     platformStartedByUser ?? flutterStartedByUser;
-
-({ConnectionStatus status, bool pending}) visibleStatusForColdAttach(
-  ConnectionStatus status, {
-  required bool isAndroid,
-  required bool coldAttachStatusPending,
-  required bool coreStarted,
-  required bool operationInProgress,
-}) {
-  if (!coldAttachStatusPending) return (status: status, pending: false);
-  final verifiesExistingSession = isAndroid && status is Connecting && coreStarted && !operationInProgress;
-  return (
-    status: verifiesExistingSession ? const Connecting(existingSessionVerification: true) : status,
-    pending: verifiesExistingSession,
-  );
-}
 
 Duration autoReconnectDelayForAttempt(int attempt, {required bool isAndroid}) {
   final delayIndex = attempt.clamp(0, ConnectionNotifier._autoReconnectDelays.length - 1);

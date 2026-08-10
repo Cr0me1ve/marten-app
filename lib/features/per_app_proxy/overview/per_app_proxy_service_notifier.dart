@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/scheduler.dart';
 import 'package:installed_apps/index.dart';
 import 'package:marten/core/preferences/general_preferences.dart';
 import 'package:marten/features/per_app_proxy/data/selected_data_provider.dart';
@@ -27,6 +28,8 @@ class PerAppProxyService extends _$PerAppProxyService {
     });
 
     await Future<void>.delayed(initialStartupDelay);
+    if (disposed) return;
+    await SchedulerBinding.instance.scheduleTask<void>(() {}, Priority.idle, debugLabel: 'installed apps maintenance');
     if (disposed) return;
 
     final phonePkgs = (await InstalledApps.getInstalledApps(false)).map((e) => e.packageName).toSet();

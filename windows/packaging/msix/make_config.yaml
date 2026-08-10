@@ -1,7 +1,7 @@
 display_name: Marten
 publisher_display_name: Marten
 identity_name: Marten.MartenNext
-msix_version: 0.6.4.0
+msix_version: 0.6.8.0
 logo_path: windows\runner\resources\app_icon.ico
 capabilities: internetClient, internetClientServer, privateNetworkClientServer
 languages: ar, en-us, es-es, fa-ir, fr-fr, id-id, pt-br, ru-ru, tr-tr, zh-cn, zh-tw

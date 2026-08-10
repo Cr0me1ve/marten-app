@@ -12,7 +12,6 @@ import 'package:marten/features/home/data/local_outbounds_provider.dart';
 import 'package:marten/features/home/widget/connection_button.dart';
 import 'package:marten/features/home/widget/subscription_panel.dart';
 import 'package:marten/features/profile/notifier/active_profile_notifier.dart';
-import 'package:marten/features/proxy/data/proxy_data_providers.dart';
 import 'package:marten/gen/assets.gen.dart';
 
 const _backgroundColor = Color(0xFF0D0C0E);
@@ -39,8 +38,12 @@ class HomePage extends HookConsumerWidget {
         remembered: remembered,
       );
       if (tag == null || tag.isEmpty) return;
-      await ref.read(selectedProxyByProfileProvider.notifier).select(activeProfile.id, tag, availableTags: tags);
-      await ref.read(proxyRepositoryProvider).selectProxy('select', tag).run();
+      if (remembered != tag) {
+        await ref.read(selectedProxyByProfileProvider.notifier).select(activeProfile.id, tag, availableTags: tags);
+      }
+      // ConnectionRepository has already selected this outbound and completed
+      // the fresh route probe before Connected is published. Do not reselect
+      // and launch a duplicate post-connect probe from the widget tree.
       ref.read(pendingProxySelectionProvider.notifier).selected = null;
     });
 

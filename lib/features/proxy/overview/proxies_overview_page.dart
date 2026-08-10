@@ -2,7 +2,6 @@ import 'dart:math';
 
 import 'package:fluentui_system_icons/fluentui_system_icons.dart';
 import 'package:flutter/material.dart';
-import 'package:gap/gap.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:marten/core/localization/translations.dart';
 import 'package:marten/core/model/failures.dart';
@@ -20,7 +19,6 @@ class ProxiesOverviewPage extends HookConsumerWidget with PresLogger {
     final t = ref.watch(translationsProvider).requireValue;
 
     final proxies = ref.watch(proxiesOverviewNotifierProvider);
-    final sortBy = ref.watch(proxiesSortNotifierProvider);
     final connection = ref.watch(connectionNotifierProvider).valueOrNull ?? const Disconnected();
     final selectionLocked = connection is! Disconnected;
 
@@ -29,21 +27,7 @@ class ProxiesOverviewPage extends HookConsumerWidget with PresLogger {
     // );
 
     return Scaffold(
-      appBar: AppBar(
-        title: Text(t.pages.proxies.title),
-        actions: [
-          PopupMenuButton<ProxiesSort>(
-            initialValue: sortBy,
-            onSelected: ref.read(proxiesSortNotifierProvider.notifier).update,
-            icon: const Icon(FluentIcons.arrow_sort_24_regular),
-            tooltip: t.pages.proxies.sort,
-            itemBuilder: (context) {
-              return [...ProxiesSort.values.map((e) => PopupMenuItem(value: e, child: Text(e.present(t))))];
-            },
-          ),
-          const Gap(8),
-        ],
-      ),
+      appBar: AppBar(title: Text(t.pages.proxies.title)),
       floatingActionButton: FloatingActionButton(
         onPressed: () async => await ref.read(proxiesOverviewNotifierProvider.notifier).urlTest("select"),
         tooltip: t.pages.proxies.testDelay,

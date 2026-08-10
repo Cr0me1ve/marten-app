@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:marten/core/preferences/preferences_provider.dart';
@@ -60,8 +61,17 @@ final localOutboundsProvider = FutureProvider<List<LocalOutbound>>((ref) async {
 
   final repo = await ref.watch(profileRepositoryProvider.future);
   final raw = await repo.getRawConfig(profile.id).run().then((e) => e.getOrElse((_) => ''));
-  return parseLocalOutbounds(raw);
+  return parseLocalOutboundsResponsively(raw);
 });
+
+const localOutboundsBackgroundParseThreshold = 64 * 1024;
+
+Future<List<LocalOutbound>> parseLocalOutboundsResponsively(String raw) {
+  if (raw.length < localOutboundsBackgroundParseThreshold) {
+    return Future.value(parseLocalOutbounds(raw));
+  }
+  return compute(parseLocalOutbounds, raw, debugLabel: 'parse local outbounds');
+}
 
 List<LocalOutbound> parseLocalOutbounds(String raw) {
   if (raw.isEmpty) return const [];
@@ -139,7 +149,6 @@ List<LocalOutbound> parseLocalOutbounds(String raw) {
         ),
       );
     }
-    result.sort(compareLocalOutboundsByName);
     return result;
   } catch (_) {
     return const [];
@@ -247,7 +256,6 @@ List<String> selectableOutboundTagsFromConfig(String raw) {
       if (!_isCoreSelectableOutbound(outbound)) continue;
       tags.add(outbound['tag'].toString());
     }
-    tags.sort(compareOutboundTagsByName);
     return tags;
   } catch (_) {
     return const [];
@@ -291,7 +299,6 @@ String prepareConfigForSelectedOutbound(String raw, String selectedTag) {
     }
 
     if (selectableOutbounds.isNotEmpty) {
-      selectableOutbounds.sort(_compareConfigOutboundsByName);
       final selectedIndex = selectableOutbounds.indexWhere((outbound) => outbound['tag'] == selectedTag);
       if (selectedIndex > 0) {
         final selected = selectableOutbounds.removeAt(selectedIndex);
@@ -493,7 +500,6 @@ void _patchSelectorDefaults(List<dynamic> outbounds, String selectedTag) {
       if (filteredItems.contains(selectedTag)) {
         item['outbounds'] = [selectedTag];
       } else {
-        filteredItems.sort(compareOutboundTagsByName);
         item['outbounds'] = filteredItems;
       }
     }
@@ -516,42 +522,6 @@ void _stripCoreUnsafeMartenMetadata(Map<String, dynamic> config) {
   for (final key in const ['split_tunnel', 'split_tunneling', 'servers', 'subscription']) {
     config.remove(key);
   }
-}
-
-int compareLocalOutboundsByName(LocalOutbound a, LocalOutbound b) {
-  final byName = _compareDisplayNames(a.displayName, b.displayName);
-  if (byName != 0) return byName;
-  return a.tag.compareTo(b.tag);
-}
-
-int compareOutboundTagsByName(String a, String b) {
-  final byName = _compareDisplayNames(stripTagMetadata(a), stripTagMetadata(b));
-  if (byName != 0) return byName;
-  return a.compareTo(b);
-}
-
-int _compareConfigOutboundsByName(Map<String, dynamic> a, Map<String, dynamic> b) {
-  return compareOutboundTagsByName(a['tag']?.toString() ?? '', b['tag']?.toString() ?? '');
-}
-
-int _compareDisplayNames(String a, String b) {
-  return _displaySortKey(a).compareTo(_displaySortKey(b));
-}
-
-String _displaySortKey(String value) {
-  final runes = value.trim().runes.toList();
-  var start = 0;
-  while (start + 1 < runes.length && _isRegionalIndicator(runes[start]) && _isRegionalIndicator(runes[start + 1])) {
-    start += 2;
-    while (start < runes.length && String.fromCharCode(runes[start]).trim().isEmpty) {
-      start++;
-    }
-  }
-  return String.fromCharCodes(runes.skip(start)).trim().toLowerCase();
-}
-
-bool _isRegionalIndicator(int rune) {
-  return rune >= 0x1F1E6 && rune <= 0x1F1FF;
 }
 
 class _ServerInfo {

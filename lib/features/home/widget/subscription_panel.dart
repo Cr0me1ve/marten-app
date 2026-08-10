@@ -35,9 +35,8 @@ class SubscriptionPanel extends HookConsumerWidget {
     final t = ref.watch(translationsProvider).requireValue;
     final activeProfile = ref.watch(activeProfileProvider).valueOrNull;
     final profiles = ref.watch(profilesNotifierProvider).valueOrNull ?? const <ProfileEntity>[];
-    final connectionStatus = ref.watch(connectionNotifierProvider).valueOrNull ?? const Disconnected();
+    final useLive = ref.watch(connectionNotifierProvider.select((value) => value.valueOrNull is Connected));
     final switchingProfileId = useState<String?>(null);
-    final useLive = connectionStatus is Connected;
 
     useEffect(() {
       Future.microtask(() => ref.read(localPingProvider.notifier).clear());
@@ -75,48 +74,50 @@ class SubscriptionPanel extends HookConsumerWidget {
 
     return ConstrainedBox(
       constraints: BoxConstraints(maxHeight: maxPanelHeight),
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 220),
-        curve: Curves.easeOut,
-        clipBehavior: Clip.antiAlias,
-        decoration: const BoxDecoration(
-          color: _panelColor,
-          borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            _PanelHeader(profile: activeProfile),
-            Flexible(
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxHeight: 400),
-                child: KeyedSubtree(
-                  key: ValueKey('subscription-profile-body-${activeProfile.id}'),
-                  child: const _PanelBody(),
+      child: ClipRRect(
+        borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
+        child: DecoratedBox(
+          decoration: const BoxDecoration(color: _panelColor),
+          child: AnimatedSize(
+            alignment: Alignment.topCenter,
+            duration: const Duration(milliseconds: 220),
+            curve: Curves.easeOut,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                _PanelHeader(profile: activeProfile),
+                Flexible(
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(maxHeight: 400),
+                    child: KeyedSubtree(
+                      key: ValueKey('subscription-profile-body-${activeProfile.id}'),
+                      child: _PanelBody(profile: activeProfile),
+                    ),
+                  ),
                 ),
-              ),
+                if (inactiveProfiles.isNotEmpty) ...[
+                  const Divider(height: 1, thickness: 1, color: _dividerColor),
+                  SizedBox(
+                    key: const ValueKey('subscription-collapsed-list'),
+                    height: inactiveListHeight,
+                    child: ListView.separated(
+                      primary: false,
+                      itemCount: inactiveProfiles.length,
+                      separatorBuilder: (_, _) => const Divider(height: 1, thickness: 1, color: _dividerColor),
+                      itemBuilder: (context, index) {
+                        final profile = inactiveProfiles[index];
+                        return _CollapsedProfileHeader(
+                          profile: profile,
+                          switching: switchingProfileId.value == profile.id,
+                          onTap: () => selectProfile(profile),
+                        );
+                      },
+                    ),
+                  ),
+                ],
+              ],
             ),
-            if (inactiveProfiles.isNotEmpty) ...[
-              const Divider(height: 1, thickness: 1, color: _dividerColor),
-              SizedBox(
-                key: const ValueKey('subscription-collapsed-list'),
-                height: inactiveListHeight,
-                child: ListView.separated(
-                  primary: false,
-                  itemCount: inactiveProfiles.length,
-                  separatorBuilder: (_, _) => const Divider(height: 1, thickness: 1, color: _dividerColor),
-                  itemBuilder: (context, index) {
-                    final profile = inactiveProfiles[index];
-                    return _CollapsedProfileHeader(
-                      profile: profile,
-                      switching: switchingProfileId.value == profile.id,
-                      onTap: () => selectProfile(profile),
-                    );
-                  },
-                ),
-              ),
-            ],
-          ],
+          ),
         ),
       ),
     );
@@ -166,8 +167,7 @@ class _PanelHeader extends HookConsumerWidget {
     final updateSucceeded = updateState?.valueOrNull != null;
     final updateFailed = updateState?.hasError ?? false;
     final showingFeedback = updateSucceeded || updateFailed;
-    final connection = ref.watch(connectionNotifierProvider).valueOrNull ?? const Disconnected();
-    final useLive = connection is Connected;
+    final useLive = ref.watch(connectionNotifierProvider.select((value) => value.valueOrNull is Connected));
 
     return Material(
       key: ValueKey('subscription-profile-${profile.id}-expanded'),
@@ -366,20 +366,37 @@ class _CollapsedProfileHeader extends ConsumerWidget {
   }
 }
 
-class _PanelBody extends ConsumerWidget {
-  const _PanelBody();
+class _PanelBody extends HookConsumerWidget {
+  const _PanelBody({required this.profile});
+
+  final ProfileEntity profile;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final connection = ref.watch(connectionNotifierProvider).valueOrNull ?? const Disconnected();
-    final useLive = connection is Connected;
+    final connection = ref.watch(connectionNotifierProvider.select((value) => value.valueOrNull));
+    final updating =
+        profile is RemoteProfileEntity &&
+        ref.watch(updateProfileNotifierProvider(profile.id).select((value) => value.isLoading));
+    final compactDuringRefresh = useRef(false);
+    final effectiveConnection = connection ?? const Disconnected();
+
+    if (updating && !effectiveConnection.isDisconnected) {
+      compactDuringRefresh.value = true;
+    } else if (!updating) {
+      compactDuringRefresh.value = false;
+    }
+
+    final currentOnly = !effectiveConnection.isDisconnected || compactDuringRefresh.value;
+    final selectionEnabled = effectiveConnection.isDisconnected && !compactDuringRefresh.value;
 
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
         const Divider(height: 1, thickness: 1, color: _dividerColor),
         Flexible(
-          child: useLive ? const _LiveServerList() : _OfflineServerList(selectionEnabled: connection is Disconnected),
+          child: effectiveConnection is Connected
+              ? const _LiveServerList()
+              : _OfflineServerList(selectionEnabled: selectionEnabled, currentOnly: currentOnly),
         ),
       ],
     );
@@ -397,45 +414,45 @@ class _LiveServerList extends ConsumerWidget {
 
     return proxies.when(
       data: (group) {
-        if (group == null || group.items.isEmpty) {
+        if (group == null || group.selected.tag.isEmpty) {
           return _PanelMessage(text: t.pages.proxies.empty);
         }
-        final items = [...group.items]..sort((a, b) => compareOutboundTagsByName(a.tag, b.tag));
+        final selected = group.items.firstWhere((item) => item.tag == group.selected.tag, orElse: () => group.selected);
         return ListView.separated(
           primary: false,
           shrinkWrap: true,
           padding: const EdgeInsets.symmetric(vertical: 4),
-          itemCount: items.length,
+          itemCount: 1,
           separatorBuilder: (_, _) => const Divider(height: 1, thickness: 1, color: _dividerColor),
           itemBuilder: (context, index) {
-            final proxy = items[index];
-            final ping = pings[proxy.tag];
+            final ping = pings[selected.tag];
             return _ServerTile(
-              tag: proxy.tag,
-              title: proxy.tagDisplay,
-              type: displayTypeForProxyLabel(proxy.type),
+              tag: selected.tag,
+              title: selected.tagDisplay,
+              type: displayTypeForProxyLabel(selected.type),
               countryCode:
-                  countryCodeFromTag(proxy.tag) ??
-                  (proxy.ipinfo.countryCode.isNotEmpty ? proxy.ipinfo.countryCode : null),
-              organization: proxy.ipinfo.org,
-              urlTestDelay: displayDelayWithLocalPing(coreDelay: proxy.urlTestDelay, localPing: ping),
+                  countryCodeFromTag(selected.tag) ??
+                  (selected.ipinfo.countryCode.isNotEmpty ? selected.ipinfo.countryCode : null),
+              organization: selected.ipinfo.org,
+              urlTestDelay: displayDelayWithLocalPing(coreDelay: selected.urlTestDelay, localPing: ping),
               pingPending: ping == 0,
-              selected: group.selected.tag == proxy.tag,
+              selected: true,
               onTap: null,
             );
           },
         );
       },
-      loading: () => const _OfflineServerList(selectionEnabled: false),
-      error: (_, _) => const _OfflineServerList(selectionEnabled: false),
+      loading: () => const _OfflineServerList(selectionEnabled: false, currentOnly: true),
+      error: (_, _) => const _OfflineServerList(selectionEnabled: false, currentOnly: true),
     );
   }
 }
 
-class _OfflineServerList extends ConsumerWidget {
-  const _OfflineServerList({required this.selectionEnabled});
+class _OfflineServerList extends HookConsumerWidget {
+  const _OfflineServerList({required this.selectionEnabled, this.currentOnly = false});
 
   final bool selectionEnabled;
+  final bool currentOnly;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -445,69 +462,77 @@ class _OfflineServerList extends ConsumerWidget {
     final pings = ref.watch(localPingProvider);
     final activeProfile = ref.watch(activeProfileProvider).valueOrNull;
     ref.watch(selectedProxyByProfileProvider);
+    final retainedItems = useRef<List<LocalOutbound>>(const []);
+    final latestItems = outbounds.valueOrNull;
 
-    return outbounds.when(
-      data: (items) {
-        if (items.isEmpty) {
-          return _PanelMessage(text: t.pages.proxies.empty);
-        }
-        final tags = items.map((item) => item.tag).toList(growable: false);
-        final remembered = activeProfile == null
-            ? null
-            : ref.read(selectedProxyByProfileProvider.notifier).rememberedTagFor(activeProfile.id, tags);
-        final selectedTag = resolveSelectedOutboundTag(tags, pending: pending, remembered: remembered);
-        if (activeProfile != null && selectedTag != null && remembered != selectedTag) {
-          Future.microtask(
-            () => ref
-                .read(selectedProxyByProfileProvider.notifier)
-                .select(activeProfile.id, selectedTag, availableTags: tags),
-          );
-        }
-        if (pending != null && pending != selectedTag) {
-          Future.microtask(() => ref.read(pendingProxySelectionProvider.notifier).selected = null);
-        }
-        return ListView.separated(
-          primary: false,
-          shrinkWrap: true,
-          padding: const EdgeInsets.symmetric(vertical: 4),
-          itemCount: items.length,
-          separatorBuilder: (_, _) => const Divider(height: 1, thickness: 1, color: _dividerColor),
-          itemBuilder: (context, index) {
-            final item = items[index];
-            final ping = pings[item.tag];
-            return _ServerTile(
-              tag: item.tag,
-              title: item.displayName,
-              type: item.type,
-              countryCode: item.countryCode,
-              organization: null,
-              urlTestDelay: switch (ping) {
-                null => 0,
-                0 => 0,
-                -1 => 999999,
-                _ => ping,
-              },
-              pingPending: ping == 0,
-              selected: item.tag == selectedTag,
-              onTap: selectionEnabled
-                  ? () async {
-                      ref.read(pendingProxySelectionProvider.notifier).selected = item.tag;
-                      if (activeProfile != null) {
-                        await ref
-                            .read(selectedProxyByProfileProvider.notifier)
-                            .select(activeProfile.id, item.tag, availableTags: tags);
-                      }
-                    }
-                  : null,
-            );
-          },
+    if (latestItems != null) {
+      retainedItems.value = latestItems;
+    }
+    final items = latestItems ?? retainedItems.value;
+
+    if (items.isNotEmpty) {
+      final tags = items.map((item) => item.tag).toList(growable: false);
+      final remembered = activeProfile == null
+          ? null
+          : ref.read(selectedProxyByProfileProvider.notifier).rememberedTagFor(activeProfile.id, tags);
+      final selectedTag = resolveSelectedOutboundTag(tags, pending: pending, remembered: remembered);
+      if (activeProfile != null && selectedTag != null && remembered != selectedTag) {
+        Future.microtask(
+          () => ref
+              .read(selectedProxyByProfileProvider.notifier)
+              .select(activeProfile.id, selectedTag, availableTags: tags),
         );
-      },
-      loading: () => const Padding(
-        padding: EdgeInsets.symmetric(vertical: 24),
-        child: Center(child: CircularProgressIndicator()),
-      ),
-      error: (_, _) => _PanelMessage(text: t.pages.proxies.empty),
+      }
+      if (pending != null && pending != selectedTag) {
+        Future.microtask(() => ref.read(pendingProxySelectionProvider.notifier).selected = null);
+      }
+      final visibleItems = currentOnly && selectedTag != null
+          ? items.where((item) => item.tag == selectedTag).take(1).toList(growable: false)
+          : items;
+      return ListView.separated(
+        primary: false,
+        shrinkWrap: true,
+        padding: const EdgeInsets.symmetric(vertical: 4),
+        itemCount: visibleItems.length,
+        separatorBuilder: (_, _) => const Divider(height: 1, thickness: 1, color: _dividerColor),
+        itemBuilder: (context, index) {
+          final item = visibleItems[index];
+          final ping = pings[item.tag];
+          return _ServerTile(
+            tag: item.tag,
+            title: item.displayName,
+            type: item.type,
+            countryCode: item.countryCode,
+            organization: null,
+            urlTestDelay: switch (ping) {
+              null => 0,
+              0 => 0,
+              -1 => 999999,
+              _ => ping,
+            },
+            pingPending: ping == 0,
+            selected: item.tag == selectedTag,
+            onTap: selectionEnabled
+                ? () async {
+                    ref.read(pendingProxySelectionProvider.notifier).selected = item.tag;
+                    if (activeProfile != null) {
+                      await ref
+                          .read(selectedProxyByProfileProvider.notifier)
+                          .select(activeProfile.id, item.tag, availableTags: tags);
+                    }
+                  }
+                : null,
+          );
+        },
+      );
+    }
+
+    if (latestItems != null || outbounds.hasError) {
+      return _PanelMessage(text: t.pages.proxies.empty);
+    }
+    return const Padding(
+      padding: EdgeInsets.symmetric(vertical: 24),
+      child: Center(child: CircularProgressIndicator()),
     );
   }
 }

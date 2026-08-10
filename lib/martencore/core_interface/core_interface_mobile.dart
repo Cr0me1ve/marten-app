@@ -33,6 +33,8 @@ bool shouldProbeExistingBackgroundCoreForManualStart({
     platformStatus is CoreStarted ||
     (platformStatus == null && backgroundChannelKnownAvailable);
 
+typedef _BackgroundCoreEndpoint = ({int port, CoreStatus status});
+
 class CoreInterfaceMobile extends CoreInterface with InfraLogger {
   static const channelPrefix = "app.marten.client";
   static const methodChannel = MethodChannel("$channelPrefix/method");
@@ -104,9 +106,9 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
     fgClient = CoreClient(_coreChannel(_portFront, channelOption));
 
     if (!await _keepCurrentBackgroundPortIfUsable(channelOption)) {
-      final attachedBackgroundPort = await _findStartedBackgroundPort(channelOption, includeStarting: true);
-      if (attachedBackgroundPort != null) {
-        _portBack = attachedBackgroundPort;
+      final attachedBackground = await _findAttachableBackgroundCore(channelOption, includeStarting: true);
+      if (attachedBackground != null) {
+        _portBack = attachedBackground.port;
         _isBgClientAvailable = true;
       } else {
         _portBack = await _selectAvailablePort(
@@ -234,7 +236,7 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
     return false;
   }
 
-  Future<int?> _findStartedBackgroundPort(
+  Future<_BackgroundCoreEndpoint?> _findAttachableBackgroundCore(
     ChannelCredentials channelCredentials, {
     bool includeStarting = false,
     bool includeStopped = false,
@@ -242,7 +244,8 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
     for (final port in _candidatePorts(_portBack)) {
       if (port == _portFront) continue;
       final status = await _coreStatusOnPort(port, channelCredentials);
-      if (!_isAttachableBackgroundStatus(status, includeStarting: includeStarting, includeStopped: includeStopped)) {
+      if (status == null ||
+          !_isAttachableBackgroundStatus(status, includeStarting: includeStarting, includeStopped: includeStopped)) {
         if (status != null) {
           loggy.warning("background core gRPC on 127.0.0.1:$port is $status; not attaching");
         }
@@ -254,7 +257,7 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
         } else {
           loggy.info("background core gRPC healthcheck passed on existing 127.0.0.1:$port");
         }
-        return port;
+        return (port: port, status: status);
       }
     }
     return null;
@@ -289,7 +292,7 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
     }
   }
 
-  Future<bool> _attachExistingBackgroundCore({
+  Future<_BackgroundCoreEndpoint?> _attachExistingBackgroundCore({
     Duration timeout = _backgroundAttachTimeout,
     bool includeStarting = false,
     bool includeStopped = false,
@@ -298,16 +301,16 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
     final deadline = DateTime.now().add(timeout);
     final tolerateStoppedUntil = DateTime.now().add(staleStoppedGrace);
     while (DateTime.now().isBefore(deadline)) {
-      final port = await _findStartedBackgroundPort(
+      final endpoint = await _findAttachableBackgroundCore(
         _channelCredentials,
         includeStarting: includeStarting,
         includeStopped: includeStopped,
       );
-      if (port != null) {
-        _portBack = port;
+      if (endpoint != null) {
+        _portBack = endpoint.port;
         bgClient = CoreClient(_coreChannel(_portBack, _channelCredentials));
         _isBgClientAvailable = true;
-        return true;
+        return endpoint;
       }
 
       final serviceStatus = await _serviceStatusSnapshot(timeout: const Duration(milliseconds: 250));
@@ -323,10 +326,10 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
             await Future.delayed(const Duration(milliseconds: 100));
             continue;
           }
-          return false;
+          return null;
       }
     }
-    return false;
+    return null;
   }
 
   Future<CoreStatus?> _serviceStatusSnapshot({required Duration timeout}) async {
@@ -411,8 +414,7 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
   }
 
   @override
-  Future<CoreStatus> setupBackground(String path, String name) async {
-    // if (!await waitUntilPort(portBack, false, stop)) return const CoreStatus.stopped(alert: CoreAlert.createService);
+  Future<BackgroundCoreSetupResult> setupBackground(String path, String name) async {
     final platformStatus = await readPlatformServiceStatus();
     final shouldProbeExisting = shouldProbeExistingBackgroundCoreForManualStart(
       isAndroid: Platform.isAndroid,
@@ -423,7 +425,7 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
       "manual background start platform_running=${platformStatus is CoreStarting || platformStatus is CoreStarted} "
       "channel_known=$_isBgClientAvailable probe_existing=$shouldProbeExisting",
     );
-    var attachedExisting = false;
+    _BackgroundCoreEndpoint? attachedExisting;
     if (shouldProbeExisting) {
       attachedExisting = await _attachExistingBackgroundCore(
         includeStarting: true,
@@ -433,16 +435,19 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
         staleStoppedGrace: backgroundAttachStoppedGrace(explicitManualStart: true),
       );
     }
-    final attachedStatus = attachedExisting ? await _coreStatusOnPort(_portBack, _channelCredentials) : null;
-    if (attachedExisting && attachedStatus is! CoreStopped) {
-      loggy.info("background service gRPC is already available; attached without stopping it");
-      return const CoreStarted();
+    if (attachedExisting?.status case CoreStarting() || CoreStarted()) {
+      loggy.info(
+        "background service gRPC is already available with ${attachedExisting!.status}; attached without stopping it",
+      );
+      return BackgroundCoreSetupResult.attached(attachedExisting.status);
     }
 
-    if (attachedExisting) {
+    if (attachedExisting != null) {
       loggy.info("background core gRPC shell is stopped; starting Android service on existing 127.0.0.1:$_portBack");
     } else {
-      if (!await stop()) return const CoreStatus.stopped(alert: CoreAlert.createService);
+      if (!await stop()) {
+        return const BackgroundCoreSetupResult.failed(CoreStatus.stopped(alert: CoreAlert.createService));
+      }
       _status.clean();
       _portBack = await _selectAvailablePort(
         preferred: _portBack,
@@ -466,28 +471,31 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
     )) {
       loggy.info("background core start wait cancelled by stop request");
       _isBgClientAvailable = false;
-      return const CoreStatus.stopped();
+      return const BackgroundCoreSetupResult.failed(CoreStatus.stopped());
     }
-    if (startStatus == const CoreStatus.started()) {
-      return startStatus;
+    final setupResult = BackgroundCoreSetupResult.fromStatus(startStatus);
+    if (setupResult is! BackgroundCoreSetupFailed) {
+      return setupResult;
     }
 
     final lateAttached = await _attachExistingBackgroundCore(
       timeout: _backgroundServiceLateAttachGrace,
       includeStarting: true,
     );
-    if (lateAttached && await _isMartenCoreHealthy(_portBack, _channelCredentials)) {
+    if (lateAttached != null) {
       loggy.warning("background core became healthy during late attach grace");
-      return const CoreStarted();
+      return BackgroundCoreSetupResult.attached(lateAttached.status);
     }
 
     if (startStatus is CoreStopped && startStatus.alert != null) {
-      return startStatus;
+      return BackgroundCoreSetupResult.failed(startStatus);
     }
 
     loggy.warning("background core service did not expose gRPC before timeout; stopping platform service");
     await stop();
-    return const CoreStatus.stopped(alert: CoreAlert.startService, message: "starting background core timed out");
+    return const BackgroundCoreSetupResult.failed(
+      CoreStatus.stopped(alert: CoreAlert.startService, message: "starting background core timed out"),
+    );
   }
 
   Future<void> _invokeBackgroundStartAndWait(String path, String name, int grpcPort) async {
@@ -502,24 +510,25 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
 
   Future<CoreStatus> _waitForBackgroundServiceReady({required Duration timeout, required int startGeneration}) async {
     final deadline = DateTime.now().add(timeout);
-    loggy.info("Waiting for starting core");
+    loggy.info("waiting for background service gRPC readiness");
     while (DateTime.now().isBefore(deadline)) {
       if (backgroundStartCancelled(
         startGeneration: startGeneration,
         lifecycleGeneration: _backgroundLifecycleGeneration,
       )) {
-        loggy.info("Waiting for starting core cancelled");
+        loggy.info("background service gRPC readiness wait cancelled");
         return const CoreStatus.stopped();
       }
-      if (await _isMartenCoreHealthy(_portBack, _channelCredentials)) {
-        loggy.info("Waiting for starting core finished");
-        return const CoreStarted();
+      final coreStatus = await _coreStatusOnPort(_portBack, _channelCredentials);
+      if (coreStatus != null) {
+        loggy.info("background service gRPC ready with $coreStatus");
+        return coreStatus;
       }
 
       final snapshot = await _serviceStatusSnapshot(timeout: const Duration(milliseconds: 250));
       switch (snapshot) {
         case CoreStopped(alert: final alert) when alert != null:
-          loggy.info("Waiting for starting core finished with alert");
+          loggy.info("background service start finished with alert");
           return snapshot;
         case CoreStarted():
         case CoreStarting():
@@ -531,11 +540,12 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
       await Future.delayed(_backgroundServicePollInterval);
     }
 
-    if (await _isMartenCoreHealthy(_portBack, _channelCredentials)) {
-      loggy.info("Waiting for starting core finished");
-      return const CoreStarted();
+    final coreStatus = await _coreStatusOnPort(_portBack, _channelCredentials);
+    if (coreStatus != null) {
+      loggy.info("background service gRPC ready with $coreStatus");
+      return coreStatus;
     }
-    loggy.info("Waiting for starting core finished");
+    loggy.info("background service gRPC readiness wait timed out");
     return const CoreStatus.stopped(alert: CoreAlert.startService, message: "starting background core timed out");
   }
 

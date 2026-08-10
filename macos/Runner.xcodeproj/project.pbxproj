@@ -523,9 +523,9 @@
 			baseConfigurationReference = 7C0B4F177A93E89661E9B0CB /* Pods-RunnerTests.debug.xcconfig */;
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
-				CURRENT_PROJECT_VERSION = 604;
+				CURRENT_PROJECT_VERSION = 608;
 				GENERATE_INFOPLIST_FILE = YES;
-				MARKETING_VERSION = 0.6.4;
+				MARKETING_VERSION = 0.6.8;
 				PRODUCT_BUNDLE_IDENTIFIER = app.marten.client.RunnerTests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_VERSION = 5.0;
@@ -538,9 +538,9 @@
 			baseConfigurationReference = 1C05D6984C93FE0E5C9038D0 /* Pods-RunnerTests.release.xcconfig */;
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
-				CURRENT_PROJECT_VERSION = 604;
+				CURRENT_PROJECT_VERSION = 608;
 				GENERATE_INFOPLIST_FILE = YES;
-				MARKETING_VERSION = 0.6.4;
+				MARKETING_VERSION = 0.6.8;
 				PRODUCT_BUNDLE_IDENTIFIER = app.marten.client.RunnerTests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_VERSION = 5.0;
@@ -553,9 +553,9 @@
 			baseConfigurationReference = D96FD811DCD14FAF8EC1F071 /* Pods-RunnerTests.profile.xcconfig */;
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
-				CURRENT_PROJECT_VERSION = 604;
+				CURRENT_PROJECT_VERSION = 608;
 				GENERATE_INFOPLIST_FILE = YES;
-				MARKETING_VERSION = 0.6.4;
+				MARKETING_VERSION = 0.6.8;
 				PRODUCT_BUNDLE_IDENTIFIER = app.marten.client.RunnerTests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_VERSION = 5.0;
