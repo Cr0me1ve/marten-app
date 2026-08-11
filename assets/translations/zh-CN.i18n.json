@@ -204,8 +204,8 @@
           "light": "浅色模式",
           "black": "纯黑模式"
         },
-        "enableAnalytics": "启用分析",
-        "enableAnalyticsMsg": "允许收集分析数据和发送崩溃报告以改进应用",
+        "enableAnalytics": "发送错误报告",
+        "enableAnalyticsMsg": "发送经过清理的崩溃报告和近期诊断上下文以改进应用",
         "autoIpCheck": "自动检查连接 IP",
         "dynamicNotification": "在通知中显示速度",
         "hapticFeedback": "触觉反馈",

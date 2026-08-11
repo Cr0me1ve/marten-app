@@ -4,6 +4,8 @@
 <dict>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>FirebaseCrashlyticsCollectionEnabled</key>
+	<false/>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIconFile</key>
@@ -24,6 +26,8 @@
 	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>$(PRODUCT_COPYRIGHT)</string>
+	<key>NSApplicationCrashOnExceptions</key>
+	<true/>
 	<key>NSMainNibFile</key>
 	<string>MainMenu</string>
 	<key>CFBundleURLTypes</key>
@@ -36,12 +40,58 @@
 			<key>CFBundleURLSchemes</key>
 			<array>
 				<string>marten</string>
+				<string>turncoat</string>
 				<string>v2ray</string>
 				<string>v2rayn</string>
 				<string>v2rayng</string>
 				<string>clash</string>
 				<string>clashmeta</string>
 				<string>sing-box</string>
+				<string>singbox</string>
+				<string>happ</string>
+				<string>hiddify</string>
+				<string>incy</string>
+				<string>icny</string>
+				<string>streisand</string>
+				<string>v2box</string>
+				<string>v2raytun</string>
+				<string>shadowrocket</string>
+				<string>sub</string>
+				<string>stash</string>
+				<string>surge</string>
+				<string>loon</string>
+				<string>quantumult</string>
+				<string>quantumult-x</string>
+				<string>karing</string>
+				<string>mihomo</string>
+				<string>clashx</string>
+				<string>clash-verge</string>
+				<string>nekobox</string>
+				<string>nekoray</string>
+				<string>surfboard</string>
+				<string>vless</string>
+				<string>svless</string>
+				<string>vmess</string>
+				<string>svmess</string>
+				<string>trojan</string>
+				<string>strojan</string>
+				<string>ss</string>
+				<string>tuic</string>
+				<string>hysteria</string>
+				<string>hysteria2</string>
+				<string>hy2</string>
+				<string>ssh</string>
+				<string>wg</string>
+				<string>wireguard</string>
+				<string>ssconf</string>
+				<string>ssconf+http</string>
+				<string>warp</string>
+				<string>socks</string>
+				<string>phttp</string>
+				<string>phttps</string>
+				<string>xvmess</string>
+				<string>xvless</string>
+				<string>xtrojan</string>
 			</array>
 		</dict>
 	</array>

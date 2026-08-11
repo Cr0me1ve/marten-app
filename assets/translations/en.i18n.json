@@ -206,8 +206,8 @@
           "light": "Light mode",
           "black": "Black mode"
         },
-        "enableAnalytics": "Enable analytics",
-        "enableAnalyticsMsg": "Give permission to collect analytics and send crash reports to improve the app",
+        "enableAnalytics": "Send error reports",
+        "enableAnalyticsMsg": "Send privacy-safe crash reports and recent diagnostic context to improve the app",
         "autoIpCheck": "Automatically check connection IP",
         "dynamicNotification": "Display speed in notification",
         "hapticFeedback": "Haptic feedback",

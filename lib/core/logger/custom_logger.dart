@@ -1,5 +1,6 @@
 // ignore_for_file: avoid_print
 
+import 'dart:async';
 import 'dart:io';
 
 import 'package:loggy/loggy.dart';
@@ -71,6 +72,8 @@ class FileLogPrinter extends LoggyPrinter {
     }
     _writer.add(buffer.toString(), timestamp: record.time);
   }
+
+  Future<T> runSynchronized<T>(Future<T> Function() operation) => _writer.runSynchronized(operation);
 
   Future<void> dispose() => _writer.close();
 }

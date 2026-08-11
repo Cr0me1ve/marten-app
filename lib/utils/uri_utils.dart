@@ -35,7 +35,10 @@ abstract class UriUtils {
       final file = XFile(uri.path, mimeType: mimeType);
       final result = await Share.shareXFiles([file]);
       loggy.debug('share result status: ${result.status.name}');
-      return result.status == ShareResultStatus.success;
+      // Every returned status means the platform accepted the handoff:
+      // `dismissed` is user cancellation, while `unavailable` only means the
+      // platform cannot report which action the user chose.
+      return true;
     } catch (error) {
       loggy.warning('error sharing local file (${error.runtimeType})');
       return false;

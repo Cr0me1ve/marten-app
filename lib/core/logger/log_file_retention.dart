@@ -64,12 +64,21 @@ class LogFileRetention {
 
   static String trimToRetention(String content, {DateTime? now}) {
     final reference = now ?? DateTime.now();
-    final kept = retainItems<List<String>>(
+    final retained = retainItems<List<String>>(
       entries(content),
       timestampOf: (entry) => timestampFromLine(entry.first, now: reference),
       levelOf: (entry) => _levelFromPersistedLine(entry.first),
       now: reference,
-    ).map((entry) => entry.join('\n').trimRight()).toList();
+    );
+    final exactTimestampedEntries = <String>{};
+    final kept = <String>[];
+    for (final entry in retained) {
+      final serialized = entry.join('\n').trimRight();
+      final timestamped = timestampFromLine(entry.first, now: reference) != null;
+      if (!timestamped || exactTimestampedEntries.add(serialized)) {
+        kept.add(serialized);
+      }
+    }
     return kept.isEmpty ? '' : '${kept.join('\n')}\n';
   }
 
@@ -170,7 +179,15 @@ class LogFileRetention {
     return timestamp;
   }
 
-  static String formatTimestamp(DateTime time) => time.toLocal().toIso8601String();
+  static String formatTimestamp(DateTime time) {
+    final local = time.toLocal();
+    final offset = local.timeZoneOffset;
+    final sign = offset.isNegative ? '-' : '+';
+    final totalMinutes = offset.inMinutes.abs();
+    final hours = (totalMinutes ~/ 60).toString().padLeft(2, '0');
+    final minutes = (totalMinutes % 60).toString().padLeft(2, '0');
+    return '${local.toIso8601String()}$sign$hours:$minutes';
+  }
 
   static String? _levelFromPersistedLine(String line) {
     final separator = line.indexOf(' - ');

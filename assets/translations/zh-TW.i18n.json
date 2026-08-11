@@ -204,8 +204,8 @@
           "light": "淺色模式",
           "black": "純黑模式"
         },
-        "enableAnalytics": "啟用分析",
-        "enableAnalyticsMsg": "允許收集分析資料和傳送崩潰報告以改進應用程式",
+        "enableAnalytics": "傳送錯誤報告",
+        "enableAnalyticsMsg": "傳送已清理的當機報告與近期診斷內容以改善應用程式",
         "autoIpCheck": "自動檢查連線 IP",
         "dynamicNotification": "在通知中顯示速度",
         "hapticFeedback": "觸覺回饋",

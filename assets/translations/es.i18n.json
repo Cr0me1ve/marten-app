@@ -204,8 +204,8 @@
           "light": "Modo claro",
           "black": "Modo negro"
         },
-        "enableAnalytics": "Habilitar análisis",
-        "enableAnalyticsMsg": "Dar permiso para recopilar análisis y enviar informes de fallos para mejorar la aplicación",
+        "enableAnalytics": "Enviar informes de errores",
+        "enableAnalyticsMsg": "Enviar informes depurados y contexto de diagnóstico reciente para mejorar la aplicación",
         "autoIpCheck": "Comprobar IP de conexión automáticamente",
         "dynamicNotification": "Mostrar velocidad en la notificación",
         "hapticFeedback": "Respuesta háptica",

@@ -204,8 +204,8 @@
           "light": "Mode terang",
           "black": "Mode hitam"
         },
-        "enableAnalytics": "Aktifkan analitik",
-        "enableAnalyticsMsg": "Berikan izin untuk mengumpulkan analitik dan mengirim laporan kerusakan untuk meningkatkan aplikasi",
+        "enableAnalytics": "Kirim laporan kesalahan",
+        "enableAnalyticsMsg": "Kirim laporan kerusakan yang telah dibersihkan dan konteks diagnostik terbaru untuk meningkatkan aplikasi",
         "autoIpCheck": "Periksa IP koneksi secara otomatis",
         "dynamicNotification": "Tampilkan kecepatan di notifikasi",
         "hapticFeedback": "Umpan balik haptik",

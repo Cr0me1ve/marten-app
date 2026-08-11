@@ -3,6 +3,8 @@ import 'dart:io';
 
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:in_app_review/in_app_review.dart';
+import 'package:marten/core/analytics/analytics_controller.dart';
+import 'package:marten/core/analytics/analytics_logger.dart';
 import 'package:marten/core/haptic/haptic_service.dart';
 import 'package:marten/core/localization/translations.dart';
 import 'package:marten/core/preferences/general_preferences.dart';
@@ -20,11 +22,17 @@ import 'package:marten/singbox/model/core_status.dart';
 import 'package:marten/utils/utils.dart';
 import 'package:riverpod_annotation/riverpod_annotation.dart';
 import 'package:rxdart/rxdart.dart';
-import 'package:sentry_flutter/sentry_flutter.dart';
 
 part 'connection_notifier.g.dart';
 
 enum ManualConnectionCommand { connect, disconnect, abort }
+
+String _crashConnectionState(ConnectionStatus status) => switch (status) {
+  Disconnected() => 'disconnected',
+  Connecting() => 'connecting',
+  Connected() => 'connected',
+  Disconnecting() => 'disconnecting',
+};
 
 const manualDisconnectInputSettleDelay = Duration(milliseconds: 750);
 
@@ -108,6 +116,9 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
       if (previous == next) return;
       final previousStatus = previous?.valueOrNull;
       final nextStatus = next.valueOrNull;
+      if (nextStatus != null) {
+        crashReporter.setContext('connection_state', _crashConnectionState(nextStatus));
+      }
       _handleAutoReconnectTransition(previousStatus, nextStatus);
       _handleRouteWatchdogTransition(nextStatus);
       _handleStartupRouteVerification(nextStatus);
@@ -204,6 +215,8 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
       loggy.debug("stale manual $command ignored for current status $currentStatus");
       return;
     }
+
+    crashReporter.setContext('last_action', 'manual_${command.name}');
 
     final haptic = ref.read(hapticServiceProvider.notifier);
     switch (command) {
@@ -431,7 +444,13 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
       }
       loggy.warning("error connecting", err);
       if (err.toString().contains("panic")) {
-        await Sentry.captureException(Exception(err.toString()));
+        await ref
+            .read(analyticsControllerProvider.notifier)
+            .recordNonFatal(
+              StateError('native core panic reported during connect'),
+              StackTrace.current,
+              reason: 'native_core_panic_connect',
+            );
       }
       final platformStatus = await _connectionRepo.readPlatformServiceStatus();
       final platformStartedByUser = await _connectionRepo.readPlatformStartedByUser();

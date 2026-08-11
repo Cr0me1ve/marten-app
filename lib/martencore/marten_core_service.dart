@@ -9,6 +9,7 @@ import 'package:loggy/loggy.dart' as loggyl;
 import 'package:marten/core/directories/directories_provider.dart';
 import 'package:marten/core/logger/buffered_file_writer.dart';
 import 'package:marten/core/logger/log_file_retention.dart';
+import 'package:marten/core/logger/logger_controller.dart';
 import 'package:marten/core/logger/sensitive_data_redactor.dart';
 import 'package:marten/core/notification/in_app_notification_controller.dart';
 import 'package:marten/core/preferences/general_preferences.dart';
@@ -89,11 +90,19 @@ class MartenCoreService with InfraLogger {
     if (emit) statusController.add(next);
   }
 
-  void setCoreLogFilePath(String path) {
+  Future<void> setCoreLogFilePath(String path) async {
+    if (_coreLogFile?.path == path && _coreLogWriter != null) return;
     final previousWriter = _coreLogWriter;
-    if (previousWriter != null) unawaited(previousWriter.close());
+    _coreLogWriter = null;
+    if (previousWriter != null) await previousWriter.close();
     _coreLogFile = File(path);
     _coreLogWriter = BufferedFileWriter(_coreLogFile!);
+  }
+
+  Future<T> runCoreLogSynchronized<T>(Future<T> Function() operation) {
+    final writer = _coreLogWriter;
+    if (writer == null) return operation();
+    return writer.runSynchronized(operation);
   }
 
   Future<bool> notifyBackgroundStarted() => core.notifyBackgroundStarted();
@@ -900,7 +909,12 @@ class MartenCoreService with InfraLogger {
       _coreLogDeduplicator.clear();
       final file = _coreLogFile;
       if (file != null) {
-        await _coreLogWriter?.clear();
+        final writer = _coreLogWriter;
+        if (writer != null) {
+          await writer.clear();
+        } else {
+          await file.writeAsString('', flush: true);
+        }
       }
       runtimeLogController.add(const []);
       logController.add(const []);
@@ -1106,10 +1120,9 @@ class MartenCoreService with InfraLogger {
         _persistCoreLog(safeEvent);
         runtimeLogController.add(List.unmodifiable(runtimeLogBuffer));
         logController.add(List.unmodifiable(logBuffer));
-        // loggy.log(getLogLevel(event.level), event.message);
-        safeEvent.message.split('\n').forEach((line) {
-          loggy.log(getLogLevel(event.level), line);
-        });
+        for (final line in safeEvent.message.split('\n')) {
+          LoggerController.instance.onCoreLog(loggyl.LogRecord(getLogLevel(event.level), line, 'MartenCoreService'));
+        }
         return event;
       });
     });

@@ -62,8 +62,8 @@ else
 	TARGET=lib/main_dev.dart
 endif
 
-BUILD_ARGS=--dart-define sentry_dsn=$(SENTRY_DSN)
-DISTRIBUTOR_ARGS=--skip-clean --build-target $(TARGET) --build-dart-define sentry_dsn=$(SENTRY_DSN)
+BUILD_ARGS=
+DISTRIBUTOR_ARGS=--skip-clean --build-target $(TARGET)
 
 
 
@@ -272,8 +272,7 @@ android-apk-release:
 	  --targets apk \
 	  --skip-clean \
 	  --build-target=$(TARGET) \
-	  --build-target-platform=android-arm,android-arm64,android-x64 \
-	  --build-dart-define=sentry_dsn=$(SENTRY_DSN)
+	  --build-target-platform=android-arm,android-arm64,android-x64
 	ls -R build/app/outputs
 
 android-aab-release:
@@ -282,7 +281,6 @@ android-aab-release:
 	  --targets aab \
 	  --skip-clean \
 	  --build-target=$(TARGET) \
-	  --build-dart-define=sentry_dsn=$(SENTRY_DSN) \
 	  --build-dart-define=release=google-play
 
 windows-release: windows-zip-release windows-exe-release windows-msix-release
@@ -293,7 +291,6 @@ windows-zip-release:
 	  --targets zip \
 	  --skip-clean \
 	  --build-target=$(TARGET) \
-	  --build-dart-define=sentry_dsn=$(SENTRY_DSN) \
 	  --build-dart-define=portable=true
 	@FULL_PATH=$$(ls dist/*/*.zip | head -n 1); \
 	ZIP_DIR=$$(dirname "$$FULL_PATH"); \
@@ -314,16 +311,14 @@ windows-exe-release:
 	  --platform windows \
 	  --targets exe \
 	  --skip-clean \
-	  --build-target=$(TARGET) \
-	  --build-dart-define=sentry_dsn=$(SENTRY_DSN)
+	  --build-target=$(TARGET)
 
 windows-msix-release:
 	fastforge package \
 	  --platform windows \
 	  --targets msix \
 	  --skip-clean \
-	  --build-target=$(TARGET) \
-	  --build-dart-define=sentry_dsn=$(SENTRY_DSN)
+	  --build-target=$(TARGET)
 
 linux-release: linux-deb-release linux-appimage-release
 
@@ -338,8 +333,7 @@ linux-deb-release:
 	--platform linux \
 	--targets deb \
 	--skip-clean \
-	--build-target=$(TARGET) \
-	--build-dart-define=sentry_dsn=$(SENTRY_DSN)
+	--build-target=$(TARGET)
 
 
 # ==============================================================================
@@ -376,8 +370,7 @@ linux-appimage-release:
 	--platform linux \
 	--targets appimage \
 	--skip-clean \
-	--build-target=$(TARGET) \
-	--build-dart-define=sentry_dsn=$(SENTRY_DSN)
+	--build-target=$(TARGET)
 	@$(YELLOW)Post-processing AppImage$(DONE); \
 	$(BLUE)Extracting AppImage$(DONE); \
 	cd dist/* && ./*.AppImage --appimage-extract > /dev/null; \

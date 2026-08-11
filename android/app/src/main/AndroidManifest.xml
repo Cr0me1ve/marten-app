@@ -43,6 +43,12 @@
             android:name="flutter_deeplinking_enabled"
             android:value="true" />
 
+        <!-- Remote diagnostics are explicit opt-in. The runtime preference can
+             enable collection after Firebase is initialized. -->
+        <meta-data
+            android:name="firebase_crashlytics_collection_enabled"
+            android:value="false" />
+
         <meta-data
             android:name="android.app.shortcuts"
             android:resource="@xml/shortcuts" />
@@ -88,6 +94,51 @@
                 <data android:scheme="clash" />
                 <data android:scheme="clashmeta" />
                 <data android:scheme="sing-box" />
+                <data android:scheme="singbox" />
+                <data android:scheme="happ" />
+                <data android:scheme="hiddify" />
+                <data android:scheme="incy" />
+                <data android:scheme="icny" />
+                <data android:scheme="streisand" />
+                <data android:scheme="v2box" />
+                <data android:scheme="v2raytun" />
+                <data android:scheme="shadowrocket" />
+                <data android:scheme="sub" />
+                <data android:scheme="stash" />
+                <data android:scheme="surge" />
+                <data android:scheme="loon" />
+                <data android:scheme="quantumult" />
+                <data android:scheme="quantumult-x" />
+                <data android:scheme="karing" />
+                <data android:scheme="mihomo" />
+                <data android:scheme="clashx" />
+                <data android:scheme="clash-verge" />
+                <data android:scheme="nekobox" />
+                <data android:scheme="nekoray" />
+                <data android:scheme="surfboard" />
+                <data android:scheme="vless" />
+                <data android:scheme="svless" />
+                <data android:scheme="vmess" />
+                <data android:scheme="svmess" />
+                <data android:scheme="trojan" />
+                <data android:scheme="strojan" />
+                <data android:scheme="ss" />
+                <data android:scheme="tuic" />
+                <data android:scheme="hysteria" />
+                <data android:scheme="hysteria2" />
+                <data android:scheme="hy2" />
+                <data android:scheme="ssh" />
+                <data android:scheme="wg" />
+                <data android:scheme="wireguard" />
+                <data android:scheme="ssconf" />
+                <data android:scheme="ssconf+http" />
+                <data android:scheme="warp" />
+                <data android:scheme="socks" />
+                <data android:scheme="phttp" />
+                <data android:scheme="phttps" />
+                <data android:scheme="xvmess" />
+                <data android:scheme="xvless" />
+                <data android:scheme="xtrojan" />
 
                 <!-- <data android:host="import" />
                 <data android:host="install-config" />

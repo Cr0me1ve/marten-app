@@ -40,8 +40,8 @@ Some generated protocol bindings reflect interfaces provided by the native runti
 
 This repository deliberately excludes `marten-core` and release runtime artifacts such as Android AARs and iOS frameworks. They must be obtained or built through the authorized release process before packaging a native release. The preparation targets in the [Makefile](../Makefile) identify the required integration points.
 
-The Android Firebase configuration file is also intentionally absent. It is only needed for optional push support; builds without it should retain the normal no-push behavior.
+Firebase configuration files are also intentionally absent. They are only needed for optional Android push support and opt-in Crashlytics reporting; builds without them should keep both integrations disabled while preserving normal app behavior.
 
 ## Keeping a working tree safe
 
-Never commit credentials, imported profiles, subscription URLs, signing material, `android/app/google-services.json`, or local runtime artifacts. Check `git status` before committing and keep generated changes limited to the generators you ran.
+Never commit credentials, imported profiles, subscription URLs, signing material, Firebase configuration files, or local runtime artifacts. Check `git status` before committing and keep generated changes limited to the generators you ran.

@@ -11,7 +11,7 @@ typedef _CoreLogFingerprint = ({int seconds, int nanos, int level, int type, Str
 /// log observer. Listening to both is still useful for lifecycle recovery, but
 /// it means the same observer event can reach Flutter twice. Keep a small FIFO
 /// of exact event identities so that duplicate delivery does not duplicate the
-/// rolling buffers, file writes, Sentry breadcrumbs, or TURNcoat log scanning.
+/// rolling buffers, file writes, Crashlytics context, or TURNcoat log scanning.
 class CoreLogDeduplicator {
   CoreLogDeduplicator({this.capacity = 256}) : assert(capacity > 0);
 

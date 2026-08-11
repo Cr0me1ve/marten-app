@@ -6,6 +6,7 @@ import 'dart:math' as math;
 import 'package:flutter/foundation.dart';
 import 'package:fpdart/fpdart.dart';
 import 'package:marten/core/logger/log_file_retention.dart';
+import 'package:marten/core/logger/logger_controller.dart';
 import 'package:marten/core/utils/exception_handler.dart';
 import 'package:marten/features/log/data/log_parser.dart';
 import 'package:marten/features/log/data/log_path_resolver.dart';
@@ -19,6 +20,7 @@ abstract interface class LogRepository {
   TaskEither<LogFailure, Unit> init();
   Stream<Either<LogFailure, List<LogEntity>>> watchLogs();
   TaskEither<LogFailure, Unit> clearLogs();
+  Future<File> prepareShareFile(LogExportMetadata metadata);
 }
 
 class LogRepositoryImpl with ExceptionHandler, InfraLogger implements LogRepository {
@@ -55,7 +57,7 @@ class LogRepositoryImpl with ExceptionHandler, InfraLogger implements LogReposit
         // prune in their serialized background write chains. Waiting for the
         // same retention scan here delayed the home screen and scanned each
         // file twice during every cold launch.
-        singbox.setCoreLogFilePath(logPathResolver.coreFile().path);
+        await singbox.setCoreLogFilePath(logPathResolver.coreFile().path);
       }
       return right(unit);
     }, LogUnexpectedFailure.new);
@@ -80,14 +82,22 @@ class LogRepositoryImpl with ExceptionHandler, InfraLogger implements LogReposit
     return exceptionHandler(() async {
       final result = await singbox.clearLogs().mapLeft(LogFailure.unexpected).run();
       if (!kIsWeb) {
-        await logPathResolver.coreFile().writeAsString('', flush: true);
-        await logPathResolver.appFile().writeAsString('', flush: true);
+        await LoggerController.instance.runAppLogSynchronized(
+          () => logPathResolver.appFile().writeAsString('', flush: true),
+        );
       }
       _persistedCache = const [];
       _persistedCacheAt = DateTime.now();
       _persistedReadFuture = null;
       return result;
     }, LogFailure.unexpected);
+  }
+
+  @override
+  Future<File> prepareShareFile(LogExportMetadata metadata) {
+    return singbox.runCoreLogSynchronized(
+      () => LoggerController.instance.runAppLogSynchronized(() => logPathResolver.prepareShareFile(metadata: metadata)),
+    );
   }
 
   Future<List<LogEntity>> _readPersistedLogs({bool force = false}) async {

@@ -1,5 +1,8 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:loggy/loggy.dart';
+import 'package:marten/core/analytics/analytics_logger.dart';
 import 'package:marten/core/logger/custom_logger.dart';
 import 'package:marten/utils/custom_loggers.dart';
 
@@ -20,6 +23,7 @@ class LoggerController extends LoggyPrinter with InfraLogger {
   static void init(String appLogPath, {bool debugConsole = true}) {
     _instance = LoggerController(ConsolePrinter(minLevel: debugConsole ? LogLevel.debug : LogLevel.info), {
       "app": kIsWeb ? const ConsolePrinter() : FileLogPrinter(appLogPath),
+      "crash-reporting": crashReporter,
     });
     Loggy.initLoggy(logPrinter: _instance);
   }
@@ -54,5 +58,23 @@ class LoggerController extends LoggyPrinter with InfraLogger {
     for (final printer in otherPrinters.values) {
       printer.onLog(record);
     }
+  }
+
+  /// Sends native-core diagnostics to the console and analytics without
+  /// duplicating them in app.log; the canonical copy lives in box.log.
+  void onCoreLog(LogRecord record) {
+    consolePrinter.onLog(record);
+    for (final entry in otherPrinters.entries) {
+      if (entry.key == 'app') continue;
+      entry.value.onLog(record);
+    }
+  }
+
+  Future<T> runAppLogSynchronized<T>(Future<T> Function() operation) {
+    final printer = otherPrinters['app'];
+    if (printer case FileLogPrinter()) {
+      return printer.runSynchronized(operation);
+    }
+    return operation();
   }
 }

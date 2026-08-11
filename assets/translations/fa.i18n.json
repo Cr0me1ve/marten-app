@@ -204,8 +204,8 @@
           "light": "حالت روشن",
           "black": "حالت مشکی"
         },
-        "enableAnalytics": "فعال‌سازی آمار",
-        "enableAnalyticsMsg": "اجازه جمع‌آوری آمار و ارسال گزارش‌های خطا برای بهبود برنامه",
+        "enableAnalytics": "ارسال گزارش خطا",
+        "enableAnalyticsMsg": "ارسال گزارش‌های پاک‌سازی‌شده و اطلاعات تشخیصی اخیر برای بهبود برنامه",
         "autoIpCheck": "بررسی خودکار IP اتصال",
         "dynamicNotification": "نمایش سرعت در اعلان",
         "hapticFeedback": "بازخورد لرزشی",

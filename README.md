@@ -40,13 +40,13 @@ More detail for contributors is in [docs/development.md](docs/development.md). F
 
 Native builds, including `flutter run`, need separately built artifacts from [marten-core](https://github.com/Cr0me1ve/marten-core) and its [marten-sing-box](https://github.com/Cr0me1ve/marten-sing-box) dependency. Native artifacts are intentionally not committed here, so a fresh clone is sufficient for Flutter and Dart work but not for running or packaging a native build. The platform preparation targets in [Makefile](Makefile) show where those artifacts are expected during a release build.
 
-## Android push setup
+## Optional Firebase setup
 
-Android push support is optional. The Firebase configuration file `android/app/google-services.json` is intentionally excluded from the repository. If it is not supplied in a local build, push registration is disabled gracefully and the rest of the app continues to work.
+Firebase configuration files are intentionally excluded from the repository. Android push support and privacy-safe Crashlytics reporting are optional; without local Firebase configuration, both integrations are disabled gracefully and the rest of the app continues to work. Crash reporting is also disabled by default at runtime and requires explicit user opt-in.
 
 ## Privacy
 
-Marten processes the profiles you import on your device in order to establish the requested connection. Connection endpoints, credentials, and subscription links can be sensitive: do not include them in issues, logs, screenshots, or pull requests. The project does not bundle a profile provider or a telemetry requirement.
+Marten processes the profiles you import on your device in order to establish the requested connection. Connection endpoints, credentials, and subscription links can be sensitive: do not include them in issues, logs, screenshots, or pull requests. The project does not bundle a profile provider, Firebase Analytics, tracking, or a telemetry requirement.
 
 ## Contributing
 

@@ -1,15 +1,69 @@
 import 'dart:convert';
 import 'dart:io';
-import 'dart:math' as math;
+import 'dart:isolate';
 
 import 'package:marten/core/logger/log_file_retention.dart';
 import 'package:marten/core/logger/sensitive_data_redactor.dart';
 import 'package:path/path.dart' as p;
 
+class LogExportMetadata {
+  const LogExportMetadata({
+    required this.generatedAt,
+    required this.appName,
+    required this.appVersion,
+    required this.appBuildNumber,
+    required this.platform,
+    required this.timeZoneOffset,
+    required this.timeZoneName,
+  });
+
+  factory LogExportMetadata.now({
+    required String appName,
+    required String appVersion,
+    required String appBuildNumber,
+    required String platform,
+  }) {
+    final generatedAt = DateTime.now();
+    return LogExportMetadata(
+      generatedAt: generatedAt,
+      appName: appName,
+      appVersion: appVersion,
+      appBuildNumber: appBuildNumber,
+      platform: platform,
+      timeZoneOffset: generatedAt.timeZoneOffset,
+      timeZoneName: generatedAt.timeZoneName,
+    );
+  }
+
+  final DateTime generatedAt;
+  final String appName;
+  final String appVersion;
+  final String appBuildNumber;
+  final String platform;
+  final Duration timeZoneOffset;
+  final String timeZoneName;
+
+  String get generatedAtUtc => generatedAt.toUtc().toIso8601String();
+
+  String get generatedAtLocal {
+    final shifted = generatedAt.toUtc().add(timeZoneOffset).toIso8601String();
+    final wallClock = shifted.endsWith('Z') ? shifted.substring(0, shifted.length - 1) : shifted;
+    return '$wallClock${_formatUtcOffset(timeZoneOffset)}';
+  }
+
+  String get formattedTimeZone => '$timeZoneName (UTC${_formatUtcOffset(timeZoneOffset)})';
+
+  static String _formatUtcOffset(Duration offset) {
+    final sign = offset.isNegative ? '-' : '+';
+    final totalMinutes = offset.inMinutes.abs();
+    final hours = (totalMinutes ~/ 60).toString().padLeft(2, '0');
+    final minutes = (totalMinutes % 60).toString().padLeft(2, '0');
+    return '$sign$hours:$minutes';
+  }
+}
+
 class LogPathResolver {
   const LogPathResolver(this._workingDir);
-
-  static const _shareTailBytes = 512 * 1024;
 
   final Directory _workingDir;
 
@@ -51,45 +105,58 @@ class LogPathResolver {
     return File(p.join(directory.path, "marten-logs.txt"));
   }
 
-  Future<File> prepareShareFile() async {
+  Future<File> prepareShareFile({required LogExportMetadata metadata}) async {
     await LogFileRetention.prepare(coreFile());
     await LogFileRetention.prepare(appFile());
 
     final file = shareFile();
     final buffer = StringBuffer()
       ..writeln("Marten logs")
+      ..writeln("Generated local: ${metadata.generatedAtLocal}")
+      ..writeln("Generated UTC: ${metadata.generatedAtUtc}")
+      ..writeln("Time zone: ${metadata.formattedTimeZone}")
+      ..writeln("App: ${metadata.appName} ${metadata.appVersion} (${metadata.appBuildNumber})")
+      ..writeln("Platform: ${metadata.platform}")
+      ..writeln("Log timestamps use local device time; legacy entries without an offset use the export time zone.")
       ..writeln();
 
-    await _appendLogFiles(buffer, title: "Core logs", files: coreFiles());
-    await _appendLogFile(buffer, title: "App logs", file: appFile());
+    await _appendLogFiles(buffer, title: "Core logs", source: "core", files: coreFiles());
+    await _appendLogFile(buffer, title: "App logs", source: "app", file: appFile());
 
-    await file.writeAsString(SensitiveDataRedactor.redact(buffer.toString()), flush: true);
+    final rawExport = buffer.toString();
+    final safeExport = await Isolate.run(() => SensitiveDataRedactor.redact(rawExport));
+    await file.writeAsString(safeExport, flush: true);
     return file;
   }
 
-  Future<void> _appendLogFiles(StringBuffer buffer, {required String title, required List<File> files}) async {
+  Future<void> _appendLogFiles(
+    StringBuffer buffer, {
+    required String title,
+    required String source,
+    required List<File> files,
+  }) async {
     buffer
       ..writeln("===== $title =====")
       ..writeln();
 
     for (final file in files) {
-      await _appendLogFile(buffer, file: file);
+      await _appendLogFile(buffer, source: source, file: file);
     }
   }
 
-  Future<void> _appendLogFile(StringBuffer buffer, {String? title, required File file}) async {
+  Future<void> _appendLogFile(StringBuffer buffer, {String? title, required String source, required File file}) async {
     if (title != null) {
       buffer
         ..writeln("===== $title =====")
         ..writeln();
     }
 
-    buffer.writeln("Source: ${p.relative(file.path, from: directory.path)}");
+    buffer.writeln("Source: $source");
 
     if (!await file.exists()) {
       buffer.writeln("(missing)");
     } else {
-      final content = SensitiveDataRedactor.redact(await _readShareTail(file));
+      final content = await _readShareContent(file);
       if (content.trim().isEmpty) {
         buffer.writeln("(empty)");
       } else {
@@ -103,23 +170,7 @@ class LogPathResolver {
     buffer.writeln();
   }
 
-  Future<String> _readShareTail(File file) async {
-    final length = await file.length();
-    if (length <= _shareTailBytes) {
-      return utf8.decode(await file.readAsBytes(), allowMalformed: true);
-    }
-
-    final raf = await file.open();
-    try {
-      final start = length - _shareTailBytes;
-      await raf.setPosition(start);
-      final bytes = await raf.read(math.min(_shareTailBytes, length));
-      final content = utf8.decode(bytes, allowMalformed: true);
-      final newline = content.indexOf('\n');
-      final tail = newline >= 0 ? content.substring(newline + 1) : content;
-      return '[truncated to last $_shareTailBytes bytes]\n$tail';
-    } finally {
-      await raf.close();
-    }
+  Future<String> _readShareContent(File file) async {
+    return utf8.decode(await file.readAsBytes(), allowMalformed: true);
   }
 }

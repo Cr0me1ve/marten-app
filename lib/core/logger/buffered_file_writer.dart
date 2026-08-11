@@ -42,6 +42,26 @@ class BufferedFileWriter {
     await _writeChain;
   }
 
+  /// Runs [operation] after every pending write and keeps later writes queued
+  /// behind it. This is used for snapshots and other file operations that
+  /// must not race with the buffered writer.
+  Future<T> runSynchronized<T>(Future<T> Function() operation) {
+    if (_closed) {
+      return Future<T>.error(StateError('BufferedFileWriter is closed'));
+    }
+
+    _enqueueFlush();
+    final result = Completer<T>();
+    _writeChain = _writeChain.onError((_, _) {}).then((_) async {
+      try {
+        result.complete(await operation());
+      } catch (error, stackTrace) {
+        result.completeError(error, stackTrace);
+      }
+    });
+    return result.future;
+  }
+
   Future<void> clear() async {
     if (_closed) return;
     _flushTimer?.cancel();

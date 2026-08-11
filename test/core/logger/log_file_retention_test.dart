@@ -161,6 +161,36 @@ void main() {
       expect(trimmed, 'raw legacy line\n');
     });
 
+    test('removes exact retained duplicates without dropping distinct error context', () {
+      final now = DateTime(2026, 6, 3, 15);
+      const duplicate = '2026-06-03T12:00:00.000 - [INFO] repeated context';
+      const distinct = '2026-06-03T12:00:01.000 - [INFO] distinct context';
+      final content = [duplicate, duplicate, distinct, '2026-06-03T14:30:00.000 - [ERROR] failure', ''].join('\n');
+
+      final trimmed = LogFileRetention.trimToRetention(content, now: now);
+
+      expect(duplicate.allMatches(trimmed), hasLength(1));
+      expect(trimmed, contains(distinct));
+      expect(trimmed, contains('failure'));
+    });
+
+    test('does not collapse entries that only share a timestamp or message', () {
+      final now = DateTime(2026, 6, 3, 15);
+      final content = [
+        '2026-06-03T14:30:00.000 - [INFO] same timestamp',
+        '2026-06-03T14:30:00.000 - [WARN] same timestamp',
+        '2026-06-03T14:31:00.000 - [INFO] same message',
+        '2026-06-03T14:32:00.000 - [INFO] same message',
+        '',
+      ].join('\n');
+
+      final trimmed = LogFileRetention.trimToRetention(content, now: now);
+
+      expect(LogFileRetention.entries(trimmed), hasLength(4));
+      expect(trimmed, contains('[WARN] same timestamp'));
+      expect('same message'.allMatches(trimmed), hasLength(2));
+    });
+
     test('prunes malformed utf8 log files without throwing', () async {
       final dir = await Directory.systemTemp.createTemp('marten-malformed-log-');
       addTearDown(() async {

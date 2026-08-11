@@ -1,7 +1,6 @@
 import UIKit
 import Flutter
 import MartenCore
-import Sentry
 import UserNotifications
 import workmanager_apple
 @main

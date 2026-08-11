@@ -7,6 +7,7 @@ import 'package:flutter_displaymode/flutter_displaymode.dart';
 import 'package:flutter_native_splash/flutter_native_splash.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:marten/core/analytics/analytics_controller.dart';
+import 'package:marten/core/analytics/analytics_logger.dart';
 import 'package:marten/core/app_info/app_info_provider.dart';
 import 'package:marten/core/directories/directories_provider.dart';
 import 'package:marten/core/localization/translations.dart';
@@ -28,7 +29,6 @@ import 'package:marten/features/window/notifier/window_notifier.dart';
 import 'package:marten/martencore/marten_core_service_provider.dart';
 import 'package:marten/riverpod_observer.dart';
 import 'package:marten/utils/utils.dart';
-import 'package:sentry_flutter/sentry_flutter.dart';
 
 Future<void> lazyBootstrap(WidgetsBinding widgetsBinding, Environment env) async {
   if (!kIsWeb) {
@@ -51,6 +51,19 @@ Future<void> lazyBootstrap(WidgetsBinding widgetsBinding, Environment env) async
 
   final (_, appInfo, _) = await (directoriesFuture, appInfoFuture, preferencesFuture).wait;
   LoggerController.init(container.read(logPathResolverProvider).appFile().path, debugConsole: !PlatformUtils.isMobile);
+  final crashReportingEnabled =
+      container.read(sharedPreferencesProvider).requireValue.getBool(enableAnalyticsPrefKey) ?? false;
+  crashReporter
+    ..setContextCollectionEnabled(crashReportingEnabled)
+    ..setContext('environment', env.name)
+    ..startLifecycleTracking();
+  final enableCrashReporting = await _safeInit(
+    "crash reporting preference",
+    () => container.read(analyticsControllerProvider.future),
+  );
+  if (enableCrashReporting == true) {
+    await _safeInit("crash reporting", () => container.read(analyticsControllerProvider.notifier).enableAnalytics());
+  }
 
   await _init("preferences migration", () async {
     try {
@@ -89,12 +102,7 @@ Future<void> lazyBootstrap(WidgetsBinding widgetsBinding, Environment env) async
 
   WidgetsBinding.instance.addTimingsCallback(onFirstFrameTimings);
 
-  runApp(
-    UncontrolledProviderScope(
-      container: container,
-      child: SentryUserInteractionWidget(child: const App()),
-    ),
-  );
+  runApp(UncontrolledProviderScope(container: container, child: const App()));
 
   if (!kIsWeb) {
     FlutterNativeSplash.remove();
@@ -105,7 +113,6 @@ Future<void> lazyBootstrap(WidgetsBinding widgetsBinding, Environment env) async
     stopWatch.stop();
     unawaited(_warmUpAfterFirstFrame(container, appInfo, debug));
   });
-  // SentryFlutter.s(DateTime.now().toUtc());
 }
 
 Future<void> _warmUpAfterFirstFrame(ProviderContainer container, AppInfoEntity appInfo, bool debug) async {
@@ -115,14 +122,6 @@ Future<void> _warmUpAfterFirstFrame(ProviderContainer container, AppInfoEntity a
       : _safeInit("marten-core", () => container.read(martenCoreServiceProvider).init());
   if (PlatformUtils.isAndroid) {
     Logger.bootstrap.info("Android marten-core warm-up follows authoritative service state");
-  }
-
-  final enableAnalytics = await _safeInit(
-    "analytics preference",
-    () => container.read(analyticsControllerProvider.future),
-  );
-  if (enableAnalytics == true) {
-    await _safeInit("analytics", () => container.read(analyticsControllerProvider.notifier).enableAnalytics());
   }
 
   if (PlatformUtils.isDesktop) {

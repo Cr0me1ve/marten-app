@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:marten/core/analytics/analytics_controller.dart';
 import 'package:marten/core/localization/locale_extensions.dart';
 import 'package:marten/core/localization/locale_preferences.dart';
@@ -7,7 +8,7 @@ import 'package:marten/core/preferences/general_preferences.dart';
 import 'package:marten/core/router/dialog/dialog_notifier.dart';
 import 'package:marten/core/theme/app_theme_mode.dart';
 import 'package:marten/core/theme/theme_preferences.dart';
-import 'package:hooks_riverpod/hooks_riverpod.dart';
+import 'package:marten/utils/platform_utils.dart';
 
 class LocalePrefTile extends ConsumerWidget {
   const LocalePrefTile({super.key});
@@ -46,6 +47,10 @@ class EnableAnalyticsPrefTile extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    if (!(PlatformUtils.isAndroid || PlatformUtils.isIOS || PlatformUtils.isMacOS)) {
+      return const SizedBox.shrink();
+    }
+
     final t = ref.watch(translationsProvider).requireValue;
 
     final enabled = ref.watch(analyticsControllerProvider).requireValue;
@@ -53,7 +58,7 @@ class EnableAnalyticsPrefTile extends ConsumerWidget {
     return SwitchListTile.adaptive(
       title: Text(t.pages.settings.general.enableAnalytics),
       subtitle: Text(t.pages.settings.general.enableAnalyticsMsg, style: Theme.of(context).textTheme.bodySmall),
-      secondary: const Icon(Icons.analytics_rounded),
+      secondary: const Icon(Icons.bug_report_outlined),
       value: enabled,
       onChanged: (value) async {
         if (onChanged != null) {

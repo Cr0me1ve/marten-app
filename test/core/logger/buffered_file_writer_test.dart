@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -77,6 +78,47 @@ void main() {
     final content = await file.readAsString();
     expect(content, isNot(contains('stale-0')));
     expect(content, contains('fresh-after-initial-prune'));
+  });
+
+  test('flushes pending data before a synchronized operation and serializes later appends', () async {
+    final file = File('${directory.path}/synchronized.log');
+    final writer = BufferedFileWriter(file, flushInterval: const Duration(hours: 1));
+    final operationStarted = Completer<void>();
+    final releaseOperation = Completer<void>();
+
+    writer.add('before\n');
+    final operation = writer.runSynchronized(() async {
+      expect(await file.readAsString(), 'before\n');
+      operationStarted.complete();
+      await releaseOperation.future;
+      await file.writeAsString('snapshot\n', mode: FileMode.append, flush: true);
+    });
+
+    await operationStarted.future;
+    writer.add('after\n');
+    releaseOperation.complete();
+    await operation;
+    await writer.flush();
+
+    expect(await file.readAsString(), 'before\nsnapshot\nafter\n');
+    await writer.close();
+  });
+
+  test('keeps the writer queue usable after a synchronized operation fails', () async {
+    final file = File('${directory.path}/synchronized-error.log');
+    final writer = BufferedFileWriter(file, flushInterval: const Duration(hours: 1));
+
+    writer.add('before\n');
+    await expectLater(
+      writer.runSynchronized<void>(() async => throw StateError('simulated snapshot failure')),
+      throwsA(isA<StateError>()),
+    );
+
+    writer.add('after\n');
+    await writer.flush();
+
+    expect(await file.readAsString(), 'before\nafter\n');
+    await writer.close();
   });
 
   test('initial asynchronous prune failures are isolated from the write chain', () {

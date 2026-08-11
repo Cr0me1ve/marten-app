@@ -5,10 +5,12 @@ import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:fpdart/fpdart.dart';
 import 'package:gap/gap.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
+import 'package:marten/core/app_info/app_info_provider.dart';
 import 'package:marten/core/localization/translations.dart';
 import 'package:marten/core/model/failures.dart';
 import 'package:marten/core/widget/adaptive_icon.dart';
 import 'package:marten/features/log/data/log_data_providers.dart';
+import 'package:marten/features/log/data/log_path_resolver.dart';
 import 'package:marten/features/log/model/log_entity.dart';
 import 'package:marten/features/log/model/log_level.dart';
 import 'package:marten/features/log/overview/logs_overview_notifier.dart';
@@ -25,8 +27,10 @@ class LogsPage extends HookConsumerWidget with PresLogger {
     final notifier = ref.watch(logsOverviewNotifierProvider.notifier);
 
     final pathResolver = ref.watch(logPathResolverProvider);
+    final appInfo = ref.watch(appInfoProvider).requireValue;
 
     final filterController = useTextEditingController(text: state.filter);
+    final exporting = useState(false);
 
     return Scaffold(
       appBar: AppBar(
@@ -53,14 +57,39 @@ class LogsPage extends HookConsumerWidget with PresLogger {
             iconSize: 20,
           ),
           IconButton(
-            onPressed: () async {
-              final file = await pathResolver.prepareShareFile();
-              await UriUtils.tryShareOrLaunchFile(
-                file.uri,
-                fileOrDir: pathResolver.directory.uri,
-                mimeType: "text/plain",
-              );
-            },
+            onPressed: exporting.value
+                ? null
+                : () async {
+                    exporting.value = true;
+                    try {
+                      final metadata = LogExportMetadata.now(
+                        appName: appInfo.name,
+                        appVersion: appInfo.version,
+                        appBuildNumber: appInfo.buildNumber,
+                        platform: appInfo.operatingSystem,
+                      );
+                      final file = await ref.read(logRepositoryProvider).requireValue.prepareShareFile(metadata);
+                      final opened = await UriUtils.tryShareOrLaunchFile(
+                        file.uri,
+                        fileOrDir: pathResolver.directory.uri,
+                        mimeType: "text/plain",
+                      );
+                      if (!opened && context.mounted) {
+                        ScaffoldMessenger.of(
+                          context,
+                        ).showSnackBar(SnackBar(content: Text(t.common.msg.export.file.failure)));
+                      }
+                    } catch (error, stackTrace) {
+                      loggy.warning("error sharing logs", error, stackTrace);
+                      if (context.mounted) {
+                        ScaffoldMessenger.of(
+                          context,
+                        ).showSnackBar(SnackBar(content: Text(t.common.msg.export.file.failure)));
+                      }
+                    } finally {
+                      if (context.mounted) exporting.value = false;
+                    }
+                  },
             icon: Icon(AdaptiveIcon(context).share),
             tooltip: t.common.share,
             iconSize: 20,

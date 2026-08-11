@@ -1,61 +1,56 @@
-import 'package:flutter/foundation.dart';
-import 'package:marten/core/analytics/analytics_filter.dart';
-import 'package:marten/core/analytics/analytics_logger.dart';
+import 'dart:io';
 
-import 'package:marten/core/logger/logger_controller.dart';
-import 'package:marten/core/model/environment.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:flutter/foundation.dart';
+import 'package:marten/core/analytics/analytics_logger.dart';
 import 'package:marten/core/preferences/preferences_provider.dart';
 import 'package:marten/utils/custom_loggers.dart';
 import 'package:riverpod_annotation/riverpod_annotation.dart';
-import 'package:sentry_flutter/sentry_flutter.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 part 'analytics_controller.g.dart';
 
-const String enableAnalyticsPrefKey = "enable_analytics";
-
-bool _testCrashReport = false;
+// Kept for preference migration compatibility. The setting now controls only
+// privacy-safe Firebase Crashlytics reports; Firebase Analytics is not used.
+const String enableAnalyticsPrefKey = 'enable_analytics';
 
 @Riverpod(keepAlive: true)
 class AnalyticsController extends _$AnalyticsController with AppLogger {
   @override
   Future<bool> build() async {
-    return _preferences.getBool(enableAnalyticsPrefKey) ?? false;
+    if (!_supportsCrashlytics) {
+      crashReporter.setContextCollectionEnabled(false);
+      return false;
+    }
+    final enabled = _preferences.getBool(enableAnalyticsPrefKey) ?? false;
+    crashReporter.setContextCollectionEnabled(enabled);
+    return enabled;
   }
 
   SharedPreferences get _preferences => ref.read(sharedPreferencesProvider).requireValue;
 
+  bool get _supportsCrashlytics => !kIsWeb && (Platform.isAndroid || Platform.isIOS || Platform.isMacOS);
+
   Future<void> enableAnalytics() async {
+    if (!_supportsCrashlytics) {
+      crashReporter.setContextCollectionEnabled(false);
+      state = const AsyncData(false);
+      return;
+    }
     if (state case AsyncData(value: final enabled)) {
-      loggy.debug("enabling analytics");
+      loggy.debug('enabling privacy-safe crash reporting');
       state = const AsyncLoading();
       if (!enabled) {
         await _preferences.setBool(enableAnalyticsPrefKey, true);
       }
+      crashReporter.setContextCollectionEnabled(true);
 
-      // final env = ref.read(environmentProvider);
-      // final appInfo = await ref.read(appInfoProvider.future);
-      final dsn = !kDebugMode || _testCrashReport ? Environment.sentryDSN : "";
-      final sentryLogger = SentryLoggyIntegration();
-      LoggerController.instance.addPrinter("analytics", sentryLogger);
-
-      await SentryFlutter.init((options) {
-        options.dsn = dsn;
-        // options.environment = env.name;
-        // options.dist = appInfo.release.name;
-        options.debug = kDebugMode;
-        options.enableNativeCrashHandling = true;
-        options.enableNdkScopeSync = true;
-        options.sendDefaultPii = false;
-        // options.autoAppStart = false;
-        // options.attachScreenshot = true;
-        options.serverName = "";
-        options.attachThreads = true;
-        options.tracesSampleRate = 0;
-        options.enableUserInteractionTracing = false;
-        options.addIntegration(sentryLogger);
-        options.beforeSend = sentryBeforeSend;
-      });
+      try {
+        if (Firebase.apps.isEmpty) await Firebase.initializeApp();
+        await crashReporter.enable(discardExistingReports: !enabled);
+      } catch (error, stackTrace) {
+        loggy.warning('Firebase Crashlytics initialization failed (${error.runtimeType})', error, stackTrace);
+      }
 
       state = const AsyncData(true);
     }
@@ -63,12 +58,14 @@ class AnalyticsController extends _$AnalyticsController with AppLogger {
 
   Future<void> disableAnalytics() async {
     if (state case AsyncData()) {
-      loggy.debug("disabling analytics");
+      loggy.debug('disabling crash reporting');
       state = const AsyncLoading();
       await _preferences.setBool(enableAnalyticsPrefKey, false);
-      await Sentry.close();
-      await LoggerController.instance.removePrinter("analytics");
+      await crashReporter.disable();
       state = const AsyncData(false);
     }
   }
+
+  Future<void> recordNonFatal(Object error, StackTrace stackTrace, {required String reason}) =>
+      crashReporter.recordError(error, stackTrace, reason: reason);
 }

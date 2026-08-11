@@ -4,7 +4,6 @@ enum Environment {
   prod,
   dev;
 
-  static const sentryDSN = String.fromEnvironment("sentry_dsn");
   // This environment variable is set in the 'windows-release-zip' command
   static const isPortable = bool.fromEnvironment("portable");
 }
