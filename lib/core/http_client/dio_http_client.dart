@@ -140,6 +140,34 @@ class DioHttpClient with InfraLogger {
     );
   }
 
+  Future<Response<T>> delete<T>(
+    String url, {
+    Object? data,
+    CancelToken? cancelToken,
+    String? userAgent,
+    ({String username, String password})? credentials,
+    Map<String, String>? extraHeaders,
+    bool proxyOnly = false,
+  }) async {
+    final mode = proxyOnly
+        ? "proxy"
+        : await isPortOpen("127.0.0.1", port)
+        ? "both"
+        : "direct";
+    final dio = _dio[mode]!;
+
+    return _requestFollowingRedirects<T>(
+      dio,
+      url,
+      method: 'DELETE',
+      data: data,
+      cancelToken: cancelToken,
+      userAgent: userAgent,
+      credentials: credentials,
+      extraHeaders: extraHeaders,
+    );
+  }
+
   Future<Response> download(
     String url,
     String path, {

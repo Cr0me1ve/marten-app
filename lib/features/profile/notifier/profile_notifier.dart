@@ -65,7 +65,9 @@ class AddProfileNotifier extends _$AddProfileNotifier with AppLogger {
       final markAsActive = await _shouldMarkImportedProfileActive();
       final TaskEither<ProfileFailure, Unit> task;
       if (LinkParser.parse(rawInput) case (final rs)?) {
-        final userOverride = rs.name.isNotEmpty ? UserOverride(name: rs.name) : null;
+        final userOverride = rs.name.isNotEmpty || rs.pushEndpoint != null
+            ? UserOverride(name: rs.name.isEmpty ? null : rs.name, pushEndpoint: rs.pushEndpoint)
+            : null;
         if (LinkParser.isRemoteProfileUrl(rs.url)) {
           loggy.debug("adding remote profile, mark as active? [$markAsActive]");
           task = profilesRepo.upsertRemote(

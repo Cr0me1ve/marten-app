@@ -111,10 +111,7 @@ class SubscriptionPushRefreshService with AppLogger {
   }
 
   Future<void> _registerProfile(String token, RemoteProfileEntity profile) async {
-    final candidateUrls = ProfileParser.subscriptionCandidateUrls(
-      profile.url,
-      profile: profile,
-    ).map(pushTokenRegistrationUrlFor).whereType<Uri>().toList();
+    final candidateUrls = pushTokenRegistrationUrlsFor(profile);
     if (candidateUrls.isEmpty) return;
 
     final prefs = _ref.read(sharedPreferencesProvider).requireValue;
@@ -148,6 +145,30 @@ class SubscriptionPushRefreshService with AppLogger {
     }
     if (lastError != null) {
       loggy.warning('push token registration failed for profile [${profile.id}] (${lastError.runtimeType})');
+    }
+  }
+
+  Future<void> unregisterProfile(RemoteProfileEntity profile) async {
+    if (!PlatformUtils.isMobile) return;
+    final prefs = _ref.read(sharedPreferencesProvider).requireValue;
+    final bindingId = await readPushBindingId(prefs, profile.id, create: false);
+    if (bindingId == null) return;
+    await prefs.remove('$_pushBindingPrefix${profile.id}');
+
+    final candidateUrls = pushTokenRegistrationUrlsFor(profile);
+    final deviceIdentity = await _ref.read(deviceIdentityProvider.future);
+    final client = _ref.read(httpClientProvider);
+    for (final registrationUrl in candidateUrls) {
+      try {
+        await client.delete(
+          registrationUrl.toString(),
+          data: {'push_binding_id': bindingId},
+          extraHeaders: {'X-Device-ID': deviceIdentity.deviceId, 'X-Client-Secret': deviceIdentity.clientSecret},
+        );
+        break;
+      } catch (error) {
+        loggy.debug('push token unregister failed for profile [${profile.id}] (${error.runtimeType})');
+      }
     }
   }
 }
@@ -246,6 +267,32 @@ Future<String?> readPushBindingId(SharedPreferences prefs, String profileId, {re
   final generated = const Uuid().v4();
   await prefs.setString(key, generated);
   return generated;
+}
+
+@visibleForTesting
+List<Uri> pushTokenRegistrationUrlsFor(RemoteProfileEntity profile) {
+  final urls = <Uri>[];
+  final seen = <String>{};
+  final explicit = externalPushTokenRegistrationUrl(profile.userOverride?.pushEndpoint);
+  if (explicit != null && seen.add(explicit.toString())) {
+    urls.add(explicit);
+  }
+  for (final url in ProfileParser.subscriptionCandidateUrls(profile.url, profile: profile)) {
+    final derived = pushTokenRegistrationUrlFor(url);
+    if (derived != null && seen.add(derived.toString())) {
+      urls.add(derived);
+    }
+  }
+  return urls;
+}
+
+@visibleForTesting
+Uri? externalPushTokenRegistrationUrl(String? value) {
+  if (value == null) return null;
+  final uri = Uri.tryParse(value.trim());
+  if (uri == null || uri.scheme != 'https' || uri.host.isEmpty) return null;
+  if (uri.userInfo.isNotEmpty || uri.hasQuery || uri.hasFragment) return null;
+  return uri;
 }
 
 @visibleForTesting

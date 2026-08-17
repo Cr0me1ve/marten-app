@@ -10,6 +10,7 @@ import 'package:marten/features/connection/notifier/connection_notifier.dart';
 import 'package:marten/features/profile/data/profile_data_providers.dart';
 import 'package:marten/features/profile/model/profile_entity.dart';
 import 'package:marten/features/profile/model/profile_sort_enum.dart';
+import 'package:marten/features/profile/notifier/subscription_push_refresh.dart';
 import 'package:marten/utils/utils.dart';
 import 'package:riverpod_annotation/riverpod_annotation.dart';
 
@@ -60,6 +61,9 @@ class ProfilesNotifier extends _$ProfilesNotifier with AppLogger {
     loggy.debug('deleting profile: ${profile.name}');
 
     if (profile.active) await ref.read(connectionNotifierProvider.notifier).abortConnection();
+    if (profile case final RemoteProfileEntity remoteProfile) {
+      unawaited(ref.read(subscriptionPushRefreshServiceProvider).unregisterProfile(remoteProfile));
+    }
     final profilesRepo = await ref.read(profileRepositoryProvider.future);
     await profilesRepo
         .deleteById(profile.id, profile.active)

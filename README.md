@@ -48,6 +48,82 @@ The public Android workflow downloads a stripped, SHA256-pinned `marten-core.aar
 
 Firebase configuration files are intentionally excluded from the repository. Android push support and privacy-safe Crashlytics reporting are optional; without local Firebase configuration, both integrations are disabled gracefully and the rest of the app continues to work. Crash reporting is also disabled by default at runtime and requires explicit user opt-in.
 
+## Subscription refresh API
+
+`https://api.app.marten.pw` is a public registry for providers who already have an HTTPS subscription URL and want Marten installations to refresh it after a silent push. The registry does not download or proxy the subscription payload. It creates an install link, stores the source URL encrypted, and keeps an owner credential separate from the link shared with subscribers.
+
+Create a channel:
+
+```sh
+curl --fail-with-body https://api.app.marten.pw/v1/subscriptions \
+  --header 'Content-Type: application/json' \
+  --data '{"name":"My subscription","url":"https://provider.example/subscription/token"}'
+```
+
+The `url` must use HTTPS. A successful `201` response has this shape:
+
+```json
+{
+  "subscription": {
+    "id": "sub_...",
+    "name": "My subscription",
+    "status": "active",
+    "devices": 0
+  },
+  "install_url": "https://api.app.marten.pw/install/sub_...",
+  "deep_link": "marten://import?...",
+  "push_endpoint": "https://api.app.marten.pw/v1/subscriptions/sub_.../devices/push-token",
+  "trigger_endpoint": "https://api.app.marten.pw/v1/subscriptions/sub_.../push",
+  "owner_token": "mtn_owner_..."
+}
+```
+
+Save `owner_token` immediately. It is returned only after creation or rotation, is not included in the install link, and must not be given to subscribers. Share `install_url` or `deep_link`; Marten continues to download the original subscription directly from its provider and uses the registry only for push registration.
+
+Request a data-only silent refresh:
+
+```sh
+curl --fail-with-body --request POST \
+  https://api.app.marten.pw/v1/subscriptions/sub_ID/push \
+  --header 'Authorization: Bearer mtn_owner_SECRET'
+```
+
+The `202` response contains a push job ID. Its aggregate status can be read with the same owner credential:
+
+```sh
+curl --fail-with-body \
+  https://api.app.marten.pw/v1/subscriptions/sub_ID/push-jobs/job_ID \
+  --header 'Authorization: Bearer mtn_owner_SECRET'
+```
+
+Read or replace channel metadata:
+
+```sh
+curl --fail-with-body https://api.app.marten.pw/v1/subscriptions/sub_ID \
+  --header 'Authorization: Bearer mtn_owner_SECRET'
+
+curl --fail-with-body --request PATCH https://api.app.marten.pw/v1/subscriptions/sub_ID \
+  --header 'Authorization: Bearer mtn_owner_SECRET' \
+  --header 'Content-Type: application/json' \
+  --data '{"name":"Renamed subscription","url":"https://provider.example/subscription/new-token"}'
+```
+
+Rotate the owner credential or delete the channel:
+
+```sh
+curl --fail-with-body --request POST \
+  https://api.app.marten.pw/v1/subscriptions/sub_ID/owner-token/rotate \
+  --header 'Authorization: Bearer mtn_owner_OLD_SECRET'
+
+curl --fail-with-body --request DELETE \
+  https://api.app.marten.pw/v1/subscriptions/sub_ID \
+  --header 'Authorization: Bearer mtn_owner_SECRET'
+```
+
+The service accepts one owner-triggered refresh per channel every 30 seconds and at most 100 per UTC day. Creation is limited to five requests per source IP per hour; device registration is limited to ten requests per source IP and thirty per channel per minute. A limited request returns `429`, `Retry-After`, and a JSON `scope`. Missing or invalid owner credentials return `401`, while unknown or deleted channels return `404`.
+
+Marten registers and unregisters its FCM token automatically. The registration endpoint is intentionally device-facing: callers must send `X-Device-ID`, `X-Client-Secret`, and an opaque per-profile `push_binding_id`. Push messages contain only a refresh type, binding ID, reason, and timestamp; subscription URLs, configurations, and credentials are never placed in a push payload.
+
 ## Privacy
 
 Marten processes the profiles you import on your device in order to establish the requested connection. Connection endpoints, credentials, and subscription links can be sensitive: do not include them in issues, logs, screenshots, or pull requests. The project does not bundle a profile provider, Firebase Analytics, tracking, or a telemetry requirement.

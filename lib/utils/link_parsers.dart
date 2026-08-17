@@ -2,7 +2,7 @@ import 'dart:convert';
 
 import 'package:marten/utils/validators.dart';
 
-typedef ProfileLink = ({String url, String name});
+typedef ProfileLink = ({String url, String name, String? pushEndpoint});
 
 /// Normalizes subscription links shared by Marten and other proxy clients.
 ///
@@ -123,7 +123,7 @@ abstract class LinkParser {
   static ProfileLink? simple(String link) {
     if (!isUrl(link)) return null;
     final uri = Uri.parse(link.trim());
-    return (url: uri.toString(), name: uri.queryParameters['name'] ?? '');
+    return (url: uri.toString(), name: uri.queryParameters['name'] ?? '', pushEndpoint: null);
   }
 
   /// Whether [value] is a URL that should be downloaded as a remote profile.
@@ -144,16 +144,18 @@ abstract class LinkParser {
       if (scheme == 'happ' && _isEncryptedHappLink(uri)) return null;
 
       final name = _profileName(uri);
+      final pushEndpoint = _pushEndpoint(uri, scheme);
+      if (uri.queryParameters.containsKey('push') && scheme == 'marten' && pushEndpoint == null) return null;
       for (final key in _payloadQueryKeys) {
         final candidate = uri.queryParameters[key];
         if (candidate == null || candidate.trim().isEmpty) continue;
         final normalized = _normalizePayload(candidate);
-        if (normalized != null) return (url: normalized, name: name);
+        if (normalized != null) return (url: normalized, name: name, pushEndpoint: pushEndpoint);
       }
 
       final pathPayload = _pathPayload(raw, uri, scheme);
       final normalized = pathPayload == null ? null : _normalizePayload(pathPayload);
-      return normalized == null ? null : (url: normalized, name: name);
+      return normalized == null ? null : (url: normalized, name: name, pushEndpoint: pushEndpoint);
     } on FormatException {
       return null;
     }
@@ -171,6 +173,16 @@ abstract class LinkParser {
       if (value != null && value.isNotEmpty) return _decodePercent(value);
     }
     return uri.hasFragment ? _decodePercent(uri.fragment.trim()) : '';
+  }
+
+  static String? _pushEndpoint(Uri uri, String scheme) {
+    if (scheme != 'marten') return null;
+    final raw = uri.queryParameters['push']?.trim();
+    if (raw == null || raw.isEmpty) return null;
+    final endpoint = Uri.tryParse(raw);
+    if (endpoint == null || endpoint.scheme.toLowerCase() != 'https' || endpoint.host.isEmpty) return null;
+    if (endpoint.userInfo.isNotEmpty || endpoint.hasQuery || endpoint.hasFragment) return null;
+    return endpoint.toString();
   }
 
   static String? _pathPayload(String raw, Uri uri, String scheme) {

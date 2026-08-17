@@ -669,6 +669,55 @@ void main() {
       profile.match((l) => fail('parse failed: $l'), (r) => expect(r.name, 'Server name'));
     });
 
+    test('Should keep UserOverride.pushEndpoint on parse', () {
+      final override = const UserOverride(name: 'Manual name', pushEndpoint: 'https://push.example.net/register');
+      final profile = ProfileParser.parse(
+        tempFilePath: '',
+        profile: ProfileEntity.remote(
+          id: const Uuid().v4(),
+          active: true,
+          name: '',
+          url: validBaseUrl,
+          lastUpdate: DateTime.now(),
+          userOverride: override,
+        ),
+      );
+
+      expect(profile.isRight(), isTrue);
+      profile.match((l) => fail('parse failed: $l'), (r) {
+        final rp = r as RemoteProfileEntity;
+        expect(rp.userOverride, equals(override));
+      });
+    });
+
+    test('Should round-trip UserOverride JSON with pushEndpoint', () {
+      final override = const UserOverride(
+        name: 'Manual name',
+        pushEndpoint: 'https://push.example.net/register',
+        isAutoUpdateDisable: false,
+      );
+      final serialized = override.toStr();
+      final parsed = UserOverride.fromStr(serialized);
+
+      expect(parsed, isNotNull);
+      expect(parsed?.name, equals(override.name));
+      expect(parsed?.pushEndpoint, equals(override.pushEndpoint));
+      expect(parsed?.version, equals(latestUserOverrideVersion));
+    });
+
+    test('Should preserve UserOverride.pushEndpoint from legacy JSON', () {
+      final parsed = UserOverride.fromStr('''{
+        "version":1,
+        "name":"Legacy",
+        "pushEndpoint":"https://push.example.net/legacy"
+      }''');
+
+      expect(parsed, isNotNull);
+      expect(parsed?.name, equals('Legacy'));
+      expect(parsed?.pushEndpoint, equals('https://push.example.net/legacy'));
+      expect(parsed?.version, equals(latestUserOverrideVersion));
+    });
+
     test("Should read split_tunneling alias from subscription metadata", () {
       final apps = ProfileParser.splitTunnelBypassApps('''
 {
@@ -986,23 +1035,20 @@ void main() {
         orderedEquals(['$candidateUrl/refresh', candidateUrl, candidateUrl, candidateUrl]),
       );
       expect(result.isLeft(), isTrue, reason: 'all responses are unsupported and should fail closed');
-      result.match(
-        (failure) {
-          expect(
-            failure.map(
-              unexpected: (_) => false,
-              notFound: (_) => false,
-              invalidUrl: (_) => false,
-              invalidConfig: (_) => true,
-              cancelByUser: (_) => false,
-              deviceMismatch: (_) => false,
-            ),
-            isTrue,
-          );
-          expect(failure.toString(), contains('subscription server returned no supported client representation'));
-        },
-        (_) => fail('unsupported compatibility responses should not be treated as successful profile'),
-      );
+      result.match((failure) {
+        expect(
+          failure.map(
+            unexpected: (_) => false,
+            notFound: (_) => false,
+            invalidUrl: (_) => false,
+            invalidConfig: (_) => true,
+            cancelByUser: (_) => false,
+            deviceMismatch: (_) => false,
+          ),
+          isTrue,
+        );
+        expect(failure.toString(), contains('subscription server returned no supported client representation'));
+      }, (_) => fail('unsupported compatibility responses should not be treated as successful profile'));
     });
 
     test("Should rotate subscription URLs across remembered LB endpoints", () {
@@ -1013,6 +1059,28 @@ void main() {
         url: "https://sub-a.example.net/sub/token-1",
         lastUpdate: DateTime.now(),
         subscriptionEndpoints: const ["https://sub-a.example.net", "https://sub-b.example.net"],
+        currentSubscriptionEndpoint: "https://sub-b.example.net",
+      );
+
+      expect(ProfileParser.subscriptionCandidateUrls(profile.url, profile: profile), [
+        "https://sub-b.example.net/sub/token-1",
+        "https://sub-a.example.net/sub/token-1",
+      ]);
+    });
+
+    test("Should dedupe duplicated subscription candidate endpoints", () {
+      final profile = RemoteProfileEntity(
+        id: const Uuid().v4(),
+        active: true,
+        name: '',
+        url: "https://sub-a.example.net/sub/token-1",
+        lastUpdate: DateTime.now(),
+        subscriptionEndpoints: const [
+          "https://sub-b.example.net",
+          "https://sub-b.example.net/",
+          "https://sub-a.example.net",
+          "https://sub-a.example.net",
+        ],
         currentSubscriptionEndpoint: "https://sub-b.example.net",
       );
 

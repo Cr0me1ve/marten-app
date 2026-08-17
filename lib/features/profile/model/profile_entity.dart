@@ -79,6 +79,7 @@ abstract class UserOverride with _$UserOverride {
   const factory UserOverride({
     @Default(latestUserOverrideVersion) int version,
     String? name,
+    String? pushEndpoint,
     @Default(false) bool isAutoUpdateDisable,
     // hours
     int? updateInterval,

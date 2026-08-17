@@ -102,7 +102,9 @@ class RoutingConfigNotifier extends _$RoutingConfigNotifier {
           url = newUrlFromAppLink;
           newUrlFromAppLink = '';
         } else if (state.uri.queryParameters['url'] != null) {
-          url = state.uri.queryParameters['url'];
+          url = state.uri.scheme.toLowerCase() == 'marten' && state.uri.queryParameters['push'] != null
+              ? state.uri.toString()
+              : state.uri.queryParameters['url'];
         }
 
         if (!introCompleted) {
