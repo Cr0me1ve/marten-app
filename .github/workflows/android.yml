@@ -67,7 +67,8 @@ jobs:
 
       - name: Install the pinned Android NDK
         shell: bash
-        run: sdkmanager "ndk;${ANDROID_NDK_VERSION}"
+        run: |
+          "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" "ndk;${ANDROID_NDK_VERSION}"
 
       - name: Download the pinned public core AAR
         shell: bash
