@@ -9,7 +9,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>FirebaseCrashlyticsCollectionEnabled</key>
-	<false/>
+	<true/>
 	<key>CFBundleDisplayName</key>
 	<string>Marten</string>
 	<key>CFBundleExecutable</key>
@@ -58,6 +58,9 @@
 				<string>mihomo</string>
 				<string>clashx</string>
 				<string>clash-verge</string>
+				<string>flclashx</string>
+				<string>koala-clash</string>
+				<string>prizrak-box</string>
 				<string>nekobox</string>
 				<string>nekoray</string>
 				<string>surfboard</string>

@@ -45,3 +45,6 @@
 #   - x-scheme-handler/clash
 #   - x-scheme-handler/clashmeta
 #   - x-scheme-handler/sing-box
+#   - x-scheme-handler/flclashx
+#   - x-scheme-handler/koala-clash
+#   - x-scheme-handler/prizrak-box

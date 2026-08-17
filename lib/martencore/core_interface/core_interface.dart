@@ -71,6 +71,10 @@ class CoreInterface {
 
   Future<bool> notifyBackgroundStarted() async => true;
 
+  Future<bool> storeNativeResumeConfig(String path, String name) async => true;
+
+  Future<bool> clearNativeResumeConfig() async => true;
+
   Future<bool?> readPlatformStartedByUser() async {
     return null;
   }

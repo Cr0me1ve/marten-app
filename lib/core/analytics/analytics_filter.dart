@@ -20,6 +20,7 @@ bool canSendCrashReport(dynamic throwable) {
 }
 
 bool canReportLogRecord(dynamic throwable) => switch (throwable) {
+  null => false,
   ExpectedMeasuredFailure _ => true,
   _ => canSendCrashReport(throwable),
 };

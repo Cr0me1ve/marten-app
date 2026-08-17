@@ -22,6 +22,7 @@ import 'package:marten/singbox/model/singbox_config_option.dart';
 import 'package:marten/utils/utils.dart';
 import 'package:meta/meta.dart';
 import 'package:rxdart/rxdart.dart';
+import 'package:uuid/uuid.dart';
 
 abstract interface class ConnectionRepository {
   SingboxConfigOption? get configOptionsSnapshot;
@@ -38,6 +39,7 @@ abstract interface class ConnectionRepository {
   TaskEither<ConnectionFailure, Unit> connect(ProfileEntity activeProfile, bool disableMemoryLimit);
   TaskEither<ConnectionFailure, Unit> disconnect();
   TaskEither<ConnectionFailure, Unit> reconnect(ProfileEntity activeProfile, bool disableMemoryLimit);
+  TaskEither<ConnectionFailure, Unit> syncNativeResumeConfig(ProfileEntity? activeProfile);
   TaskEither<ConnectionFailure, Unit> verifyConnectedRoute({bool holdStartupRouteReady = false});
   TaskEither<ConnectionFailure, int> measureConnectedRouteDelay();
 }
@@ -96,8 +98,9 @@ class ConnectionRepositoryImpl with ExceptionHandler, InfraLogger implements Con
   _ConnectionIntent _connectionIntent = _ConnectionIntent.stop;
   StartupEndpointProbe? _activeStartupEndpoint;
   CoreStatus? _lastObservedCoreStatus;
+  CoreStatus? _lastObservedPlatformStatus;
   bool _nativeRecoveryRouteGatePending = false;
-  bool _platformRouteGatePending = false;
+  bool _nativePlatformRecoveryRouteGatePending = false;
   final _startupRouteReadyController = BehaviorSubject<bool>.seeded(
     initialStartupRouteReadyForPlatform(isAndroid: Platform.isAndroid),
   );
@@ -125,13 +128,17 @@ class ConnectionRepositoryImpl with ExceptionHandler, InfraLogger implements Con
   @override
   Stream<ConnectionStatus> watchConnectionStatus() {
     final coreStatus = singbox.watchStatus().doOnData((event) {
-      final transition = nativeRecoveryRouteGateTransition(
-        previous: _lastObservedCoreStatus,
-        current: event,
-        pending: _nativeRecoveryRouteGatePending,
-      );
-      _nativeRecoveryRouteGatePending = transition.pending;
-      if (transition.routeReady case final ready?) _setStartupRouteReady(ready);
+      if (Platform.isAndroid) {
+        if (androidRouteGateReset(event) case final ready?) _setStartupRouteReady(ready);
+      } else {
+        final transition = nativeRecoveryRouteGateTransition(
+          previous: _lastObservedCoreStatus,
+          current: event,
+          pending: _nativeRecoveryRouteGatePending,
+        );
+        _nativeRecoveryRouteGatePending = transition.pending;
+        if (transition.routeReady case final ready?) _setStartupRouteReady(ready);
+      }
       _lastObservedCoreStatus = event;
     });
 
@@ -146,9 +153,15 @@ class ConnectionRepositoryImpl with ExceptionHandler, InfraLogger implements Con
     final platformStatus = singbox
         .watchPlatformServiceStatus()
         .doOnData((event) {
-          final transition = platformRouteGateTransition(current: event, pending: _platformRouteGatePending);
-          _platformRouteGatePending = transition.pending;
+          final transition = nativeRecoveryRouteGateTransition(
+            previous: _lastObservedPlatformStatus,
+            current: event,
+            pending: _nativePlatformRecoveryRouteGatePending,
+          );
+          _lastObservedPlatformStatus = event;
+          _nativePlatformRecoveryRouteGatePending = transition.pending;
           if (transition.routeReady case final ready?) _setStartupRouteReady(ready);
+          if (androidRouteGateReset(event) case final ready?) _setStartupRouteReady(ready);
         })
         .startWith(const CoreStatus.stopped());
 
@@ -233,21 +246,88 @@ class ConnectionRepositoryImpl with ExceptionHandler, InfraLogger implements Con
   }
 
   @override
+  TaskEither<ConnectionFailure, Unit> syncNativeResumeConfig(ProfileEntity? activeProfile) {
+    if (!Platform.isAndroid) return TaskEither.of(unit);
+    return TaskEither.tryCatch(() async {
+      final generation = _connectionGeneration;
+
+      if (activeProfile == null) {
+        if (_isConnectionStale(generation)) return unit;
+        final cleared = await singbox.clearNativeResumeConfig();
+        if (!cleared) throw const ConnectionFailure.unexpected('failed to clear native resume config');
+        loggy.info('cleared native resume config because there is no active profile');
+        return unit;
+      }
+
+      final encFile = profilePathResolver.file(activeProfile.id);
+      final decFile = profilePathResolver.tempFile('${activeProfile.id}_native_resume_${const Uuid().v4()}');
+      try {
+        if (!await encFile.exists()) {
+          throw const ConnectionFailure.invalidConfig(missingProfileConfigFailureMessage);
+        }
+        final deviceIdentity = await readDeviceIdentity();
+        if (_isConnectionStale(generation)) return unit;
+        try {
+          await ProfileCrypto.decryptToTemp(encFile, decFile, deviceIdentity.clientSecret);
+        } catch (error) {
+          if (!ProfileCrypto.isMissingFileError(error)) rethrow;
+          throw const ConnectionFailure.invalidConfig(missingProfileConfigFailureMessage);
+        }
+        if (_isConnectionStale(generation)) return unit;
+
+        final rawConfig = await decFile.readAsString();
+        final coreConfig = ProfileParser.stripMartenSubscriptionMetadata(rawConfig);
+        final tags = selectableOutboundTagsFromConfig(coreConfig);
+        final selectedTag = _selectedOutboundTag(activeProfile, tags);
+        final preparedConfig = selectedTag == null
+            ? coreConfig
+            : prepareConfigForSelectedOutbound(coreConfig, selectedTag);
+        await decFile.writeAsString(preparedConfig, flush: true);
+        await _stripNativeStartMetadata(decFile);
+        if (_isConnectionStale(generation)) return unit;
+
+        final stored = await singbox.storeNativeResumeConfig(
+          decFile.path,
+          _notificationDisplayName(activeProfile, selectedTag),
+        );
+        if (!stored) throw const ConnectionFailure.unexpected('failed to store native resume config');
+        loggy.info('synchronized native resume config for the active profile');
+        return unit;
+      } catch (error, stackTrace) {
+        if (!_isConnectionStale(generation)) {
+          final cleared = await singbox.clearNativeResumeConfig();
+          if (!cleared) loggy.warning('failed to clear stale native resume config after sync failure');
+        }
+        Error.throwWithStackTrace(error, stackTrace);
+      } finally {
+        if (await decFile.exists()) await decFile.delete();
+      }
+    }, (err, st) => err is ConnectionFailure ? err : ConnectionFailure.unexpected(err, st));
+  }
+
+  @override
   TaskEither<ConnectionFailure, Unit> verifyConnectedRoute({bool holdStartupRouteReady = false}) {
     return TaskEither.tryCatch(() async {
       if (holdStartupRouteReady) _setStartupRouteReady(false);
       var verified = false;
       try {
-        final health = await _probeSelectedRouteHealth();
-        final delay = health.delay;
-        if (delay == null) {
-          loggy.info('route watchdog verified [${health.tag}] by ${health.source}');
+        if (Platform.isAndroid) {
+          // The Android service performs the authoritative request through
+          // the current VPN Network/TUN. Running the direct core urltest first
+          // would both add latency and reproduce the old false-positive gate.
+          final platformAccepted = await singbox.notifyBackgroundStarted();
+          if (!platformAccepted) {
+            throw const ConnectionFailure.unexpected("Android VPN data plane did not become ready");
+          }
+          loggy.info('Android VPN data plane verified');
         } else {
-          loggy.info('route watchdog verified [${health.tag}]: ${delay}ms');
-        }
-        final platformAccepted = await singbox.notifyBackgroundStarted();
-        if (!platformAccepted) {
-          throw const ConnectionFailure.unexpected("Android VPN TUN did not become ready");
+          final health = await _probeSelectedRouteHealth();
+          final delay = health.delay;
+          if (delay == null) {
+            loggy.info('route watchdog verified [${health.tag}] by ${health.source}');
+          } else {
+            loggy.info('route watchdog verified [${health.tag}]: ${delay}ms');
+          }
         }
         verified = true;
         return unit;
@@ -273,7 +353,6 @@ class ConnectionRepositoryImpl with ExceptionHandler, InfraLogger implements Con
 
   Future<({String tag, int? delay, String source})> _probeSelectedRouteHealth() async {
     final endpoint = _activeStartupEndpoint;
-    final turncoatBefore = ref.read(turncoatLivenessNotifierProvider);
     final probe = await _runFreshUrlTestProbe(
       readSnapshot: () => singbox.selectedUrlTestDelaySnapshot(_startupRouteTestGroup),
       timeout: _routeWatchdogUrlTestTimeout,
@@ -289,11 +368,6 @@ class ConnectionRepositoryImpl with ExceptionHandler, InfraLogger implements Con
     }
     final failure = selectedRouteHealthFailure(error, selectedDelay);
     if (failure != null) {
-      final turncoatHealth = await _turncoatConnectedRouteHealthFallback(
-        previousRouteActivityCount: turncoatBefore.routeActivityCount,
-        selectedTag: selectedDelay?.tag,
-      );
-      if (turncoatHealth != null) return turncoatHealth;
       if (endpoint != null &&
           error == null &&
           selectedDelay != null &&
@@ -363,23 +437,6 @@ class ConnectionRepositoryImpl with ExceptionHandler, InfraLogger implements Con
     return (cancelled: false, error: null, snapshot: snapshot);
   }
 
-  Future<({String tag, int? delay, String source})?> _turncoatConnectedRouteHealthFallback({
-    required int previousRouteActivityCount,
-    required String? selectedTag,
-  }) async {
-    final before = ref.read(turncoatLivenessNotifierProvider);
-    if (!before.inUse && !before.live) return null;
-    final state = await ref
-        .read(turncoatLivenessNotifierProvider.notifier)
-        .waitForFreshRouteActivity(previousRouteActivityCount);
-    if (!isUsableTurncoatConnectedRoute(previousRouteActivityCount: previousRouteActivityCount, liveness: state)) {
-      return null;
-    }
-    final tag = selectedTag?.isNotEmpty == true ? selectedTag! : 'TURNcoat route';
-    loggy.info('route watchdog verified by fresh TURNcoat selected-route traffic [$tag]');
-    return (tag: tag, delay: null, source: 'fresh TURNcoat selected-route traffic');
-  }
-
   TaskEither<ConnectionFailure, Unit> _withPreparedConfig(
     ProfileEntity profile,
     TaskEither<ConnectionFailure, Unit> Function(String path, String displayName) action, {
@@ -427,90 +484,72 @@ class ConnectionRepositoryImpl with ExceptionHandler, InfraLogger implements Con
         }
         _activeStartupEndpoint = selected.startupEndpoint;
         _setStartupRouteReady(false);
-        final result = await action(actionConfigFile.path, _notificationDisplayName(profile, selected.tag)).run();
-        if (_isConnectionStale(generation)) {
-          await _stopStaleConnectionOperation(generation);
-          return unit;
-        }
-        final value = result.match((l) {
-          _resetTurncoatFeatures();
-          _activeStartupEndpoint = null;
-          throw l;
-        }, (r) => r);
-        if (_isConnectionStale(generation)) {
-          await _stopStaleConnectionOperation(generation);
-          return unit;
-        }
-        if (selected.tag != null) {
-          if (!await _waitForCoreStarted()) {
-            loggy.warning(
-              'stopping connection because core did not report started before route selection '
-              '[${selected.tag}], core state is ${singbox.currentState}',
-            );
-            await _stopFailedStartupRoute(selected.tag!);
+        final startupRoute = selected.tag ?? 'prepared route';
+        try {
+          final result = await action(actionConfigFile.path, _notificationDisplayName(profile, selected.tag)).run();
+          if (_isConnectionStale(generation)) {
+            await _stopStaleConnectionOperation(generation);
+            return unit;
+          }
+          final value = result.match((failure) => throw failure, (success) => success);
+          if (_isConnectionStale(generation)) {
+            await _stopStaleConnectionOperation(generation);
+            return unit;
+          }
+          if (selected.tag != null) {
+            if (!await _waitForCoreStarted()) {
+              loggy.warning(
+                'core did not report started before route selection '
+                '[${selected.tag}], core state is ${singbox.currentState}',
+              );
+              throw const ConnectionFailure.unexpected("core did not report started after launch");
+            }
             if (_isConnectionStale(generation)) {
               await _stopStaleConnectionOperation(generation);
               return unit;
             }
-            throw const ConnectionFailure.unexpected("core did not report started after launch");
+            await _selectPreparedOutbound(selected.tag!);
+
+            // Android owns the authoritative startup request. Its probe is
+            // bound to the active VPN Network/TUN, so a direct core urltest or
+            // TURNcoat carrier signal cannot admit the route first.
+            if (!Platform.isAndroid) {
+              final verification = startupRouteVerificationFor(startupEndpoint: selected.startupEndpoint);
+              final routeVerified = switch (verification) {
+                StartupRouteVerification.endpointFallback => await _verifyStartupRouteWithEndpointFallback(
+                  selected.tag!,
+                  selected.startupEndpoint!,
+                  generation,
+                ),
+                StartupRouteVerification.urlTest => await _verifyStartupRoute(selected.tag!, generation),
+              };
+              if (!routeVerified) {
+                throw const ConnectionFailure.unexpected("selected route failed startup connectivity check");
+              }
+            }
           }
           if (_isConnectionStale(generation)) {
             await _stopStaleConnectionOperation(generation);
             return unit;
           }
-          await _selectPreparedOutbound(selected.tag!);
-          final verification = startupRouteVerificationFor(
-            usesTurncoat: selected.usesTurncoat,
-            startupEndpoint: selected.startupEndpoint,
-          );
-          switch (verification) {
-            case StartupRouteVerification.turncoatProbeAndLiveness:
-              if (!await _verifyTurncoatStartupRoute(selected.tag!, generation)) {
-                await _stopFailedStartupRoute(selected.tag!, allowNativeRecovery: true);
-                if (_isConnectionStale(generation)) {
-                  await _stopStaleConnectionOperation(generation);
-                  return unit;
-                }
-                throw const ConnectionFailure.unexpected("selected route failed startup connectivity check");
-              }
-            case StartupRouteVerification.endpointFallback:
-              if (!await _verifyStartupRouteWithEndpointFallback(
-                selected.tag!,
-                selected.startupEndpoint!,
-                generation,
-              )) {
-                await _stopFailedStartupRoute(selected.tag!, allowNativeRecovery: true);
-                if (_isConnectionStale(generation)) {
-                  await _stopStaleConnectionOperation(generation);
-                  return unit;
-                }
-                throw const ConnectionFailure.unexpected("selected route failed startup connectivity check");
-              }
-            case StartupRouteVerification.urlTest:
-              if (!await _verifyStartupRoute(selected.tag!, generation)) {
-                await _stopFailedStartupRoute(selected.tag!, allowNativeRecovery: true);
-                if (_isConnectionStale(generation)) {
-                  await _stopStaleConnectionOperation(generation);
-                  return unit;
-                }
-                throw const ConnectionFailure.unexpected("selected route failed startup connectivity check");
-              }
+
+          // On Android this call performs the authoritative HTTP request over
+          // the current VPN Network/TUN and returns only after native startup
+          // cleanup if the proof fails. Connected is published afterward.
+          final platformAccepted = await singbox.notifyBackgroundStarted();
+          if (!platformAccepted) {
+            throw const ConnectionFailure.unexpected("Android VPN data plane did not become ready");
           }
+          _setStartupRouteReady(true);
+          return value;
+        } catch (error, stackTrace) {
+          if (_isConnectionStale(generation)) {
+            await _stopStaleConnectionOperation(generation);
+            return unit;
+          }
+          await _stopFailedStartupRoute(startupRoute);
+          Error.throwWithStackTrace(error, stackTrace);
         }
-        if (_isConnectionStale(generation)) {
-          await _stopStaleConnectionOperation(generation);
-          return unit;
-        }
-        // The Android service can still be showing Starting after a native
-        // quick-tile attempt failed and Flutter completed the serialized retry.
-        // Re-assert the platform status only after this generation's selected
-        // route passed the same readiness gate used by the UI.
-        final platformAccepted = await singbox.notifyBackgroundStarted();
-        if (!platformAccepted) {
-          throw const ConnectionFailure.unexpected("Android VPN TUN did not become ready");
-        }
-        _setStartupRouteReady(true);
-        return value;
       } finally {
         if (await decFile.exists()) await decFile.delete();
       }
@@ -778,108 +817,6 @@ class ConnectionRepositoryImpl with ExceptionHandler, InfraLogger implements Con
     });
   }
 
-  Future<bool> _verifyTurncoatStartupRoute(String selectedTag, int generation) async {
-    loggy.info('verifying TURNcoat startup route by concurrent active probe and fresh route evidence [$selectedTag]');
-    final notifier = ref.read(turncoatLivenessNotifierProvider.notifier);
-    var routeProbeCancelled = false;
-    final routeProbeFuture = _verifyStartupRouteByUrlTest(
-      selectedTag,
-      generation,
-      timeout: _turncoatStartupRouteTestTimeout,
-      isCancelled: () => routeProbeCancelled,
-    ).then<_TurncoatStartupSignal>(_TurncoatStartupProbeSignal.new);
-    final routeEvidenceFuture = notifier
-        .waitForLiveSelectedRouteOrTerminal()
-        .timeout(
-          _turncoatStartupRouteTestTimeout + const Duration(seconds: 1),
-          onTimeout: () => const TurncoatLivenessState(inUse: true, timedOut: true),
-        )
-        .then<_TurncoatStartupSignal>(_TurncoatStartupEvidenceSignal.new);
-
-    final first = await Future.any<_TurncoatStartupSignal>([routeProbeFuture, routeEvidenceFuture]);
-    if (_isConnectionStale(generation)) {
-      routeProbeCancelled = true;
-      return true;
-    }
-
-    switch (first) {
-      case _TurncoatStartupEvidenceSignal(:final state):
-        routeProbeCancelled = true;
-        notifier.cancelStartupRouteEvidenceWait();
-        if (isUsableTurncoatStartupRoute(routeVerified: false, liveness: state)) {
-          loggy.info('TURNcoat startup route verified by live selected-route traffic [$selectedTag]');
-          return true;
-        }
-        loggy.warning(
-          'TURNcoat startup route evidence ended before readiness [$selectedTag]: '
-          'inUse=${state.inUse} live=${state.live} routeActive=${state.routeActive} timedOut=${state.timedOut}',
-        );
-        return false;
-      case _TurncoatStartupProbeSignal(:final result):
-        if (result.connectionStale) return true;
-        if (!result.routeVerified) {
-          loggy.warning('TURNcoat startup route active probe failed [$selectedTag]; waiting for live route evidence');
-          var state = notifier.currentState;
-
-          // A captcha may still be in progress when urlTest exhausts its
-          // attempts. Keep the full carrier startup window until the first
-          // live session, then give real backend RX a short final grace. This
-          // avoids both cutting off a human captcha and holding Connecting for
-          // the remainder of the 75-second window after the carrier is live.
-          if (state.inUse && !state.live && !state.timedOut) {
-            state = await notifier.waitForLiveOrTerminal().timeout(
-              _turncoatStartupRouteTestTimeout + const Duration(seconds: 1),
-              onTimeout: () => const TurncoatLivenessState(inUse: true, timedOut: true),
-            );
-          }
-          if (_isConnectionStale(generation)) return true;
-
-          final postCarrierGrace = turncoatRouteEvidenceGraceAfterFailedProbe(state);
-          if (postCarrierGrace != null) {
-            final signal = await routeEvidenceFuture.timeout(
-              postCarrierGrace,
-              onTimeout: () => _TurncoatStartupEvidenceSignal(notifier.currentState),
-            );
-            state = (signal as _TurncoatStartupEvidenceSignal).state;
-          } else if (!state.timedOut && !isUsableTurncoatStartupRoute(routeVerified: false, liveness: state)) {
-            state = await routeEvidenceFuture.then((signal) => (signal as _TurncoatStartupEvidenceSignal).state);
-          }
-          notifier.cancelStartupRouteEvidenceWait();
-          if (_isConnectionStale(generation)) return true;
-          if (isUsableTurncoatStartupRoute(routeVerified: false, liveness: state)) {
-            loggy.info('TURNcoat startup route verified by live selected-route traffic [$selectedTag]');
-            return true;
-          }
-          loggy.warning(
-            'TURNcoat startup route failed [$selectedTag]: '
-            'routeVerified=false inUse=${state.inUse} live=${state.live} '
-            'routeActive=${state.routeActive} timedOut=${state.timedOut}',
-          );
-          return false;
-        }
-
-        // The URL probe proves the selected backend route, but Connected still
-        // requires a bidirectionally verified TURNcoat carrier. The stronger
-        // route-evidence waiter is no longer needed in this branch.
-        notifier.cancelStartupRouteEvidenceWait();
-        final state = await notifier.waitForLiveOrTerminal().timeout(
-          _turncoatStartupRouteTestTimeout + const Duration(seconds: 1),
-          onTimeout: () => const TurncoatLivenessState(inUse: true, timedOut: true),
-        );
-        if (_isConnectionStale(generation)) return true;
-        if (isUsableTurncoatStartupRoute(routeVerified: true, liveness: state)) {
-          loggy.info('TURNcoat startup route verified by active probe and live session [$selectedTag]');
-          return true;
-        }
-        loggy.warning(
-          'TURNcoat startup route failed [$selectedTag]: '
-          'routeVerified=true inUse=${state.inUse} live=${state.live} '
-          'routeActive=${state.routeActive} timedOut=${state.timedOut}',
-        );
-        return false;
-    }
-  }
-
   Future<bool> _verifyStartupEndpoint(
     StartupEndpointProbe endpoint,
     int generation, {
@@ -920,19 +857,16 @@ class ConnectionRepositoryImpl with ExceptionHandler, InfraLogger implements Con
     }
   }
 
-  Future<void> _stopFailedStartupRoute(String selectedTag, {bool allowNativeRecovery = false}) async {
+  Future<void> _stopFailedStartupRoute(String selectedTag) async {
     _resetTurncoatFeatures();
     _activeStartupEndpoint = null;
-    if (shouldPreserveFailedStartupRouteForNativeRecovery(
-      isAndroid: Platform.isAndroid,
-      allowNativeRecovery: allowNativeRecovery,
-    )) {
-      loggy.warning('preserving failed startup route for Android native recovery [$selectedTag]');
-      return;
-    }
+    _setStartupRouteReady(false);
     loggy.warning('stopping failed startup route [$selectedTag]');
     final result = await singbox.stop().run();
-    result.match((err) => loggy.warning('error stopping failed startup route [$selectedTag]', err), (_) {});
+    result.match(
+      (err) => throw ConnectionFailure.unexpected('failed to stop/close startup route [$selectedTag]: $err'),
+      (_) => unit,
+    );
   }
 
   void _setStartupRouteReady(bool ready) {
@@ -987,31 +921,11 @@ class CoalescedFuture<T> {
 }
 
 @visibleForTesting
-bool shouldPreserveFailedStartupRouteForNativeRecovery({required bool isAndroid, required bool allowNativeRecovery}) =>
-    isAndroid && allowNativeRecovery;
-
-@visibleForTesting
 T requireCoreOperationSuccess<T>(Either<String, T> result, {required String operation}) {
   return result.match((error) => throw ConnectionFailure.unexpected('$operation failed: $error'), (value) => value);
 }
 
 enum _ConnectionIntent { start, stop }
-
-sealed class _TurncoatStartupSignal {
-  const _TurncoatStartupSignal();
-}
-
-class _TurncoatStartupProbeSignal extends _TurncoatStartupSignal {
-  const _TurncoatStartupProbeSignal(this.result);
-
-  final ({bool connectionStale, bool routeVerified, bool endpointFallbackAllowed}) result;
-}
-
-class _TurncoatStartupEvidenceSignal extends _TurncoatStartupSignal {
-  const _TurncoatStartupEvidenceSignal(this.state);
-
-  final TurncoatLivenessState state;
-}
 
 @visibleForTesting
 const initialStartupRouteReady = true;
@@ -1026,8 +940,6 @@ const _startupRouteTestRetryDelay = Duration(milliseconds: 700);
 const _urlTestResultPollInterval = Duration(milliseconds: 200);
 const _urlTestFreshnessGrace = Duration(seconds: 2);
 const _startupEndpointProbeTimeout = Duration(seconds: 6);
-const _turncoatStartupRouteTestTimeout = Duration(seconds: 75);
-const _turncoatPostCarrierRouteEvidenceGrace = Duration(seconds: 8);
 const _routeWatchdogUrlTestTimeout = Duration(seconds: 8);
 const _routeWatchdogDelaySnapshotTimeout = Duration(seconds: 2);
 const _startupRouteTimeoutDelay = 65535;
@@ -1075,10 +987,6 @@ Future<UrlTestDelaySnapshot?> waitForFreshUrlTestDelaySnapshot({
 }
 
 @visibleForTesting
-Duration? turncoatRouteEvidenceGraceAfterFailedProbe(TurncoatLivenessState state) =>
-    state.live && !state.routeActive && !state.timedOut ? _turncoatPostCarrierRouteEvidenceGrace : null;
-
-@visibleForTesting
 class StartupEndpointProbe {
   const StartupEndpointProbe({required this.tag, required this.type, required this.server, required this.serverPort});
 
@@ -1089,14 +997,10 @@ class StartupEndpointProbe {
 }
 
 @visibleForTesting
-enum StartupRouteVerification { turncoatProbeAndLiveness, endpointFallback, urlTest }
+enum StartupRouteVerification { endpointFallback, urlTest }
 
 @visibleForTesting
-StartupRouteVerification startupRouteVerificationFor({
-  required bool usesTurncoat,
-  required StartupEndpointProbe? startupEndpoint,
-}) {
-  if (usesTurncoat) return StartupRouteVerification.turncoatProbeAndLiveness;
+StartupRouteVerification startupRouteVerificationFor({required StartupEndpointProbe? startupEndpoint}) {
   if (startupEndpoint != null) return StartupRouteVerification.endpointFallback;
   return StartupRouteVerification.urlTest;
 }
@@ -1126,20 +1030,7 @@ int connectedRoutePingDelay({required int? reportedDelay, required int elapsed})
 }
 
 @visibleForTesting
-bool isUsableTurncoatStartupLiveness(TurncoatLivenessState state) => state.live && !state.timedOut;
-
-@visibleForTesting
 bool shouldRunFinalStopAfterInterrupt({required bool previousOperationInProgress}) => previousOperationInProgress;
-
-@visibleForTesting
-bool isUsableTurncoatStartupRoute({required bool routeVerified, required TurncoatLivenessState liveness}) =>
-    isUsableTurncoatStartupLiveness(liveness) && (routeVerified || liveness.routeActive);
-
-@visibleForTesting
-bool isUsableTurncoatConnectedRoute({
-  required int previousRouteActivityCount,
-  required TurncoatLivenessState liveness,
-}) => isUsableTurncoatStartupLiveness(liveness) && liveness.routeActivityCount > previousRouteActivityCount;
 
 @visibleForTesting
 ConnectionFailure? selectedRouteHealthFailure(String? urlTestError, ({String tag, int delay})? selectedDelay) {
@@ -1167,6 +1058,17 @@ ConnectionStatus connectionStatusFromCore(CoreStatus event, bool startupRouteRea
   };
 }
 
+/// Android's runtime core stream describes lifecycle, not route admission, so
+/// it may only close this gate. Native recovery reopens it separately when the
+/// platform service publishes Started after its explicit VPN Network proof.
+@visibleForTesting
+bool? androidRouteGateReset(CoreStatus current) {
+  return switch (current) {
+    CoreStarting() || CoreStopping() || CoreStopped() => false,
+    CoreStarted() => null,
+  };
+}
+
 @visibleForTesting
 ({bool pending, bool? routeReady}) nativeRecoveryRouteGateTransition({
   required CoreStatus? previous,
@@ -1178,23 +1080,6 @@ ConnectionStatus connectionStatusFromCore(CoreStatus event, bool startupRouteRea
   }
   if (current is CoreStarted && pending) {
     return (pending: false, routeReady: true);
-  }
-  if (current is CoreStopped || current is CoreStopping) {
-    return (pending: false, routeReady: false);
-  }
-  return (pending: pending, routeReady: null);
-}
-
-@visibleForTesting
-({bool pending, bool? routeReady}) platformRouteGateTransition({required CoreStatus current, required bool pending}) {
-  if (current is CoreStarting) {
-    return (pending: true, routeReady: false);
-  }
-  if (current is CoreStarted && pending) {
-    return (pending: false, routeReady: true);
-  }
-  if (current is CoreStarted) {
-    return (pending: false, routeReady: null);
   }
   if (current is CoreStopped || current is CoreStopping) {
     return (pending: false, routeReady: false);

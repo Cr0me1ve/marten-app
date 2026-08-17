@@ -1,3 +1,5 @@
+import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
@@ -10,6 +12,7 @@ import 'package:marten/features/profile/data/profile_data_providers.dart';
 import 'package:marten/features/profile/notifier/active_profile_notifier.dart';
 import 'package:marten/utils/custom_loggers.dart';
 import 'package:marten/utils/json_content.dart';
+import 'package:marten/utils/link_parsers.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 class LocalOutbound {
@@ -20,6 +23,7 @@ class LocalOutbound {
     required this.serverPort,
     this.countryCode,
     this.tlsServerName,
+    this.tlsProbeAllowsUntrusted = false,
     this.tunnelPingUrl,
     this.callUrls = const [],
     this.usesTurncoat = false,
@@ -32,7 +36,13 @@ class LocalOutbound {
   final String? countryCode;
   final String? tlsServerName;
 
-  String get displayName => stripTagMetadata(tag);
+  /// REALITY authenticates the peer with its configured public key rather
+  /// than Android's platform CA store. Its ordinary TLS fallback certificate
+  /// is therefore useful for proving that ClientHello traverses the physical
+  /// network, but it must not be treated as the VLESS peer identity.
+  final bool tlsProbeAllowsUntrusted;
+
+  String get displayName => stripLeadingFlagEmoji(stripTagMetadata(tag));
 
   /// HTTP URL the marten-agent on the corresponding node serves under
   /// /tunnel/ping. A 200 response with `{"ok":true}` proves the full data
@@ -55,13 +65,20 @@ const _excludedTags = {'direct', 'bypass', 'direct-fragment', 'dns-out', 'block'
 const _coreSelectableExcludedTypes = {'selector', 'urltest', 'dns', 'block', 'direct', 'custom', 'turncoat'};
 const _tunnelPingPort = 9443;
 
+final localOutboundsByProfileProvider = FutureProvider.family<List<LocalOutbound>, String>((ref, profileId) async {
+  if (profileId.isEmpty) return const [];
+  // Re-read the raw config after a refresh of the active profile and whenever
+  // a different profile becomes active.
+  ref.watch(activeProfileProvider);
+  final repo = await ref.watch(profileRepositoryProvider.future);
+  final raw = await repo.getRawConfig(profileId).run().then((e) => e.getOrElse((_) => ''));
+  return parseLocalOutboundsResponsively(raw);
+});
+
 final localOutboundsProvider = FutureProvider<List<LocalOutbound>>((ref) async {
   final profile = await ref.watch(activeProfileProvider.future);
   if (profile == null) return const [];
-
-  final repo = await ref.watch(profileRepositoryProvider.future);
-  final raw = await repo.getRawConfig(profile.id).run().then((e) => e.getOrElse((_) => ''));
-  return parseLocalOutboundsResponsively(raw);
+  return ref.watch(localOutboundsByProfileProvider(profile.id).future);
 });
 
 const localOutboundsBackgroundParseThreshold = 64 * 1024;
@@ -77,9 +94,9 @@ List<LocalOutbound> parseLocalOutbounds(String raw) {
   if (raw.isEmpty) return const [];
   try {
     final parsed = decodeJsonContent(raw);
-    if (parsed is! Map) return const [];
+    if (parsed is! Map) return _parseVlessShareOutbounds(raw);
     final out = parsed['outbounds'];
-    if (out is! List) return const [];
+    if (out is! List) return _parseVlessShareOutbounds(raw);
 
     // Per-outbound metadata block emitted by master in the same JSON. Used
     // for pre-connect tunnel ping. Stripped by marten-core before the
@@ -127,12 +144,14 @@ List<LocalOutbound> parseLocalOutbounds(String raw) {
       if (_excludedTags.contains(tag)) continue;
       final info = serverInfo[tag];
       final serverFromMetadata = info?.server?.trim() ?? '';
-      final serverFromOutbound = ob['server']?.toString().trim() ?? '';
+      final xrayEndpoint = xrayServerEndpointForOutbound(ob);
+      final serverFromOutbound = firstNonEmptyString([ob['server'], xrayEndpoint?.server]) ?? '';
       final portFromOutbound = (ob['server_port'] is int)
           ? ob['server_port'] as int
-          : int.tryParse(ob['server_port']?.toString() ?? '') ?? 0;
+          : int.tryParse(ob['server_port']?.toString() ?? '') ?? xrayEndpoint?.port ?? 0;
       final port = (info?.serverPort ?? 0) > 0 ? info!.serverPort! : portFromOutbound;
       final tlsServerName = firstNonEmptyString([info?.tlsServerName, tlsServerNameForOutbound(ob)]);
+      final tlsProbeAllowsUntrusted = vlessTlsProbeAllowsUntrusted(ob);
       final server = serverFromMetadata.isNotEmpty ? serverFromMetadata : serverFromOutbound;
       if (hasTagMetadata(tag) && info == null) continue;
       result.add(
@@ -142,6 +161,7 @@ List<LocalOutbound> parseLocalOutbounds(String raw) {
           server: server,
           serverPort: port,
           tlsServerName: tlsServerName,
+          tlsProbeAllowsUntrusted: tlsProbeAllowsUntrusted,
           countryCode: countryCodeFromTag(tag),
           tunnelPingUrl: info?.tunnelPingUrl ?? tunnelPingUrlForServer(server),
           callUrls: _callUrlsForOutbound(tag, byTag, serverInfo),
@@ -151,7 +171,68 @@ List<LocalOutbound> parseLocalOutbounds(String raw) {
     }
     return result;
   } catch (_) {
-    return const [];
+    return _parseVlessShareOutbounds(raw);
+  }
+}
+
+/// Mirrors the native VLESS share-link parser closely enough to build the
+/// disconnected Home list from the original subscription payload. New
+/// foreground imports are stored as canonical JSON, but legacy profiles and
+/// background updates may still contain their original Base64/plain content.
+///
+/// The native parser appends ` § <index>` to share-link tags before building
+/// the `select` group. Keeping that exact tag here is required so a selection
+/// made before Connect resolves to the same outbound after core startup.
+List<LocalOutbound> _parseVlessShareOutbounds(String raw) {
+  final decoded = safeDecodeBase64(raw).trim();
+  if (decoded.isEmpty) return const [];
+
+  final result = <LocalOutbound>[];
+  var counter = 0;
+  for (final rawLine in decoded.replaceAll('\r', '\n').split('\n')) {
+    final line = rawLine.trim();
+    if (line.isEmpty || line.startsWith('#') || line.startsWith('/')) continue;
+
+    for (final rawChain in line.split('&&detour=')) {
+      final chain = safeDecodeBase64(rawChain.trim()).trim();
+      final uri = Uri.tryParse(chain);
+      final scheme = uri?.scheme.toLowerCase();
+      if (uri == null || uri.host.isEmpty || (scheme != 'vless' && scheme != 'svless')) {
+        return const [];
+      }
+
+      final params = <String, String>{};
+      for (final entry in uri.queryParametersAll.entries) {
+        params[entry.key.toLowerCase().replaceAll('_', '')] = entry.value.join(',');
+      }
+      final fragment = _decodeUriFragment(uri.fragment).trim();
+      final tag = '${fragment.isEmpty ? 'vless' : fragment} § $counter';
+      result.add(
+        LocalOutbound(
+          tag: tag,
+          type: 'vless',
+          server: uri.host,
+          serverPort: uri.hasPort ? uri.port : 443,
+          tlsServerName: firstNonEmptyString([params['sni'], params['servername']]),
+          tlsProbeAllowsUntrusted:
+              params['security']?.toLowerCase() == 'reality' ||
+              _isTruthyShareParameter(params['insecure']) ||
+              _isTruthyShareParameter(params['allowinsecure']),
+          countryCode: countryCodeFromTag(fragment),
+        ),
+      );
+      counter++;
+    }
+  }
+  return result;
+}
+
+String _decodeUriFragment(String fragment) {
+  if (fragment.isEmpty) return '';
+  try {
+    return Uri.decodeComponent(fragment);
+  } on FormatException {
+    return fragment;
   }
 }
 
@@ -194,6 +275,54 @@ bool _xrayOutboundCarriesVless(Map<String, dynamic> outbound) {
   return false;
 }
 
+({String server, int port})? xrayServerEndpointForOutbound(Map<String, dynamic> outbound) {
+  final xconfig = outbound['xconfig'];
+  if (xconfig is! Map) return null;
+  final vless = _firstXrayVlessOutbound(xconfig);
+  if (vless != null) {
+    final settings = vless['settings'];
+    final vnext = settings is Map ? settings['vnext'] : null;
+    if (vnext is List && vnext.isNotEmpty) {
+      final endpoint = _xrayEndpointFromMap(vnext.first);
+      if (endpoint != null) return endpoint;
+    }
+  }
+  final nested = xconfig['outbounds'];
+  final candidates = nested is List ? nested : [xconfig];
+  for (final item in candidates) {
+    if (item is! Map) continue;
+    final protocol = item['protocol']?.toString().trim().toLowerCase() ?? '';
+    if (const {'freedom', 'blackhole', 'dns', 'loopback'}.contains(protocol)) continue;
+    final settings = item['settings'];
+    if (settings is! Map) continue;
+
+    final vnext = settings['vnext'];
+    if (vnext is List && vnext.isNotEmpty) {
+      final endpoint = _xrayEndpointFromMap(vnext.first);
+      if (endpoint != null) return endpoint;
+    }
+
+    final servers = settings['servers'];
+    if (servers is List && servers.isNotEmpty) {
+      final endpoint = _xrayEndpointFromMap(servers.first);
+      if (endpoint != null) return endpoint;
+    }
+
+    final endpoint = _xrayEndpointFromMap(settings);
+    if (endpoint != null) return endpoint;
+  }
+  return null;
+}
+
+({String server, int port})? _xrayEndpointFromMap(Object? value) {
+  if (value is! Map) return null;
+  final server = firstNonEmptyString([value['address'], value['server'], value['host']]);
+  final rawPort = value['port'] ?? value['server_port'] ?? value['serverPort'];
+  final port = rawPort is int ? rawPort : int.tryParse(rawPort?.toString() ?? '') ?? 0;
+  if (server == null || port <= 0 || port > 65535) return null;
+  return (server: server, port: port);
+}
+
 String? tlsServerNameForOutbound(Map<String, dynamic> outbound) {
   final tls = outbound['tls'];
   if (tls is Map) {
@@ -202,11 +331,67 @@ String? tlsServerNameForOutbound(Map<String, dynamic> outbound) {
   }
 
   final xconfig = outbound['xconfig'];
+  final fromVless = _xrayVlessTLSServerName(xconfig);
+  if (fromVless != null) return fromVless;
   final fromXconfig = _xrayTLSServerName(xconfig);
   if (fromXconfig != null) return fromXconfig;
 
   final raw = outbound['xray_outbound_raw'];
   return _xrayTLSServerName(raw);
+}
+
+bool vlessTlsProbeAllowsUntrusted(Map<String, dynamic> outbound) {
+  final tls = outbound['tls'];
+  if (tls is Map) {
+    final reality = tls['reality'];
+    if (reality is Map && reality['enabled'] == true) return true;
+    if (tls['insecure'] == true) return true;
+  }
+
+  return _xrayVlessAllowsUntrustedTLS(outbound['xconfig']) ||
+      _xrayVlessAllowsUntrustedTLS(outbound['xray_outbound_raw']);
+}
+
+bool _xrayVlessAllowsUntrustedTLS(Object? value) {
+  final candidate = _firstXrayVlessOutbound(value);
+  if (candidate == null) return false;
+  final streamSettings = candidate['streamSettings'];
+  if (streamSettings is! Map) return false;
+  if (streamSettings['security']?.toString().trim().toLowerCase() == 'reality') return true;
+  final tlsSettings = streamSettings['tlsSettings'];
+  if (tlsSettings is Map && tlsSettings['allowInsecure'] == true) return true;
+  return false;
+}
+
+Map? _firstXrayVlessOutbound(Object? value) {
+  if (value is! Map) return null;
+  final nested = value['outbounds'];
+  if (nested is List) {
+    for (final candidate in nested) {
+      if (candidate is Map && candidate['protocol']?.toString().trim().toLowerCase() == 'vless') {
+        return candidate;
+      }
+    }
+  }
+  return value['protocol']?.toString().trim().toLowerCase() == 'vless' ? value : null;
+}
+
+String? _xrayVlessTLSServerName(Object? value) {
+  final candidate = _firstXrayVlessOutbound(value);
+  if (candidate == null) return null;
+  final streamSettings = candidate['streamSettings'];
+  if (streamSettings is! Map) return null;
+  final security = streamSettings['security']?.toString().trim().toLowerCase();
+  final settings = security == 'reality' ? streamSettings['realitySettings'] : streamSettings['tlsSettings'];
+  if (settings is! Map) return null;
+  return firstNonEmptyString([settings['serverName'], settings['server_name']]);
+}
+
+bool _isTruthyShareParameter(String? value) {
+  return switch (value?.trim().toLowerCase()) {
+    '1' || 'true' || 'yes' || 'on' => true,
+    _ => false,
+  };
 }
 
 String? _xrayTLSServerName(Object? value) {
@@ -246,9 +431,13 @@ List<String> selectableOutboundTagsFromConfig(String raw) {
   if (raw.isEmpty) return const [];
   try {
     final parsed = decodeJsonContent(raw);
-    if (parsed is! Map) return const [];
+    if (parsed is! Map) {
+      return _parseVlessShareOutbounds(raw).map((outbound) => outbound.tag).toList(growable: false);
+    }
     final outbounds = parsed['outbounds'];
-    if (outbounds is! List) return const [];
+    if (outbounds is! List) {
+      return _parseVlessShareOutbounds(raw).map((outbound) => outbound.tag).toList(growable: false);
+    }
     final tags = <String>[];
     for (final item in outbounds) {
       if (item is! Map) continue;
@@ -258,7 +447,7 @@ List<String> selectableOutboundTagsFromConfig(String raw) {
     }
     return tags;
   } catch (_) {
-    return const [];
+    return _parseVlessShareOutbounds(raw).map((outbound) => outbound.tag).toList(growable: false);
   }
 }
 
@@ -549,7 +738,26 @@ String stripTagMetadata(String tag) {
   return tag.substring(0, idx).trimRight();
 }
 
-bool hasTagMetadata(String tag) => tag.contains('§');
+/// The country flag has its own leading tile. Remove only a leading regional
+/// indicator pair from the label so the same flag is not rendered twice.
+String stripLeadingFlagEmoji(String value) {
+  final runes = value.runes.toList(growable: false);
+  if (runes.length < 2) return value;
+  const firstRegionalIndicator = 0x1F1E6;
+  const lastRegionalIndicator = 0x1F1FF;
+  if (runes[0] < firstRegionalIndicator ||
+      runes[0] > lastRegionalIndicator ||
+      runes[1] < firstRegionalIndicator ||
+      runes[1] > lastRegionalIndicator) {
+    return value;
+  }
+  return String.fromCharCodes(runes.skip(2)).trimLeft();
+}
+
+/// Marten server metadata is a balanced marker such as `§id:abc123§`.
+/// Native share-link parsers use a single-delimiter suffix (`§ 0`) only to
+/// make tags unique; that suffix must not require a `servers` metadata entry.
+bool hasTagMetadata(String tag) => RegExp('§[^§]+§').hasMatch(tag);
 
 String? tunnelPingUrlForServer(String server) {
   final host = server.trim();
@@ -767,9 +975,58 @@ Future<int> nativeICMPEchoProbe(String host, {MethodChannel channel = _martenMet
   }
 }
 
+Future<int> nativeTLSHandshakeProbe(
+  String host,
+  int port, {
+  String? serverName,
+  bool allowUntrusted = false,
+  MethodChannel channel = _martenMethodChannel,
+  bool? isAndroid,
+}) async {
+  final endpointHost = host.trim();
+  final tlsServerName = serverName?.trim();
+  if (endpointHost.isEmpty || port <= 0 || port > 65535) return -1;
+  if (isAndroid ?? Platform.isAndroid) {
+    try {
+      final delay = await channel
+          .invokeMethod<int>('tls_ping', {
+            'host': endpointHost,
+            'port': port,
+            'serverName': tlsServerName?.isNotEmpty == true ? tlsServerName : endpointHost,
+            'allowUntrusted': allowUntrusted,
+            'timeoutMs': _pingTimeout.inMilliseconds,
+          })
+          .timeout(_pingTimeout + const Duration(milliseconds: 500));
+      return delay != null && delay > 0 ? delay : -1;
+    } catch (_) {
+      return -1;
+    }
+  }
+
+  Socket? plainSocket;
+  SecureSocket? tlsSocket;
+  final stopwatch = Stopwatch()..start();
+  try {
+    plainSocket = await Socket.connect(endpointHost, port, timeout: _pingTimeout);
+    tlsSocket = await SecureSocket.secure(
+      plainSocket,
+      host: tlsServerName?.isNotEmpty == true ? tlsServerName : endpointHost,
+      onBadCertificate: allowUntrusted ? (_) => true : null,
+    ).timeout(_pingTimeout);
+    stopwatch.stop();
+    return math.max(1, stopwatch.elapsedMilliseconds);
+  } catch (_) {
+    return -1;
+  } finally {
+    tlsSocket?.destroy();
+    plainSocket?.destroy();
+  }
+}
+
 enum LocalPingMode { preConnect, connectedRoute }
 
-/// Maps tag → measured latency in ms (-1 = timeout/error, 0 = not yet measured).
+/// Maps profile ID → tag → measured latency in ms
+/// (-1 = timeout/error, 0 = not yet measured).
 ///
 /// Probe strategy is chosen per outbound type so that "ping" reflects the
 /// actual data path, not just whether the entry's L4 port is open:
@@ -778,9 +1035,9 @@ enum LocalPingMode { preConnect, connectedRoute }
 ///     call invite URL, since that is the public WebRTC path TURNcoat uses
 ///     before it obtains relay credentials, then multiply it by 4 + random(0, 1)
 ///     to approximate TURNcoat setup/relay cost.
-///   * **VLESS** — probe the configured server domain/IP on server_port with a
-///     TCP connect. Do not promote IP endpoints to SNI domains for ping, because
-///     that can hide the real node latency behind a fronting host.
+///   * **VLESS** — complete a TLS handshake to the configured server endpoint
+///     with its issued SNI. On Android the socket is bound to the physical
+///     NOT_VPN network, so a SYN/ACK without a working ClientHello is a failure.
 ///   * **Cascade entry / single nodes** (everything else) — when the
 ///     subscription provides a `tunnel_ping_url`, we GET it. The marten-agent
 ///     on the entry node serves it by SO_BINDTODEVICE-ing the cascade WG
@@ -788,40 +1045,65 @@ enum LocalPingMode { preConnect, connectedRoute }
 ///     entry → cascade → exit → internet works end to end. Falls back to
 ///     plain TCP-connect on (server, server_port) when the agent endpoint is
 ///     missing or unhealthy (e.g. legacy single-node subscriptions).
-class LocalPingNotifier extends Notifier<Map<String, int>> with InfraLogger {
+class LocalPingNotifier extends Notifier<Map<String, Map<String, int>>> with InfraLogger {
   @override
-  Map<String, int> build() => const {};
+  Map<String, Map<String, int>> build() => const {};
 
-  bool _running = false;
+  final Map<String, Object> _activeRuns = {};
+  final _scheduler = _LocalPingScheduler(_maxConcurrentPings);
 
-  void clear() => state = const {};
-
-  void markPending(Iterable<LocalOutbound> outbounds) {
-    state = {for (final outbound in outbounds) outbound.tag: 0};
+  void clear(String profileId) {
+    if (profileId.isEmpty) return;
+    _activeRuns.remove(profileId);
+    if (!state.containsKey(profileId)) return;
+    final next = Map<String, Map<String, int>>.from(state)..remove(profileId);
+    state = Map<String, Map<String, int>>.unmodifiable(next);
   }
 
-  void record(String tag, int delay) {
-    state = {...state, tag: delay};
+  void markPending(String profileId, Iterable<LocalOutbound> outbounds) {
+    if (profileId.isEmpty) return;
+    _replaceProfileResults(profileId, {for (final outbound in outbounds) outbound.tag: 0});
   }
 
-  Future<void> pingAll(List<LocalOutbound> outbounds, {LocalPingMode mode = LocalPingMode.preConnect}) async {
-    if (_running) return;
-    _running = true;
+  void record(String profileId, String tag, int delay) {
+    if (profileId.isEmpty || tag.isEmpty) return;
+    _record(profileId, tag, delay);
+  }
+
+  Future<void> pingAll(
+    String profileId,
+    List<LocalOutbound> outbounds, {
+    LocalPingMode mode = LocalPingMode.preConnect,
+  }) async {
+    if (profileId.isEmpty || _activeRuns.containsKey(profileId)) return;
+    final run = Object();
+    _activeRuns[profileId] = run;
     try {
-      state = {for (final o in outbounds) o.tag: 0};
-      for (var start = 0; start < outbounds.length; start += _maxConcurrentPings) {
-        final next = start + _maxConcurrentPings;
-        final end = next > outbounds.length ? outbounds.length : next;
-        await Future.wait(outbounds.sublist(start, end).map((outbound) => _pingOne(outbound, mode)));
-      }
+      _replaceProfileResults(profileId, {for (final outbound in outbounds) outbound.tag: 0});
+      await Future.wait(
+        outbounds.map((outbound) => _scheduler.schedule(profileId, () => _pingOne(profileId, run, outbound, mode))),
+      );
     } finally {
-      _running = false;
+      if (identical(_activeRuns[profileId], run)) {
+        _activeRuns.remove(profileId);
+      }
     }
   }
 
-  Future<void> _pingOne(LocalOutbound o, LocalPingMode mode) async {
+  Future<void> _pingOne(String profileId, Object run, LocalOutbound o, LocalPingMode mode) async {
     final delay = await _measure(o, mode);
-    state = {...state, o.tag: delay};
+    if (identical(_activeRuns[profileId], run)) {
+      _record(profileId, o.tag, delay);
+    }
+  }
+
+  void _replaceProfileResults(String profileId, Map<String, int> results) {
+    state = Map<String, Map<String, int>>.unmodifiable({...state, profileId: Map<String, int>.unmodifiable(results)});
+  }
+
+  void _record(String profileId, String tag, int delay) {
+    final profileResults = state[profileId] ?? const <String, int>{};
+    _replaceProfileResults(profileId, {...profileResults, tag: delay});
   }
 
   Future<int> _measure(LocalOutbound o, LocalPingMode mode) async {
@@ -835,7 +1117,12 @@ class LocalPingNotifier extends Notifier<Map<String, int>> with InfraLogger {
       return scaledTurncoatPingDelay(await _tcpProbeTurncoat(o));
     }
     if (localOutboundUsesServerPortPing(o)) {
-      return _tcpProbe(o.server, o.serverPort);
+      return nativeTLSHandshakeProbe(
+        o.server,
+        o.serverPort,
+        serverName: o.tlsServerName,
+        allowUntrusted: o.tlsProbeAllowsUntrusted,
+      );
     }
     if (o.tunnelPingUrl != null && o.tunnelPingUrl!.isNotEmpty) {
       final delay = await _httpTunnelPing(o.tunnelPingUrl!);
@@ -917,7 +1204,53 @@ class LocalPingNotifier extends Notifier<Map<String, int>> with InfraLogger {
   }
 }
 
-final localPingProvider = NotifierProvider<LocalPingNotifier, Map<String, int>>(LocalPingNotifier.new);
+final localPingProvider = NotifierProvider<LocalPingNotifier, Map<String, Map<String, int>>>(LocalPingNotifier.new);
+
+class _LocalPingScheduler {
+  _LocalPingScheduler(this.maxConcurrent);
+
+  final int maxConcurrent;
+  final Map<String, Queue<_ScheduledPing>> _queues = {};
+  int _active = 0;
+  String? _lastProfileId;
+
+  Future<void> schedule(String profileId, Future<void> Function() task) {
+    final completer = Completer<void>();
+    (_queues[profileId] ??= Queue<_ScheduledPing>()).add(_ScheduledPing(task, completer));
+    _drain();
+    return completer.future;
+  }
+
+  void _drain() {
+    while (_active < maxConcurrent && _queues.isNotEmpty) {
+      final profileId = _nextProfileId();
+      final queue = _queues[profileId]!;
+      final scheduled = queue.removeFirst();
+      if (queue.isEmpty) _queues.remove(profileId);
+      _lastProfileId = profileId;
+      _active++;
+      Future<void>.sync(
+        scheduled.task,
+      ).then(scheduled.completer.complete, onError: scheduled.completer.completeError).whenComplete(() {
+        _active--;
+        _drain();
+      });
+    }
+  }
+
+  String _nextProfileId() {
+    final profileIds = _queues.keys.toList(growable: false);
+    final lastIndex = _lastProfileId == null ? -1 : profileIds.indexOf(_lastProfileId!);
+    return profileIds[(lastIndex + 1) % profileIds.length];
+  }
+}
+
+class _ScheduledPing {
+  const _ScheduledPing(this.task, this.completer);
+
+  final Future<void> Function() task;
+  final Completer<void> completer;
+}
 
 int scaledTurncoatPingDelay(int delay, {double? randomFraction}) {
   if (delay < 0) return delay;

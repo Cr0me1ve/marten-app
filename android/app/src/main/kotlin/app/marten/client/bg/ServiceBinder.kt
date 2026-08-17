@@ -6,6 +6,7 @@ import androidx.lifecycle.MutableLiveData
 import app.marten.client.IService
 import app.marten.client.IServiceCallback
 import app.marten.client.constant.Status
+import app.marten.client.crashreporting.NativeCrashDiagnostics
 import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.GlobalScope
@@ -22,6 +23,7 @@ class ServiceBinder(private val status: MutableLiveData<Status>) : IService.Stub
 
     init {
         status.observeForever {
+            NativeCrashDiagnostics.logPhase("box_service", "status_${it.name.lowercase()}")
             broadcast { callback ->
                 callback.onServiceStatusChanged(it.ordinal)
             }

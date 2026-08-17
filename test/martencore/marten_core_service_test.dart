@@ -188,6 +188,22 @@ void main() {
       }
     });
 
+    test(
+      'Android foreground and background logs share one listener while other platforms keep their roles separate',
+      () {
+        final androidForeground = coreLogListenerKey(isAndroid: true, role: 'fg');
+        final androidBackground = coreLogListenerKey(isAndroid: true, role: 'bg');
+        expect(androidForeground, androidBackground);
+        expect(androidForeground, 'androidCoreLogListener');
+
+        final desktopForeground = coreLogListenerKey(isAndroid: false, role: 'fg');
+        final desktopBackground = coreLogListenerKey(isAndroid: false, role: 'bg');
+        expect(desktopForeground, 'fgLogListener');
+        expect(desktopBackground, 'bgLogListener');
+        expect(desktopForeground, isNot(desktopBackground));
+      },
+    );
+
     test('deferred maintenance waits for idle after its existing delay without a periodic cadence', () {
       final bootstrap = File('lib/bootstrap.dart').readAsStringSync();
       final idleGateStart = bootstrap.indexOf('Future<void> _waitForUiIdle');
@@ -710,6 +726,47 @@ void main() {
         ),
         isTrue,
       );
+    });
+
+    test('native recovery maintains the background CAPTCHA log bridge before route verification', () {
+      final source = File('lib/martencore/marten_core_service.dart').readAsStringSync();
+      final apply = _extractFunctionBlock(source, 'void _applyPlatformServiceStatus(CoreStatus event)');
+      final bridge = _extractFunctionBlock(
+        source,
+        'Future<void> _maintainNativeRecoveryLogBridge(int generation) async',
+      );
+      final logs = _extractFunctionBlock(source, 'Future<void> startListeningLogs(String key, CoreClient cc) async');
+
+      expect(apply, isNotEmpty);
+      expect(bridge, isNotEmpty);
+      expect(logs, isNotEmpty);
+
+      final recoveryStart = apply.indexOf('if (startsNativePlatformRecovery(currentState, event))');
+      final bridgeStart = apply.indexOf('_startNativeRecoveryLogBridge();');
+      final recoveryCompleted = apply.indexOf('final recoveryCompleted = recoveryInProgress && event is CoreStarted;');
+      expect(recoveryStart, isNonNegative);
+      expect(bridgeStart, greaterThan(recoveryStart));
+      expect(bridgeStart, lessThan(recoveryCompleted));
+
+      expect(
+        bridge,
+        contains(
+          'while (!_disposed && _nativePlatformRecoveryInProgress && generation == _nativeRecoveryLogBridgeGeneration)',
+        ),
+      );
+      expect(
+        bridge,
+        contains('final logListenerKey = coreLogListenerKey(isAndroid: PlatformUtils.isAndroid, role: "bg")'),
+      );
+      expect(bridge, contains('if (subscriptions[logListenerKey] == null)'));
+      expect(bridge, contains('await startListeningLogs("bg", core.bgClient)'));
+      expect(bridge, contains('await Future.delayed(_nativeRecoveryLogBridgePollInterval)'));
+      expect(bridge, isNot(contains('stopListenSingle("bg")')));
+
+      expect(apply, contains('_stopNativeRecoveryLogBridge();'));
+      expect(apply.lastIndexOf('_stopNativeRecoveryLogBridge();'), greaterThan(recoveryCompleted));
+      expect(logs, contains("event.message.contains('MARTEN_TURNCOAT_CAPTCHA')"));
+      expect(logs, contains('if (!isCaptchaControlEvent && !_coreLogDeduplicator.shouldAccept(event)) return event;'));
     });
   });
 }

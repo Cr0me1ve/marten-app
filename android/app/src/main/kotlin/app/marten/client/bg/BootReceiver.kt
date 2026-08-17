@@ -24,7 +24,7 @@ class BootReceiver : BroadcastReceiver() {
         GlobalScope.launch(Dispatchers.IO) {
             if (Settings.startedByUser) {
                 withContext(Dispatchers.Main) {
-                    BoxService.connect(userInitiated = false)
+                    BoxService.connect()
                 }
             }
         }

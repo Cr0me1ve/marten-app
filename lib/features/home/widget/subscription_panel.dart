@@ -25,7 +25,9 @@ import 'package:marten/utils/platform_utils.dart';
 
 const _panelColor = Color(0xFF252426);
 const _dividerColor = Color(0xFF323135);
-const _collapsedProfileHeight = 64.0;
+const _collapsedProfileMinHeight = 64.0;
+const _serverListMaxHeight = 400.0;
+const _eagerServerRowLimit = 6;
 
 class SubscriptionPanel extends HookConsumerWidget {
   const SubscriptionPanel({super.key});
@@ -39,9 +41,14 @@ class SubscriptionPanel extends HookConsumerWidget {
     final switchingProfileId = useState<String?>(null);
 
     useEffect(() {
-      Future.microtask(() => ref.read(localPingProvider.notifier).clear());
+      final profileId = activeProfile?.id;
+      if (profileId != null) {
+        Future.microtask(() => ref.read(localPingProvider.notifier).clear(profileId));
+      }
+      // A profile switch deliberately is not a dependency: its ping keeps
+      // running and its result remains available when the user returns.
       return null;
-    }, [useLive, activeProfile?.id]);
+    }, [useLive]);
 
     if (activeProfile == null) {
       return _EmptyPanel(
@@ -53,8 +60,12 @@ class SubscriptionPanel extends HookConsumerWidget {
     final seenProfileIds = <String>{activeProfile.id};
     final inactiveProfiles = profiles.where((profile) => seenProfileIds.add(profile.id)).toList(growable: false);
     final maxPanelHeight = math.min(MediaQuery.sizeOf(context).height * 0.68, 560.0);
+    final collapsedProfileHeight = math.max(
+      _collapsedProfileMinHeight,
+      16 + MediaQuery.textScalerOf(context).scale(48),
+    );
     final inactiveListHeight = math.min(
-      inactiveProfiles.length * _collapsedProfileHeight + math.max(0, inactiveProfiles.length - 1),
+      inactiveProfiles.length * collapsedProfileHeight + math.max(0, inactiveProfiles.length - 1),
       math.min(maxPanelHeight * 0.3, 180.0),
     );
 
@@ -196,16 +207,12 @@ class _PanelHeader extends HookConsumerWidget {
                     ),
                     if (profile case RemoteProfileEntity(:final expiresAt)) ...[
                       Text(
-                        t.components.subscriptionInfo.updatedAt(date: profile.lastUpdate.format()),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
+                        t.components.subscriptionInfo.updatedAt(date: profile.lastUpdate.formatSubscriptionUpdate()),
                         style: Theme.of(context).textTheme.bodySmall?.copyWith(color: Colors.white60),
                       ),
                       if (expiresAt != null)
                         Text(
                           '${t.components.subscriptionInfo.expireDate}: ${expiresAt.toLocal().format()}',
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
                           style: Theme.of(context).textTheme.bodySmall?.copyWith(
                             color: expiresAt.isBefore(DateTime.now())
                                 ? Theme.of(context).colorScheme.error
@@ -267,8 +274,10 @@ class _PanelHeader extends HookConsumerWidget {
                 if (useLive) {
                   await ref.read(proxiesOverviewNotifierProvider.notifier).urlTest("select");
                 } else {
-                  final outbounds = await ref.read(localOutboundsProvider.future);
-                  await ref.read(localPingProvider.notifier).pingAll(outbounds);
+                  final outboundsFuture = ref.read(localOutboundsByProfileProvider(profile.id).future);
+                  final localPing = ref.read(localPingProvider.notifier);
+                  final outbounds = await outboundsFuture;
+                  await localPing.pingAll(profile.id, outbounds);
                 }
               },
               icon: const Icon(FluentIcons.flash_24_filled, color: Colors.white70),
@@ -298,17 +307,17 @@ class _CollapsedProfileHeader extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final t = ref.watch(translationsProvider).requireValue;
     final theme = Theme.of(context);
-    final subtitle = switch (profile) {
+    final subtitleParts = switch (profile) {
       RemoteProfileEntity(:final expiresAt) => [
-        t.components.subscriptionInfo.updatedAt(date: profile.lastUpdate.format()),
+        t.components.subscriptionInfo.updatedAt(date: profile.lastUpdate.formatSubscriptionUpdate()),
         if (expiresAt != null) '${t.components.subscriptionInfo.expireDate}: ${expiresAt.toLocal().format()}',
-      ].join('  ·  '),
-      _ => null,
+      ],
+      _ => const <String>[],
     };
 
-    return SizedBox(
+    return ConstrainedBox(
       key: ValueKey('subscription-profile-${profile.id}-collapsed'),
-      height: _collapsedProfileHeight,
+      constraints: const BoxConstraints(minHeight: _collapsedProfileMinHeight),
       child: Material(
         color: Colors.transparent,
         child: InkWell(
@@ -337,12 +346,13 @@ class _CollapsedProfileHeader extends ConsumerWidget {
                             fontFamily: PlatformUtils.isWindows ? FontFamily.emoji : null,
                           ),
                         ),
-                        if (subtitle != null)
-                          Text(
-                            subtitle,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: theme.textTheme.bodySmall?.copyWith(color: Colors.white54),
+                        if (subtitleParts.isNotEmpty)
+                          Wrap(
+                            spacing: 8,
+                            children: [
+                              for (final part in subtitleParts)
+                                Text(part, style: theme.textTheme.bodySmall?.copyWith(color: Colors.white54)),
+                            ],
                           ),
                       ],
                     ),
@@ -395,8 +405,8 @@ class _PanelBody extends HookConsumerWidget {
         const Divider(height: 1, thickness: 1, color: _dividerColor),
         Flexible(
           child: effectiveConnection is Connected
-              ? const _LiveServerList()
-              : _OfflineServerList(selectionEnabled: selectionEnabled, currentOnly: currentOnly),
+              ? _LiveServerList(profileId: profile.id)
+              : _OfflineServerList(profileId: profile.id, selectionEnabled: selectionEnabled, currentOnly: currentOnly),
         ),
       ],
     );
@@ -404,13 +414,14 @@ class _PanelBody extends HookConsumerWidget {
 }
 
 class _LiveServerList extends ConsumerWidget {
-  const _LiveServerList();
+  const _LiveServerList({required this.profileId});
+
+  final String profileId;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final t = ref.watch(translationsProvider).requireValue;
     final proxies = ref.watch(proxiesOverviewNotifierProvider);
-    final pings = ref.watch(localPingProvider);
 
     return proxies.when(
       data: (group) {
@@ -418,15 +429,11 @@ class _LiveServerList extends ConsumerWidget {
           return _PanelMessage(text: t.pages.proxies.empty);
         }
         final selected = group.items.firstWhere((item) => item.tag == group.selected.tag, orElse: () => group.selected);
-        return ListView.separated(
-          primary: false,
-          shrinkWrap: true,
-          padding: const EdgeInsets.symmetric(vertical: 4),
+        return _ServerListViewport(
           itemCount: 1,
-          separatorBuilder: (_, _) => const Divider(height: 1, thickness: 1, color: _dividerColor),
           itemBuilder: (context, index) {
-            final ping = pings[selected.tag];
-            return _ServerTile(
+            return _PingAwareServerTile(
+              profileId: profileId,
               tag: selected.tag,
               title: selected.tagDisplay,
               type: displayTypeForProxyLabel(selected.type),
@@ -434,32 +441,31 @@ class _LiveServerList extends ConsumerWidget {
                   countryCodeFromTag(selected.tag) ??
                   (selected.ipinfo.countryCode.isNotEmpty ? selected.ipinfo.countryCode : null),
               organization: selected.ipinfo.org,
-              urlTestDelay: displayDelayWithLocalPing(coreDelay: selected.urlTestDelay, localPing: ping),
-              pingPending: ping == 0,
+              coreDelay: selected.urlTestDelay,
               selected: true,
               onTap: null,
             );
           },
         );
       },
-      loading: () => const _OfflineServerList(selectionEnabled: false, currentOnly: true),
-      error: (_, _) => const _OfflineServerList(selectionEnabled: false, currentOnly: true),
+      loading: () => _OfflineServerList(profileId: profileId, selectionEnabled: false, currentOnly: true),
+      error: (_, _) => _OfflineServerList(profileId: profileId, selectionEnabled: false, currentOnly: true),
     );
   }
 }
 
 class _OfflineServerList extends HookConsumerWidget {
-  const _OfflineServerList({required this.selectionEnabled, this.currentOnly = false});
+  const _OfflineServerList({required this.profileId, required this.selectionEnabled, this.currentOnly = false});
 
+  final String profileId;
   final bool selectionEnabled;
   final bool currentOnly;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final t = ref.watch(translationsProvider).requireValue;
-    final outbounds = ref.watch(localOutboundsProvider);
+    final outbounds = ref.watch(localOutboundsByProfileProvider(profileId));
     final pending = ref.watch(pendingProxySelectionProvider);
-    final pings = ref.watch(localPingProvider);
     final activeProfile = ref.watch(activeProfileProvider).valueOrNull;
     ref.watch(selectedProxyByProfileProvider);
     final retainedItems = useRef<List<LocalOutbound>>(const []);
@@ -469,9 +475,9 @@ class _OfflineServerList extends HookConsumerWidget {
       retainedItems.value = latestItems;
     }
     final items = latestItems ?? retainedItems.value;
+    final tags = useMemoized(() => items.map((item) => item.tag).toList(growable: false), [items]);
 
     if (items.isNotEmpty) {
-      final tags = items.map((item) => item.tag).toList(growable: false);
       final remembered = activeProfile == null
           ? null
           : ref.read(selectedProxyByProfileProvider.notifier).rememberedTagFor(activeProfile.id, tags);
@@ -489,28 +495,18 @@ class _OfflineServerList extends HookConsumerWidget {
       final visibleItems = currentOnly && selectedTag != null
           ? items.where((item) => item.tag == selectedTag).take(1).toList(growable: false)
           : items;
-      return ListView.separated(
-        primary: false,
-        shrinkWrap: true,
-        padding: const EdgeInsets.symmetric(vertical: 4),
+      return _ServerListViewport(
         itemCount: visibleItems.length,
-        separatorBuilder: (_, _) => const Divider(height: 1, thickness: 1, color: _dividerColor),
         itemBuilder: (context, index) {
           final item = visibleItems[index];
-          final ping = pings[item.tag];
-          return _ServerTile(
+          return _PingAwareServerTile(
+            profileId: profileId,
             tag: item.tag,
             title: item.displayName,
             type: item.type,
             countryCode: item.countryCode,
             organization: null,
-            urlTestDelay: switch (ping) {
-              null => 0,
-              0 => 0,
-              -1 => 999999,
-              _ => ping,
-            },
-            pingPending: ping == 0,
+            coreDelay: 0,
             selected: item.tag == selectedTag,
             onTap: selectionEnabled
                 ? () async {
@@ -533,6 +529,72 @@ class _OfflineServerList extends HookConsumerWidget {
     return const Padding(
       padding: EdgeInsets.symmetric(vertical: 24),
       child: Center(child: CircularProgressIndicator()),
+    );
+  }
+}
+
+class _ServerListViewport extends StatelessWidget {
+  const _ServerListViewport({required this.itemCount, required this.itemBuilder});
+
+  final int itemCount;
+  final IndexedWidgetBuilder itemBuilder;
+
+  @override
+  Widget build(BuildContext context) {
+    Widget buildList({required bool shrinkWrap}) {
+      return ListView.separated(
+        primary: false,
+        shrinkWrap: shrinkWrap,
+        padding: const EdgeInsets.symmetric(vertical: 4),
+        itemCount: itemCount,
+        separatorBuilder: (_, _) => const Divider(height: 1, thickness: 1, color: _dividerColor),
+        itemBuilder: itemBuilder,
+      );
+    }
+
+    if (itemCount <= _eagerServerRowLimit) {
+      return buildList(shrinkWrap: true);
+    }
+    return SizedBox(height: _serverListMaxHeight, child: buildList(shrinkWrap: false));
+  }
+}
+
+class _PingAwareServerTile extends ConsumerWidget {
+  const _PingAwareServerTile({
+    required this.profileId,
+    required this.tag,
+    required this.title,
+    required this.type,
+    required this.countryCode,
+    required this.organization,
+    required this.coreDelay,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final String profileId;
+  final String tag;
+  final String title;
+  final String type;
+  final String? countryCode;
+  final String? organization;
+  final int coreDelay;
+  final bool selected;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final ping = ref.watch(localPingProvider.select((pings) => pings[profileId]?[tag]));
+    return _ServerTile(
+      tag: tag,
+      title: title,
+      type: type,
+      countryCode: countryCode,
+      organization: organization,
+      urlTestDelay: displayDelayWithLocalPing(coreDelay: coreDelay, localPing: ping),
+      pingPending: ping == 0,
+      selected: selected,
+      onTap: onTap,
     );
   }
 }

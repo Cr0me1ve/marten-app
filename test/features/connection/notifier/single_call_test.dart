@@ -5,7 +5,6 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:marten/features/connection/model/connection_failure.dart';
 import 'package:marten/features/connection/model/connection_status.dart';
 import 'package:marten/features/connection/notifier/connection_notifier.dart';
-import 'package:marten/singbox/model/core_status.dart';
 
 String _extractFunctionBlock(String source, String signature) {
   final marker = source.indexOf(signature);
@@ -55,36 +54,58 @@ void main() {
     expect(canExecuteManualConnectionCommand(manualConnectionCommandForStatus(releasedStatus), releasedStatus), isTrue);
   });
 
-  test('normal disconnect and abort settle input before publishing reconnect availability', () {
+  test('stop while connecting is presented as abort and routes through abort cleanup', () {
+    expect(manualConnectionCommandForStatus(const Connecting()), ManualConnectionCommand.abort);
+    expect(canExecuteManualConnectionCommand(ManualConnectionCommand.disconnect, const Connecting()), isTrue);
+    expect(canExecuteManualConnectionCommand(ManualConnectionCommand.abort, const Connecting()), isTrue);
+
     final source = File('lib/features/connection/notifier/connection_notifier.dart').readAsStringSync();
-    final normalDisconnect = _extractFunctionBlock(source, 'Future<void> _disconnectFromManualCommand() async {');
-    final abortCleanup = _extractFunctionBlock(source, 'Future<void> _disconnectAfterAbort(int token) async {');
-    final visibleStream = _extractFunctionBlock(
+    final stopFromManual = _extractFunctionBlock(
       source,
-      'ConnectionStatus _visibleConnectionStatus(ConnectionStatus event) {',
+      'Future<void> _stopFromManualCommand(ConnectionStatus? currentStatus) async {',
     );
-
-    expect(normalDisconnect, isNotEmpty);
-    expect(abortCleanup, isNotEmpty);
-    expect(visibleStream, isNotEmpty);
-
-    final normalSettle = normalDisconnect.indexOf('await _settleManualDisconnectInput();');
-    final normalReleased = normalDisconnect.indexOf('manual disconnect fully released; reconnect is available');
-    expect(normalSettle, isNonNegative);
-    expect(normalReleased, greaterThan(normalSettle));
-
-    final abortLeaseRelease = abortCleanup.indexOf('_manualButtonDisconnectInProgress = false;');
-    final abortSettle = abortCleanup.indexOf('await _settleManualDisconnectInput();');
-    final abortReleased = abortCleanup.indexOf('aborted connection cleanup fully released; reconnect is available');
-    expect(abortLeaseRelease, isNonNegative);
-    expect(abortSettle, greaterThan(abortLeaseRelease));
-    expect(abortReleased, greaterThan(abortSettle));
-
-    expect(
-      visibleStream,
-      contains('disconnectInProgress: _manualButtonDisconnectInProgress || _manualDisconnectInputSettling'),
-    );
+    expect(stopFromManual, isNotEmpty);
+    expect(stopFromManual, contains('case Connecting():'));
+    expect(stopFromManual, contains('_abortConnectionImmediately();'));
   });
+
+  test(
+    'normal disconnect and abort publish terminal Disconnected after authoritative stop despite delayed stream status',
+    () {
+      final source = File('lib/features/connection/notifier/connection_notifier.dart').readAsStringSync();
+      final normalDisconnect = _extractFunctionBlock(source, 'Future<void> _disconnectFromManualCommand() async {');
+      final abortCleanup = _extractFunctionBlock(source, 'Future<void> _disconnectAfterAbort(int token) async {');
+      final visibleStream = _extractFunctionBlock(
+        source,
+        'ConnectionStatus _visibleConnectionStatus(ConnectionStatus event) {',
+      );
+
+      expect(normalDisconnect, isNotEmpty);
+      expect(abortCleanup, isNotEmpty);
+      expect(visibleStream, isNotEmpty);
+
+      final settleInput = _extractFunctionBlock(source, 'Future<void> _settleManualDisconnectInput() async {');
+      final normalSettle = normalDisconnect.indexOf('await _settleManualDisconnectInput();');
+      final normalReleased = normalDisconnect.indexOf('manual disconnect fully released; reconnect is available');
+      final terminalDisconnected = settleInput.indexOf('state = const AsyncData(Disconnected());');
+      expect(settleInput, isNotEmpty);
+      expect(terminalDisconnected, isNonNegative);
+      expect(normalSettle, isNonNegative);
+      expect(normalReleased, greaterThan(normalSettle));
+
+      final abortLeaseRelease = abortCleanup.indexOf('_manualButtonDisconnectInProgress = false;');
+      final abortSettle = abortCleanup.indexOf('await _settleManualDisconnectInput();');
+      final abortReleased = abortCleanup.indexOf('aborted connection cleanup fully released; reconnect is available');
+      expect(abortLeaseRelease, isNonNegative);
+      expect(abortSettle, greaterThan(abortLeaseRelease));
+      expect(abortReleased, greaterThan(abortSettle));
+
+      expect(
+        visibleStream,
+        contains('disconnectInProgress: _manualButtonDisconnectInProgress || _manualDisconnectInputSettling'),
+      );
+    },
+  );
 
   test('a captured disconnect intent cannot become a connect after terminal stop', () {
     final capturedCommand = manualConnectionCommandForStatus(const Connected());
@@ -103,15 +124,42 @@ void main() {
     );
   });
 
-  test('manual connection command mapping preserves the rendered intent', () {
-    expect(manualConnectionCommandForStatus(const Disconnected()), ManualConnectionCommand.connect);
-    expect(manualConnectionCommandForStatus(const Connected()), ManualConnectionCommand.disconnect);
-    expect(manualConnectionCommandForStatus(const Connecting()), ManualConnectionCommand.abort);
-    expect(manualConnectionCommandForStatus(const Disconnecting()), ManualConnectionCommand.disconnect);
+  test(
+    'manual connection command mapping preserves the rendered intent and every active-state tap is a stop intent',
+    () {
+      expect(manualConnectionCommandForStatus(const Disconnected()), ManualConnectionCommand.connect);
+      expect(manualConnectionCommandForStatus(const Connected()), ManualConnectionCommand.disconnect);
+      expect(manualConnectionCommandForStatus(const Connecting()), ManualConnectionCommand.abort);
+      expect(manualConnectionCommandForStatus(const Disconnecting()), ManualConnectionCommand.disconnect);
 
-    expect(canExecuteManualConnectionCommand(ManualConnectionCommand.connect, const Connected()), isFalse);
-    expect(canExecuteManualConnectionCommand(ManualConnectionCommand.disconnect, const Disconnecting()), isFalse);
-    expect(canExecuteManualConnectionCommand(ManualConnectionCommand.abort, const Disconnected()), isFalse);
+      expect(canExecuteManualConnectionCommand(ManualConnectionCommand.connect, const Connected()), isFalse);
+      expect(canExecuteManualConnectionCommand(ManualConnectionCommand.disconnect, const Disconnecting()), isFalse);
+      expect(canExecuteManualConnectionCommand(ManualConnectionCommand.abort, const Disconnected()), isFalse);
+
+      for (final status in const <ConnectionStatus>[Connecting(), Connected()]) {
+        expect(
+          canExecuteManualConnectionCommand(ManualConnectionCommand.disconnect, status),
+          isTrue,
+          reason: 'a captured disconnect tap must remain a stop while Connecting and Connected race',
+        );
+        expect(
+          canExecuteManualConnectionCommand(ManualConnectionCommand.abort, status),
+          isTrue,
+          reason: 'a captured abort tap must remain a stop while Connecting and Connected race',
+        );
+      }
+    },
+  );
+
+  test('abort reads the current retained status so a Connecting-to-Connected race still stops', () {
+    final source = File('lib/features/connection/notifier/connection_notifier.dart').readAsStringSync();
+    final abort = _extractFunctionBlock(source, 'Future<void> abortConnection() async {');
+
+    expect(abort, isNotEmpty);
+    expect(abort, contains('final currentStatus = state.valueOrNull;'));
+    expect(abort, contains('if (currentStatus is! Connected && currentStatus is! Connecting) return;'));
+    expect(abort, contains('await _stopFromManualCommand(currentStatus);'));
+    expect(abort, isNot(contains('if (state case AsyncData')));
   });
 
   test('manual haptic feedback is dispatched without delaying lifecycle commands', () {
@@ -131,11 +179,11 @@ void main() {
     );
     expect(
       commandBlock.indexOf('_sendManualHaptic(haptic.mediumImpact())'),
-      lessThan(commandBlock.indexOf('await _disconnectFromManualCommand()')),
+      lessThan(commandBlock.indexOf('await _stopFromManualCommand(currentStatus);')),
     );
     expect(
       commandBlock.lastIndexOf('_sendManualHaptic(haptic.mediumImpact())'),
-      lessThan(commandBlock.indexOf('await abortConnection()')),
+      lessThan(commandBlock.lastIndexOf('await _stopFromManualCommand(currentStatus);')),
     );
     expect(hapticBlock, contains('unawaited('));
     expect(hapticBlock, contains('feedback.catchError'));
@@ -185,6 +233,57 @@ void main() {
     );
     expect(commandBlock, contains('canExecuteManualConnectionCommand(command, currentStatus)'));
     expect(commandBlock, contains(r'stale manual $command ignored'));
+  });
+
+  test('a completed startup failure becomes disconnected before its dialog and never leaves an async error', () {
+    final source = File('lib/features/connection/notifier/connection_notifier.dart').readAsStringSync();
+    final connectStart = source.indexOf('Future<bool> _connect({bool silent = false}) {');
+    final throttledStart = source.indexOf('Future<bool> _connectThrottled({');
+    final throttledEnd = source.indexOf('\n  Future<bool> _disconnect', throttledStart);
+    final connect = connectStart < 0 || throttledStart < 0 ? '' : source.substring(connectStart, throttledStart);
+    final throttled = throttledStart < 0 || throttledEnd < 0 ? '' : source.substring(throttledStart, throttledEnd);
+
+    expect(connectStart, isNonNegative);
+    expect(throttledStart, isNonNegative);
+    expect(throttledEnd, greaterThan(throttledStart));
+    expect(
+      throttled,
+      isNot(contains('.mapLeft((\n      ConnectionFailure err,\n    ) async')),
+      reason: 'TaskEither.mapLeft cannot await an async failure handler',
+    );
+    expect(throttled, contains('required ConnectionRepository connectionRepo'));
+    expect(throttled, contains('required PreferencesNotifier<bool, bool> startedByUserNotifier'));
+    expect(throttled, contains('required DialogNotifier dialogNotifier'));
+    expect(throttled, contains('required Future<Translations> translationsFuture'));
+    expect(throttled, contains('await connectionRepo.connect('));
+    expect(throttled, contains('.run();'));
+    expect(
+      throttled,
+      isNot(contains('ref.read(')),
+      reason: 'all lifecycle dependencies must be captured before the connection await',
+    );
+
+    final clearIntent = throttled.indexOf('await startedByUserNotifier.update(false);');
+    final terminalState = throttled.indexOf('state = AsyncData(Disconnected(err));');
+    final showDialog = throttled.indexOf('await dialogNotifier.showCustomAlertFromErr(');
+    expect(clearIntent, isNonNegative);
+    expect(terminalState, greaterThan(clearIntent), reason: 'cleanup completion clears user intent first');
+    expect(
+      showDialog,
+      greaterThan(terminalState),
+      reason: 'the retryable terminal state must publish before the dialog',
+    );
+    expect(
+      throttled,
+      isNot(contains('state = AsyncError(err, StackTrace.current);')),
+      reason: 'AsyncError can preserve the previous Connecting value in Riverpod',
+    );
+
+    expect(
+      connect,
+      contains('_manualConnectPending = false;'),
+      reason: 'every awaited connect completion must release the transient Connecting mask',
+    );
   });
 
   test('cancel keeps the gate closed until the running task finishes', () async {
@@ -664,49 +763,21 @@ void main() {
     },
   );
 
-  test(
-    'manual disconnect publishes released only after a successful completed stop from a visible stopping or stopped state',
-    () {
-      for (final visibleStatus in const <ConnectionStatus>[Disconnecting(), Disconnected()]) {
-        expect(
-          shouldPublishManualDisconnectReleased(
-            operationCompleted: true,
-            disconnectSucceeded: true,
-            visibleStatus: visibleStatus,
-          ),
-          isTrue,
-        );
-      }
+  test('successful authoritative manual disconnect releases independently of a delayed stream status', () {
+    expect(shouldPublishManualDisconnectReleased(operationCompleted: true, disconnectSucceeded: true), isTrue);
+    expect(shouldPublishManualDisconnectReleased(operationCompleted: false, disconnectSucceeded: true), isFalse);
+    expect(
+      shouldPublishManualDisconnectReleased(operationCompleted: true, disconnectSucceeded: false),
+      isFalse,
+      reason: 'a false authoritative platform stop must not publish the release',
+    );
 
-      expect(
-        shouldPublishManualDisconnectReleased(
-          operationCompleted: false,
-          disconnectSucceeded: true,
-          visibleStatus: const Disconnecting(),
-        ),
-        isFalse,
-      );
-      expect(
-        shouldPublishManualDisconnectReleased(
-          operationCompleted: true,
-          disconnectSucceeded: false,
-          visibleStatus: const Disconnecting(),
-        ),
-        isFalse,
-        reason: 'a false authoritative platform stop must not publish the release',
-      );
-      for (final visibleStatus in const <ConnectionStatus?>[Connecting(), Connected(), null]) {
-        expect(
-          shouldPublishManualDisconnectReleased(
-            operationCompleted: true,
-            disconnectSucceeded: true,
-            visibleStatus: visibleStatus,
-          ),
-          isFalse,
-        );
-      }
-    },
-  );
+    final source = File('lib/features/connection/notifier/connection_notifier.dart').readAsStringSync();
+    final normalDisconnect = _extractFunctionBlock(source, 'Future<void> _disconnectFromManualCommand() async {');
+    final settleInput = _extractFunctionBlock(source, 'Future<void> _settleManualDisconnectInput() async {');
+    expect(normalDisconnect, isNot(contains('visibleStatus:')));
+    expect(settleInput, contains('state = const AsyncData(Disconnected());'));
+  });
 
   test('route watchdog waits for repeated failed health checks before reconnecting', () {
     final failures = nextRouteWatchdogFailureCount(0, routeHealthy: false);
@@ -747,21 +818,32 @@ void main() {
 
   test('reconnect error path uses explicit async match and awaits cleanup before terminal state', () {
     final source = File('lib/features/connection/notifier/connection_notifier.dart').readAsStringSync();
-    final reconnectBlock = _extractFunctionBlock(source, 'Future<void> reconnect(ProfileEntity? profile) async {');
+    final reconnectStart = source.indexOf('  Future<void> reconnect(\n');
+    final reconnectEnd = source.indexOf('\n  void _scheduleReconnectAfterNativeRecovery', reconnectStart);
+    final reconnectBlock = reconnectStart < 0 || reconnectEnd < 0 ? '' : source.substring(reconnectStart, reconnectEnd);
     expect(reconnectBlock, isNotEmpty);
 
-    expect(reconnectBlock, contains('final result = await _connectionRepo.reconnect(profile'));
+    expect(reconnectBlock, contains('ConnectionRepository? repository,'));
+    expect(reconnectBlock, contains('final connectionRepo = repository ?? _connectionRepo;'));
+    expect(reconnectBlock, contains('final result = await connectionRepo.reconnect(profile'));
     expect(reconnectBlock, contains('await result.match((err) async {'));
     expect(reconnectBlock, isNot(contains('result.match((err) =>')));
     expect(reconnectBlock, isNot(contains('result.mapLeft(')));
-    expect(reconnectBlock, contains('final cleanup = await _connectionRepo.disconnect().run();'));
+    expect(reconnectBlock, contains('final cleanup = await connectionRepo.disconnect().run();'));
     expect(reconnectBlock, contains('state = AsyncError(err, StackTrace.current);'));
 
-    final cleanup = reconnectBlock.indexOf('final cleanup = await _connectionRepo.disconnect().run();');
+    final lifecycleAwait = reconnectBlock.indexOf('await _singleStart.run(');
+    final cleanup = reconnectBlock.indexOf('final cleanup = await connectionRepo.disconnect().run();');
     final terminalState = reconnectBlock.indexOf('state = AsyncError(err, StackTrace.current);');
+    expect(lifecycleAwait, isNonNegative);
     expect(cleanup, isNonNegative);
     expect(terminalState, isNonNegative);
     expect(cleanup, lessThan(terminalState));
+    expect(
+      reconnectBlock.substring(lifecycleAwait),
+      isNot(contains('ref.read(')),
+      reason: 'reconnect must use captured dependencies after the lifecycle operation begins',
+    );
   });
 
   test('connection_notifier.dart no longer contains removed cold-attach helpers or verification flag', () {
@@ -988,135 +1070,32 @@ void main() {
     expect(automaticConnectionRecoveryOwnerForPlatform(isAndroid: false), AutomaticConnectionRecoveryOwner.flutter);
   });
 
-  test('failed connection delegation to Android recovery respects ownership, status, and stale-native flags', () {
+  test('startup data-plane failure is terminal only after the awaited native cleanup', () {
+    final source = File('lib/features/connection/notifier/connection_notifier.dart').readAsStringSync();
+    final connectStart = source.indexOf('  Future<bool> _connectThrottled({');
+    expect(connectStart, isNonNegative);
+    final nextConnectFn = source.indexOf('\n  Future<bool> _disconnect', connectStart);
+    expect(nextConnectFn, isNonNegative);
+    final connectThrottled = source.substring(connectStart, nextConnectFn);
+
     expect(
-      shouldDelegateFailedConnectionToAndroidRecovery(
-        isAndroid: false,
-        failure: const ConnectionFailure.unexpected('selected route failed startup connectivity check'),
-        platformStatus: const CoreStarting(),
-        platformStartedByUser: true,
-        nativeRecoveryInProgress: false,
-      ),
-      isFalse,
+      connectThrottled,
+      isNot(contains('shouldDelegateFailedConnectionToAndroidRecovery')),
+      reason: 'a failed Android startup probe must stop/close instead of remaining indefinitely in Connecting',
     );
-    expect(
-      shouldDelegateFailedConnectionToAndroidRecovery(
-        isAndroid: true,
-        failure: const ConnectionFailure.unexpected('random startup issue'),
-        platformStatus: const CoreStarting(),
-        platformStartedByUser: true,
-        nativeRecoveryInProgress: false,
-      ),
-      isFalse,
+
+    final connectionRun = connectThrottled.indexOf(
+      'final result = await connectionRepo.connect(activeProfile, disableMemoryLimit).run();',
     );
-    expect(
-      shouldDelegateFailedConnectionToAndroidRecovery(
-        isAndroid: true,
-        failure: const ConnectionFailure.unexpected('selected route failed startup connectivity check'),
-        platformStatus: const CoreStarting(),
-        platformStartedByUser: true,
-        nativeRecoveryInProgress: false,
-      ),
-      isTrue,
-    );
-    expect(
-      shouldDelegateFailedConnectionToAndroidRecovery(
-        isAndroid: true,
-        failure: const ConnectionFailure.unexpected('selected route failed startup connectivity check'),
-        platformStatus: const CoreStarted(),
-        platformStartedByUser: true,
-        nativeRecoveryInProgress: false,
-      ),
-      isTrue,
-    );
-    expect(
-      shouldDelegateFailedConnectionToAndroidRecovery(
-        isAndroid: true,
-        failure: const ConnectionFailure.unexpected('selected route failed startup connectivity check'),
-        platformStatus: null,
-        platformStartedByUser: true,
-        nativeRecoveryInProgress: false,
-      ),
-      isFalse,
-    );
-    expect(
-      shouldDelegateFailedConnectionToAndroidRecovery(
-        isAndroid: true,
-        failure: const ConnectionFailure.unexpected('selected route failed startup connectivity check'),
-        platformStatus: null,
-        platformStartedByUser: true,
-        nativeRecoveryInProgress: true,
-      ),
-      isTrue,
-    );
-    expect(
-      shouldDelegateFailedConnectionToAndroidRecovery(
-        isAndroid: true,
-        failure: const ConnectionFailure.unexpected('selected route failed startup connectivity check'),
-        platformStatus: const CoreStopped(),
-        platformStartedByUser: true,
-        nativeRecoveryInProgress: true,
-      ),
-      isFalse,
-    );
-    expect(
-      shouldDelegateFailedConnectionToAndroidRecovery(
-        isAndroid: true,
-        failure: const ConnectionFailure.unexpected('selected route failed startup connectivity check'),
-        platformStatus: const CoreStopping(),
-        platformStartedByUser: true,
-        nativeRecoveryInProgress: true,
-      ),
-      isFalse,
-    );
-    expect(
-      shouldDelegateFailedConnectionToAndroidRecovery(
-        isAndroid: true,
-        failure: const ConnectionFailure.unexpected('selected route failed startup connectivity check'),
-        platformStatus: const CoreStarting(),
-        platformStartedByUser: false,
-        nativeRecoveryInProgress: false,
-      ),
-      isFalse,
-    );
-    expect(
-      shouldDelegateFailedConnectionToAndroidRecovery(
-        isAndroid: true,
-        failure: const ConnectionFailure.unexpected('selected route failed startup connectivity check'),
-        platformStatus: const CoreStarting(),
-        platformStartedByUser: null,
-        nativeRecoveryInProgress: false,
-      ),
-      isFalse,
-    );
+    final clearUserIntent = connectThrottled.indexOf('await startedByUserNotifier.update(false)', connectionRun);
+    final dialog = connectThrottled.indexOf('showCustomAlertFromErr', clearUserIntent);
+    final terminalState = connectThrottled.indexOf('state = AsyncData(Disconnected(err));', clearUserIntent);
+    expect(connectionRun, isNonNegative);
+    expect(clearUserIntent, isNonNegative);
+    expect(clearUserIntent, greaterThan(connectionRun));
+    expect(terminalState, greaterThan(clearUserIntent));
+    expect(dialog, greaterThan(terminalState));
+    expect(connectThrottled, isNot(contains('state = AsyncError(err, StackTrace.current);')));
+    expect(connectThrottled, isNot(contains('ref.read(')));
   });
-
-  test(
-    'delegated selected-route startup failure keeps ConnectionNotifier from invoking immediate disconnect cleanup',
-    () {
-      final source = File('lib/features/connection/notifier/connection_notifier.dart').readAsStringSync();
-      final connectStart = source.indexOf(
-        'Future<bool> _connectThrottled({bool silent = false, int? requestToken}) async {',
-      );
-      expect(connectStart, isNonNegative);
-      final nextConnectFn = source.indexOf('\n  Future<bool> _disconnect', connectStart);
-      expect(nextConnectFn, isNonNegative);
-      final connectThrottled = source.substring(connectStart, nextConnectFn);
-
-      final delegateStart = connectThrottled.indexOf('if (shouldDelegateFailedConnectionToAndroidRecovery(');
-      expect(delegateStart, isNonNegative, reason: 'delegate branch should be present');
-      final silentStart = connectThrottled.indexOf('if (silent) {', delegateStart);
-      final delegateEnd = silentStart == -1 ? connectThrottled.length : silentStart;
-      expect(delegateEnd, greaterThan(delegateStart));
-
-      final delegateBlock = connectThrottled.substring(delegateStart, delegateEnd);
-      expect(delegateBlock, contains('state = const AsyncData(Connecting());'));
-      expect(delegateBlock, contains('return;'));
-      expect(delegateBlock, isNot(contains('AsyncError(')));
-      expect(delegateBlock, isNot(contains('_disconnect(')));
-      expect(delegateBlock, isNot(contains('_disconnectAfterAbort')));
-      expect(delegateBlock, isNot(contains('showCustomAlertFromErr')));
-      expect(delegateBlock, isNot(contains('Preferences.startedByUser.notifier).update(false)')));
-    },
-  );
 }

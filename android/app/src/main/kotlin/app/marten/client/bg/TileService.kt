@@ -2,21 +2,12 @@ package app.marten.client.bg
 
 import android.app.KeyguardManager
 import android.content.Context
-import android.content.Intent
+import android.os.Build
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
-import android.util.Log
 import androidx.annotation.RequiresApi
-import androidx.core.content.ContextCompat
-import androidx.lifecycle.lifecycleScope
-import app.marten.client.Application
-import app.marten.client.MainActivity
-import app.marten.client.Settings
-import app.marten.client.constant.ServiceMode
+import app.marten.client.VpnPermissionActivity
 import app.marten.client.constant.Status
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 @RequiresApi(24)
 class TileService : TileService(), ServiceConnection.Callback {
@@ -47,7 +38,7 @@ class TileService : TileService(), ServiceConnection.Callback {
     private fun toggleService() {
         when (connection.status) {
             Status.Stopped -> {
-                BoxService.connect(userInitiated = true)
+                requestUserConnect()
                 qsTile?.apply {
                     state = Tile.STATE_UNAVAILABLE
                     updateTile()
@@ -61,6 +52,15 @@ class TileService : TileService(), ServiceConnection.Callback {
                 }
             }
             else -> {}
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun requestUserConnect() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startActivityAndCollapse(VpnPermissionActivity.pendingIntent(this, 4))
+        } else {
+            startActivityAndCollapse(VpnPermissionActivity.createIntent(this))
         }
     }
 

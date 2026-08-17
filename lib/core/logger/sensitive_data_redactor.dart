@@ -23,6 +23,16 @@ class SensitiveDataRedactor {
     caseSensitive: false,
   );
   static final _subscriptionTokenPattern = RegExp(r'(/(?:sub|subscriptions)/)[^/?#\s]+', caseSensitive: false);
+  static final _outboundTagPattern = RegExp(r'(\boutbound/[A-Za-z0-9_-]+)\[[^\]\r\n]*\]', caseSensitive: false);
+  static final _peerIdentifierPattern = RegExp(r'\bpeer\([^\)\r\n]*\)', caseSensitive: false);
+  static final _selectedRouteTagPattern = RegExp(
+    r'(\b(?:verifying startup route|selected route)\s*)\[[^\]\r\n]*\]',
+    caseSensitive: false,
+  );
+  static final _xrayRouteTagPattern = RegExp(
+    r'(\b(?:tags|taking(?:\s+platform\s+initialized)?\s+detour)\s*)\[[^\]\r\n]*\]',
+    caseSensitive: false,
+  );
   static final _packagePattern = RegExp(
     r'((?:package|packageName)\s*[:=]\s*)[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+',
     caseSensitive: false,
@@ -72,6 +82,10 @@ class SensitiveDataRedactor {
     var redacted = value.replaceAllMapped(_uriPattern, (match) => _redactUri(match.group(0)!));
     redacted = redacted.replaceAllMapped(_namedSecretPattern, (match) => '${match.group(1)}[redacted]');
     redacted = redacted.replaceAllMapped(_subscriptionTokenPattern, (match) => '${match.group(1)}[redacted]');
+    redacted = redacted.replaceAllMapped(_outboundTagPattern, (match) => '${match.group(1)}[redacted]');
+    redacted = redacted.replaceAll(_peerIdentifierPattern, 'peer([redacted])');
+    redacted = redacted.replaceAllMapped(_selectedRouteTagPattern, (match) => '${match.group(1)}[redacted]');
+    redacted = redacted.replaceAllMapped(_xrayRouteTagPattern, (match) => '${match.group(1)}[redacted]');
     redacted = redacted.replaceAllMapped(_packagePattern, (match) => '${match.group(1)}[redacted]');
     redacted = redacted.replaceAll(_uuidPattern, '[redacted-uuid]');
     redacted = redacted.replaceAll(_emailPattern, '[redacted-email]');

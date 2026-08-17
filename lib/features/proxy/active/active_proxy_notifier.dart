@@ -7,6 +7,7 @@ import 'package:marten/core/utils/throttler.dart';
 import 'package:marten/features/connection/data/connection_data_providers.dart';
 import 'package:marten/features/connection/notifier/connection_notifier.dart';
 import 'package:marten/features/home/data/local_outbounds_provider.dart';
+import 'package:marten/features/profile/notifier/active_profile_notifier.dart';
 import 'package:marten/features/proxy/data/proxy_data_providers.dart';
 import 'package:marten/features/proxy/model/ip_info_entity.dart' as oldipinfo;
 import 'package:marten/features/proxy/model/proxy_failure.dart';
@@ -99,8 +100,11 @@ class ActiveProxyNotifier extends _$ActiveProxyNotifier with AppLogger {
         await ref.read(hapticServiceProvider.notifier).lightImpact();
         final localTargets = await _connectedRoutePingTargets();
         if (localTargets.isNotEmpty) {
-          await _pingConnectedRoute(localTargets);
-          return;
+          final profileId = ref.read(activeProfileProvider).valueOrNull?.id;
+          if (profileId != null) {
+            await _pingConnectedRoute(profileId, localTargets);
+            return;
+          }
         }
         await ref.read(proxyRepositoryProvider).urlTest(groupTag).getOrElse((err) {
           loggy.warning("error testing group", err);
@@ -119,16 +123,16 @@ class ActiveProxyNotifier extends _$ActiveProxyNotifier with AppLogger {
     return connectedRoutePingOutbounds(outbounds, [active.tag]);
   }
 
-  Future<void> _pingConnectedRoute(List<LocalOutbound> targets) async {
-    final localPing = ref.read(localPingProvider.notifier)..markPending(targets);
+  Future<void> _pingConnectedRoute(String profileId, List<LocalOutbound> targets) async {
+    final localPing = ref.read(localPingProvider.notifier)..markPending(profileId, targets);
     final result = await ref.read(connectionRepositoryProvider).measureConnectedRouteDelay().run();
     await result.match(
       (failure) {
         loggy.warning('core connected-route ping failed; trying endpoint fallback', failure);
-        return localPing.pingAll(targets, mode: LocalPingMode.connectedRoute);
+        return localPing.pingAll(profileId, targets, mode: LocalPingMode.connectedRoute);
       },
       (delay) {
-        localPing.record(targets.first.tag, delay);
+        localPing.record(profileId, targets.first.tag, delay);
         return Future<void>.value();
       },
     );

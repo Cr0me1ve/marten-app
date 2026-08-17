@@ -1,11 +1,11 @@
 display_name: Marten
 publisher_display_name: Marten
 identity_name: Marten.MartenNext
-msix_version: 0.6.8.0
+msix_version: 0.7.0.0
 logo_path: windows\runner\resources\app_icon.ico
 capabilities: internetClient, internetClientServer, privateNetworkClientServer
 languages: ar, en-us, es-es, fa-ir, fr-fr, id-id, pt-br, ru-ru, tr-tr, zh-cn, zh-tw
-protocol_activation: marten, v2ray, v2rayn, v2rayng, clash, clashmeta, sing-box
+protocol_activation: marten, v2ray, v2rayn, v2rayng, clash, clashmeta, sing-box, flclashx, koala-clash, prizrak-box
 execution_alias: marten
 certificate_path: windows\sign.pfx
 certificate_password:

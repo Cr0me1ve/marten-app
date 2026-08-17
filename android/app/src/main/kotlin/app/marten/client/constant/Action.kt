@@ -4,9 +4,9 @@ object Action {
     const val SERVICE = "app.marten.client.SERVICE"
     const val SERVICE_CONNECT = "app.marten.client.SERVICE_CONNECT"
     const val SERVICE_RECOVER = "app.marten.client.SERVICE_RECOVER"
-    const val EXTRA_USER_INITIATED = "app.marten.client.extra.USER_INITIATED"
     const val SERVICE_CLOSE = "app.marten.client.SERVICE_CLOSE"
     const val SERVICE_MARK_STARTED = "app.marten.client.SERVICE_MARK_STARTED"
     const val EXTRA_KEEP_NOTIFICATION = "app.marten.client.EXTRA_KEEP_NOTIFICATION"
+    const val EXTRA_USER_INITIATED = "app.marten.client.EXTRA_USER_INITIATED"
     const val CONNECT_DEEP_LINK = "marten://connect"
 }

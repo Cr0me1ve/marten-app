@@ -5,6 +5,7 @@ import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:marten/core/localization/translations.dart';
 import 'package:marten/core/widget/shimmer_skeleton.dart';
 import 'package:marten/features/home/data/local_outbounds_provider.dart';
+import 'package:marten/features/profile/notifier/active_profile_notifier.dart';
 import 'package:marten/features/proxy/active/active_proxy_notifier.dart';
 import 'package:marten/utils/custom_loggers.dart';
 
@@ -22,7 +23,10 @@ class ActiveProxyDelayIndicator extends HookConsumerWidget with InfraLogger {
     }
 
     final proxy = activeProxy.value!;
-    final localPing = ref.watch(localPingProvider.select((pings) => pings[proxy.tag]));
+    final profileId = ref.watch(activeProfileProvider.select((profile) => profile.valueOrNull?.id));
+    final localPing = profileId == null
+        ? null
+        : ref.watch(localPingProvider.select((pings) => pings[profileId]?[proxy.tag]));
     final delay = displayDelayWithLocalPing(coreDelay: proxy.urlTestDelay, localPing: localPing);
     final timeout = delay > 65000;
 

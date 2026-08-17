@@ -51,8 +51,9 @@ Future<void> lazyBootstrap(WidgetsBinding widgetsBinding, Environment env) async
 
   final (_, appInfo, _) = await (directoriesFuture, appInfoFuture, preferencesFuture).wait;
   LoggerController.init(container.read(logPathResolverProvider).appFile().path, debugConsole: !PlatformUtils.isMobile);
-  final crashReportingEnabled =
-      container.read(sharedPreferencesProvider).requireValue.getBool(enableAnalyticsPrefKey) ?? false;
+  final crashReportingEnabled = readCrashReportingEnabledPreference(
+    container.read(sharedPreferencesProvider).requireValue,
+  );
   crashReporter
     ..setContextCollectionEnabled(crashReportingEnabled)
     ..setContext('environment', env.name)

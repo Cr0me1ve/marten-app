@@ -33,6 +33,51 @@ void main() {
 
   String encodeJson(Map<String, Object> value) => Uri.encodeComponent(jsonEncode(value));
 
+  Set<String> extractProtocolActivationSchemes(String path) {
+    final config = File(path).readAsStringSync();
+    final directMatch = RegExp(r'^protocol_activation:\s*(.*)$', multiLine: true).firstMatch(config);
+    if (directMatch == null) return {};
+    final raw = directMatch.group(1)!.trim();
+    if (raw.isEmpty) return {};
+    return raw.split(',').map((value) => value.trim()).where((value) => value.isNotEmpty).toSet();
+  }
+
+  Set<String> extractYamlListSchemes(String path, String key) {
+    final lines = File(path).readAsStringSync().split('\n');
+    final list = <String>{};
+    var collect = false;
+
+    for (final line in lines) {
+      if (!collect && RegExp(r'^\s*' + RegExp.escape(key) + r':\s*$').hasMatch(line)) {
+        collect = true;
+        continue;
+      }
+      if (collect) {
+        final valueMatch = RegExp(r'^\s*-\s*(.+?)\s*$').firstMatch(line);
+        if (valueMatch == null) {
+          break;
+        }
+        final raw = valueMatch.group(1)!;
+        const prefix = 'x-scheme-handler/';
+        if (raw.startsWith(prefix)) {
+          list.add(raw.substring(prefix.length));
+        }
+      }
+    }
+
+    return list;
+  }
+
+  Set<String> extractAppDataSchemeMimeTypes(String path) {
+    final appdata = File(path).readAsStringSync();
+    final pattern = RegExp(r'<mime-type>\s*x-scheme-handler/([^<]+)\s*</mime-type>');
+    return pattern
+        .allMatches(appdata)
+        .map((match) => match.group(1)!.trim())
+        .where((scheme) => scheme.isNotEmpty)
+        .toSet();
+  }
+
   group("LinkParser.deep", () {
     test("marten://?url=... extracts wrapped subscription URL", () {
       final r = LinkParser.deep('marten://import?url=https://sub.example/abc&name=mySub');
@@ -147,6 +192,16 @@ void main() {
       expect(r.name, equals('token-value'));
     });
 
+    test("flclashx/koala-clash/prizrak-box wrappers decode URL payload", () {
+      for (final scheme in ['flclashx', 'koala-clash', 'prizrak-box']) {
+        final encodedUrl = Uri.encodeComponent('https://sub.example/shared-config');
+        final r = LinkParser.deep('$scheme://install-config?url=$encodedUrl&name=$scheme');
+        expect(r, isNotNull, reason: scheme);
+        expect(r!.url, equals('https://sub.example/shared-config'));
+        expect(r.name, equals(scheme));
+      }
+    });
+
     test("incy://add and icny://add are both recognized", () {
       for (final scheme in ['incy', 'icny']) {
         final r = LinkParser.deep('$scheme://add/https://sub.example/$scheme');
@@ -233,6 +288,9 @@ void main() {
         'surge',
         'loon',
         'quantumult-x',
+        'flclashx',
+        'koala-clash',
+        'prizrak-box',
         'sub',
       ]) {
         expect(LinkParser.protocols, contains(scheme));
@@ -249,6 +307,24 @@ void main() {
 
     test("matches macOS Info.plist URL schemes", () {
       expect(extractPlistSchemes('macos/Runner/Info.plist'), equals(LinkParser.protocols.toSet()));
+    });
+
+    test("contains flclashx/koala-clash/prizrak-box in desktop packaging scheme registration", () {
+      final desktopSchemes = ['flclashx', 'koala-clash', 'prizrak-box'];
+      final protocolActivationSchemes = extractProtocolActivationSchemes('windows/packaging/msix/make_config.yaml');
+      final appDataSchemes = extractAppDataSchemeMimeTypes('linux/packaging/app.marten.client.appdata.xml');
+      final debSchemes = extractYamlListSchemes('linux/packaging/deb/make_config.yaml', 'supported_mime_type');
+      final appImageSchemes = extractYamlListSchemes(
+        'linux/packaging/appimage/make_config.yaml',
+        'supported_mime_type',
+      );
+
+      for (final scheme in desktopSchemes) {
+        expect(protocolActivationSchemes, contains(scheme), reason: 'windows msix');
+        expect(appDataSchemes, contains(scheme), reason: 'linux appdata');
+        expect(debSchemes, contains(scheme), reason: 'linux deb');
+        expect(appImageSchemes, contains(scheme), reason: 'linux appimage');
+      }
     });
   });
 

@@ -4,6 +4,7 @@ import android.util.Log
 import app.marten.client.Settings
 import android.content.Intent
 import android.content.pm.PackageManager.NameNotFoundException
+import android.net.Network
 import android.net.ProxyInfo
 import android.net.VpnService
 import android.os.Build
@@ -13,9 +14,9 @@ import app.marten.core.libbox.InterfaceUpdateListener
 import app.marten.core.libbox.Notification
 import app.marten.core.libbox.StringIterator
 import app.marten.client.constant.PerAppProxyMode
+import app.marten.client.crashreporting.NativeCrashDiagnostics
 import app.marten.client.ktx.toIpPrefix
 import app.marten.core.libbox.TunOptions
-import kotlinx.coroutines.runBlocking
 
 class VPNService : VpnService(), PlatformInterfaceWrapper {
 
@@ -23,7 +24,21 @@ class VPNService : VpnService(), PlatformInterfaceWrapper {
         private const val TAG = "A/VPNService"
     }
 
-    private val service = BoxService(this, this)
+    private lateinit var service: BoxService
+    private val underlyingNetworkLock = Any()
+    private var declaredUnderlyingNetwork: Network? = null
+    private var underlyingNetworkDeclarationInitialized = false
+
+    override fun onCreate() {
+        super.onCreate()
+        NativeCrashDiagnostics.logPhase("vpn_service", "on_create_start")
+        // Android attaches the Service base Context before onCreate, but only
+        // after invoking the Kotlin constructor. BoxService owns components
+        // that resolve application-scoped Android services, so construct it at
+        // the first lifecycle point where that Context is guaranteed usable.
+        service = BoxService(this, this)
+        NativeCrashDiagnostics.logPhase("vpn_service", "on_create_complete")
+    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int) =
         service.onStartCommand(intent, flags)
@@ -37,10 +52,14 @@ class VPNService : VpnService(), PlatformInterfaceWrapper {
     }
 
     override fun onDestroy() {
+        NativeCrashDiagnostics.logPhase("vpn_service", "on_destroy_start")
         try {
-            service.onDestroy()
+            if (::service.isInitialized) {
+                service.onDestroy()
+            }
         } finally {
             super.onDestroy()
+            NativeCrashDiagnostics.logPhase("vpn_service", "on_destroy_complete")
         }
     }
 
@@ -55,7 +74,10 @@ class VPNService : VpnService(), PlatformInterfaceWrapper {
     override fun onRevoke() {
         Log.w(TAG, "Android revoked Marten VPN service")
         service.onRevoke()
-        super.onRevoke()
+        // VpnService's default implementation calls stopSelf() immediately.
+        // BoxService owns an ordered core/TUN cleanup and calls stopSelf() only
+        // after that cleanup finishes; racing it here can preserve stale user
+        // intent or destroy the owner before it accepts the revoke.
     }
 
     /**
@@ -70,8 +92,18 @@ class VPNService : VpnService(), PlatformInterfaceWrapper {
      * never crosses into the native core, closing it is an unambiguous final
      * lifecycle signal. No Activity or other UI is involved.
      */
-    internal fun retirePlatformVpnSessionAfterCoreStop(): Boolean {
+    internal fun retirePlatformVpnSessionAfterCoreStop(
+        retirementAllowed: () -> Boolean = { true },
+    ): Boolean {
+        if (!retirementAllowed()) {
+            Log.i(TAG, "skipping framework VPN retirement because Marten no longer owns the VPN slot")
+            return true
+        }
         if (!BoxService.isOwnVpnActive(this)) return true
+        if (!retirementAllowed()) {
+            Log.i(TAG, "skipping framework VPN retirement after final ownership check")
+            return true
+        }
 
         Log.w(TAG, "retiring Android framework VPN session after completed core stop")
         val retirementDescriptor = runCatching {
@@ -100,47 +132,23 @@ class VPNService : VpnService(), PlatformInterfaceWrapper {
     }
 
     override fun autoDetectInterfaceControl(fd: Int) {
-        if (!protect(fd)) {
-            error("android: failed to protect socket from VPN")
-        }
-        val pfd = ParcelFileDescriptor.adoptFd(fd)
+        val underlyingNetwork = DefaultNetworkMonitor.defaultNetwork
+            ?: error("android: missing underlying network for socket")
+        val descriptor = ParcelFileDescriptor.adoptFd(fd)
         try {
-            bindSocketToDefaultNetwork(pfd)
+            // Network.bindSocket assigns the physical netId and requires an
+            // unconnected descriptor. Protect only after that assignment so
+            // netd never has to rewrite an already VPN-protected socket mark.
+            underlyingNetwork.bindSocket(descriptor.fileDescriptor)
+        } catch (error: Exception) {
+            throw IllegalStateException(
+                "android: failed to bind socket to underlying network",
+                error,
+            )
         } finally {
-            pfd.detachFd()
+            descriptor.detachFd()
         }
-    }
-
-    private fun bindSocketToDefaultNetwork(pfd: ParcelFileDescriptor) {
-        val network = runCatching {
-            runBlocking {
-                DefaultNetworkMonitor.require()
-            }
-        }.getOrElse {
-            Log.w(TAG, "no default network available; continuing with protected socket", it)
-            return
-        }
-        runCatching {
-            network.bindSocket(pfd.fileDescriptor)
-        }.onSuccess {
-            return
-        }.onFailure { firstError ->
-            Log.w(TAG, "failed to bind socket to default network; refreshing network", firstError)
-        }
-
-        val refreshedNetwork = runBlocking {
-            DefaultNetworkMonitor.refresh(network)
-        }
-        if (refreshedNetwork == null) {
-            Log.w(TAG, "no refreshed default network available; continuing with protected socket")
-            return
-        }
-
-        runCatching {
-            refreshedNetwork.bindSocket(pfd.fileDescriptor)
-        }.onFailure { retryError ->
-            Log.w(TAG, "failed to bind socket to refreshed network; continuing with protected socket", retryError)
-        }
+        protectSocket(fd)
     }
 
     override fun protectSocket(fd: Int) {
@@ -149,13 +157,56 @@ class VPNService : VpnService(), PlatformInterfaceWrapper {
         }
     }
 
+    /**
+     * Keeps Android's VPN network attached to the physical network observed by
+     * the platform monitor. Socket protection remains the only per-dial action;
+     * declaring the underlying network on the VPN itself avoids a default-route
+     * handoff window while Builder.establish() publishes the new TUN network.
+     */
+    internal fun updateUnderlyingNetwork(network: Network?) {
+        publishUnderlyingNetwork(network, requireActiveVpn = true)
+    }
+
+    private fun publishUnderlyingNetwork(observedNetwork: Network?, requireActiveVpn: Boolean) {
+        synchronized(underlyingNetworkLock) {
+            // The monitor publishes its snapshot before invoking BoxService.
+            // Re-read it under this short lock so an older callback can never
+            // overwrite a newer physical-network handoff.
+            val network = DefaultNetworkMonitor.defaultNetwork
+            if (
+                underlyingNetworkDeclarationInitialized &&
+                declaredUnderlyingNetwork == network
+            ) {
+                return
+            }
+            if (requireActiveVpn && !BoxService.isOwnVpnActive(this)) return
+
+            val accepted = runCatching {
+                setUnderlyingNetworks(network?.let { arrayOf(it) } ?: emptyArray())
+            }.onFailure {
+                Log.w(TAG, "failed to update Android VPN underlying network", it)
+            }.getOrDefault(false)
+            if (!accepted) {
+                Log.w(
+                    TAG,
+                    "Android rejected VPN underlying network update " +
+                        "available=${network != null} callback_current=${network == observedNetwork}",
+                )
+                return
+            }
+            declaredUnderlyingNetwork = network
+            underlyingNetworkDeclarationInitialized = true
+            Log.i(
+                TAG,
+                "Android VPN underlying network updated " +
+                    "available=${network != null} callback_current=${network == observedNetwork}",
+            )
+        }
+    }
+
     var systemProxyAvailable = false
     var systemProxyEnabled = false
     fun addIncludePackage(builder: Builder, packageName: String) {
-        if (packageName == this.packageName) { 
-            Log.d("VpnService","Cannot include myself: $packageName")
-            return
-        }
         try {     
             Log.d("VpnService","Including $packageName")
             builder.addAllowedApplication(packageName)
@@ -190,20 +241,6 @@ class VPNService : VpnService(), PlatformInterfaceWrapper {
                 "http_proxy=${options.isHTTPProxyEnabled}",
         )
         try {
-        var hasPermission = false
-        for (i in 0 until 20) {
-            if (prepare(this) != null) {
-                Log.w("VPN", "android: missing vpn permission")
-            } else {
-                hasPermission = true
-                break
-            }
-            Thread.sleep(50)
-        }
-
-        if (!hasPermission) {
-             error("android: missing vpn permission")
-    }
         val builder = Builder()
             .setSession("marten")
             .setMtu(options.mtu)
@@ -303,25 +340,23 @@ class VPNService : VpnService(), PlatformInterfaceWrapper {
             if (Settings.perAppProxyEnabled) {
                 val appList = Settings.perAppProxyList
                 if (Settings.perAppProxyMode == PerAppProxyMode.INCLUDE) {
-                    val bypassPackages = optionExcludePackages.toSet()
-                    appList.filter { !bypassPackages.contains(it) }.forEach {
+                    val bypassPackages = optionExcludePackages.filter { it != packageName }.toSet()
+                    (appList + packageName).distinct().filter { !bypassPackages.contains(it) }.forEach {
                         addIncludePackage(builder, it)
                     }
-//                    addIncludePackage(builder,packageName)
                 } else {
-                    (appList + optionExcludePackages + packageName).distinct().forEach {
+                    (appList + optionExcludePackages).distinct().filter { it != packageName }.forEach {
                         addExcludePackage(builder, it)
                     }
                 }
             } else {
                 if (optionIncludePackages.isNotEmpty()) {
-                    val bypassPackages = optionExcludePackages.toSet()
-                    optionIncludePackages.filter { !bypassPackages.contains(it) }.forEach {
+                    val bypassPackages = optionExcludePackages.filter { it != packageName }.toSet()
+                    (optionIncludePackages + packageName).distinct().filter { !bypassPackages.contains(it) }.forEach {
                         addIncludePackage(builder, it)
                     }
-                    //                    addIncludePackage(builder,packageName)
                 } else {
-                    (optionExcludePackages + packageName).distinct().forEach {
+                    optionExcludePackages.distinct().filter { it != packageName }.forEach {
                         addExcludePackage(builder, it)
                     }
                 }
@@ -342,18 +377,36 @@ class VPNService : VpnService(), PlatformInterfaceWrapper {
             systemProxyEnabled = false
         }
 
+        // Capture the physical network immediately before establish(), after
+        // all other Builder work, to minimize the Android default-route handoff
+        // window. A callback racing establish() is reconciled just after the
+        // retained descriptor is admitted below.
+        val initialUnderlyingNetwork = DefaultNetworkMonitor.defaultNetwork
+        if (initialUnderlyingNetwork != null) {
+            builder.setUnderlyingNetworks(arrayOf(initialUnderlyingNetwork))
+        }
+
         Log.d(
             TAG,
-            "openTun platform state permission=true addresses_v4=$inet4AddressCount " +
-                "addresses_v6=$inet6AddressCount routes_v4=$inet4RouteCount " +
-                "routes_v6=$inet6RouteCount route_excludes=$routeExcludeCount " +
-                "include_packages=$includePackageCount exclude_packages=$excludePackageCount",
+            "openTun platform state permission=delegated_to_establish addresses_v4=$inet4AddressCount " +
+            "addresses_v6=$inet6AddressCount routes_v4=$inet4RouteCount " +
+            "routes_v6=$inet6RouteCount route_excludes=$routeExcludeCount " +
+                "include_packages=$includePackageCount exclude_packages=$excludePackageCount " +
+                "underlying_network_declared=${initialUnderlyingNetwork != null}",
         )
         service.requireTunCreationPrecondition()
-        val pfd = builder.establish() ?: error("android: the application is not prepared or is revoked")
+        val pfd = builder.establish()
+        if (pfd == null) {
+            Log.w(TAG, "openTun permission outcome=not_prepared_or_revoked")
+            error("android: the application is not prepared or is revoked")
+        }
         if (!service.replaceTunFileDescriptor(pfd)) {
             error("android: VPN service stopped while creating TUN")
         }
+        publishUnderlyingNetwork(
+            DefaultNetworkMonitor.defaultNetwork,
+            requireActiveVpn = false,
+        )
         // The libbox Android wrapper duplicates this fd before creating its TUN
         // object and closes that duplicate with the core. It deliberately leaves
         // the fd returned by the platform open, so BoxService retains and closes
@@ -365,6 +418,7 @@ class VPNService : VpnService(), PlatformInterfaceWrapper {
         )
         return nativeFd
         } catch (error: Throwable) {
+            service.onTunCreationFailed()
             Log.e(
                 TAG,
                 "openTun outcome=failure error_type=${error.javaClass.simpleName}",

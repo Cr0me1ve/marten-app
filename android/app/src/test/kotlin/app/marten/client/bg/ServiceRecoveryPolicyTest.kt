@@ -46,6 +46,89 @@ class ServiceRecoveryPolicyTest {
     }
 
     @Test
+    fun `MethodHandler exposes tls_ping trigger and routes to PhysicalTlsProbe`() {
+        val methodHandler = sourceAt("src/main/kotlin/app/marten/client/MethodHandler.kt")
+
+        assertTrue(methodHandler.contains("TLSPing(\"tls_ping\")"))
+
+        val tlsPingSection = sourceSection(
+            methodHandler,
+            "Trigger.TLSPing.method -> {",
+            "Trigger.GetStableDeviceID.method -> {",
+        )
+
+        assertTrue(tlsPingSection.contains("success(PhysicalTlsProbe.measure("))
+        assertTrue(tlsPingSection.contains("val args = call.arguments as? Map<*, *>"))
+        assertTrue(tlsPingSection.contains("val host = args[\"host\"] as? String"))
+        assertTrue(tlsPingSection.contains("val port = (args[\"port\"] as? Number)"))
+        assertTrue(tlsPingSection.contains("val serverName = args[\"serverName\"] as? String"))
+        assertTrue(tlsPingSection.contains("val allowUntrusted = args[\"allowUntrusted\"] as? Boolean ?: false"))
+        assertTrue(tlsPingSection.contains("val timeoutMs = (args[\"timeoutMs\"] as? Number)"))
+    }
+
+    @Test
+    fun `PhysicalTlsProbe prefers active VPN network then physical fallback`() {
+        val source = sourceFile("PhysicalTlsProbe.kt")
+        val selectSection = sourceSection(
+            source,
+            "private suspend fun selectProbeNetwork(): Network {",
+            "private fun String.isIpLiteral(): Boolean",
+        )
+
+        val hasActiveVpnSelection =
+            selectSection.contains("val activeNetwork = Application.connectivity.activeNetwork") &&
+                selectSection.contains("val activeCapabilities = activeNetwork?.let(Application.connectivity::getNetworkCapabilities)") &&
+                selectSection.contains("activeCapabilities?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true") &&
+                selectSection.contains("return activeNetwork")
+        assertTrue(
+            "PhysicalTlsProbe must check active network transport VPN and return it before physical fallback",
+            hasActiveVpnSelection,
+        )
+
+        val activeNetworkLog = selectSection.indexOf("TLS probe route=active_vpn")
+        val physicalNetworkLog = selectSection.indexOf("TLS probe route=physical")
+        assertTrue(activeNetworkLog >= 0)
+        assertTrue(physicalNetworkLog >= 0)
+        assertTrue(activeNetworkLog < physicalNetworkLog)
+        assertTrue(selectSection.contains("return DefaultNetworkMonitor.require()"))
+    }
+
+    @Test
+    fun `PhysicalTlsProbe enforces bounded timeout and waits for TLS handshake with SNI`() {
+        val source = sourceFile("PhysicalTlsProbe.kt")
+        val measureSection = sourceSection(
+            source,
+            "withTimeout(boundedTimeoutMs) {",
+            "private suspend fun selectProbeNetwork(): Network {",
+        )
+
+        assertTrue(source.contains("private const val MIN_TIMEOUT_MS ="))
+        assertTrue(source.contains("private const val MAX_TIMEOUT_MS ="))
+        assertTrue(source.contains("val boundedTimeoutMs = timeoutMs.coerceIn(MIN_TIMEOUT_MS, MAX_TIMEOUT_MS)"))
+        assertTrue(source.contains("withTimeout(boundedTimeoutMs)"))
+        assertTrue(measureSection.contains("val network = selectProbeNetwork()"))
+        assertTrue(measureSection.contains("val addresses = network.getAllByName(endpointHost)"))
+        assertTrue(measureSection.contains("val plainSocket = network.socketFactory.createSocket()"))
+        assertTrue(source.contains("val tlsFactory = if (allowUntrusted) {"))
+        assertTrue(source.contains("realityFallbackTlsFactory"))
+        assertTrue(source.contains("} else {"))
+        assertTrue(source.contains("SSLSocketFactory.getDefault() as SSLSocketFactory"))
+        assertTrue(source.contains("val tlsSocket = (tlsFactory.createSocket("))
+        assertTrue(source.contains("plainSocket,"))
+        assertTrue(source.contains("peerName,"))
+        assertTrue(source.contains("true"))
+        assertTrue(source.contains("val peerName = serverName?.trim()"))
+        assertTrue(source.contains("parameters.endpointIdentificationAlgorithm = if (allowUntrusted) null else \"HTTPS\""))
+        assertTrue(source.contains("if (!peerName.isIpLiteral())"))
+        assertTrue(source.contains("parameters.serverNames = listOf(SNIHostName(peerName))"))
+        assertTrue(source.contains("it.startHandshake()"))
+        assertTrue(
+            "healthy result should be returned only after handshake",
+            source.indexOf("return@withTimeout") > source.indexOf("it.startHandshake()"),
+        )
+    }
+
+    @Test
     fun `platform release waits for cleanup before polling VPN and accepts a release after 750ms`() = runBlocking {
         var nowNanos = 0L
         val events = mutableListOf<String>()
@@ -285,6 +368,26 @@ class ServiceRecoveryPolicyTest {
                 ownershipKnown = true,
                 globalCandidateCount = 2,
                 serviceStopping = false,
+            ),
+        )
+        assertFalse(
+            "own vpn ownership blocks re-entry unless replacement is explicitly allowed",
+            isOwnedTunRuntimeQuiescent(
+                descriptorValid = false,
+                ownVpnActive = true,
+                ownershipKnown = true,
+                globalCandidateCount = 2,
+                allowPlatformVpnReplacement = false,
+            ),
+        )
+        assertTrue(
+            "explicit user-start replacement should allow re-entry even if ownership is still active",
+            isOwnedTunRuntimeQuiescent(
+                descriptorValid = false,
+                ownVpnActive = true,
+                ownershipKnown = true,
+                globalCandidateCount = 2,
+                allowPlatformVpnReplacement = true,
             ),
         )
         assertFalse(isOwnedTunRuntimeQuiescent(true, false, true, 0))
@@ -716,15 +819,16 @@ class ServiceRecoveryPolicyTest {
     }
 
     @Test
-    fun `live turncoat carrier suppresses destructive route recovery`() {
-        assertTrue(isLiveTurncoatCarrier(rxProofCount = 1, healthReportCount = 0, activeSessions = 1))
-        assertTrue(isLiveTurncoatCarrier(rxProofCount = 0, healthReportCount = 1, activeSessions = 10))
+    fun `live turncoat carrier requires both real backend RX and active sessions`() {
+        assertTrue(isLiveTurncoatCarrier(rxProofCount = 1, activeSessions = 1))
+        assertTrue(isLiveTurncoatCarrier(rxProofCount = 3, activeSessions = 10))
     }
 
     @Test
-    fun `turncoat evidence without active sessions does not mask a dead carrier`() {
-        assertEquals(false, isLiveTurncoatCarrier(rxProofCount = 1, healthReportCount = 1, activeSessions = 0))
-        assertEquals(false, isLiveTurncoatCarrier(rxProofCount = 0, healthReportCount = 0, activeSessions = 10))
+    fun `health-only or inactive turncoat evidence does not mask a dead backend`() {
+        assertFalse(isLiveTurncoatCarrier(rxProofCount = 1, activeSessions = 0))
+        assertFalse(isLiveTurncoatCarrier(rxProofCount = 0, activeSessions = 10))
+        assertFalse(isLiveTurncoatCarrier(rxProofCount = 0, activeSessions = 0))
     }
 
     @Test

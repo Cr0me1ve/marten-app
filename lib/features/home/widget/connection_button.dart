@@ -8,7 +8,6 @@ import 'package:marten/core/router/bottom_sheets/bottom_sheets_notifier.dart';
 import 'package:marten/features/connection/model/connection_status.dart';
 import 'package:marten/features/connection/notifier/connection_notifier.dart';
 import 'package:marten/features/profile/notifier/active_profile_notifier.dart';
-import 'package:marten/features/settings/notifier/config_option/config_option_notifier.dart';
 
 const _idleBorder = Color(0xFFE3A766);
 const _connectedBorder = Color(0xFFBA8048);
@@ -22,14 +21,12 @@ class ConnectionButton extends HookConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final t = ref.watch(translationsProvider).requireValue;
     final connectionStatus = ref.watch(connectionNotifierProvider);
-    final requiresReconnect = ref.watch(configOptionNotifierProvider).valueOrNull;
     // Startup route readiness is reduced into connectionNotifierProvider.
     // Keeping an additional widget-local gate here could retain a stale
     // Connecting after the current generation has already been verified.
-    final status = connectionButtonStatus(connectionStatus.valueOrNull);
+    final status = connectionButtonStatus(connectionStatus);
 
     final label = switch (status) {
-      Connected() when requiresReconnect == true => t.connection.reconnect,
       Connected() => t.connection.connected,
       Connecting() => t.connection.connecting,
       Disconnecting() => t.connection.disconnecting,
@@ -37,34 +34,33 @@ class ConnectionButton extends HookConsumerWidget {
     };
     final manualCommand = manualConnectionCommandForStatus(status);
 
-    final onTap = connectionStatus.isLoading
-        ? null
-        : switch (status) {
-            Connected() when requiresReconnect == true => () async {
-              final activeProfile = await ref.read(activeProfileProvider.future);
-              await ref.read(connectionNotifierProvider.notifier).reconnect(activeProfile);
-            },
-            Connecting() => () async {
-              await ref.read(connectionNotifierProvider.notifier).executeManualCommand(manualCommand);
-            },
-            Disconnected() || Connected() => () async {
-              if (manualCommand == ManualConnectionCommand.connect &&
-                  ref.read(activeProfileProvider).valueOrNull == null) {
-                ref.read(bottomSheetsNotifierProvider.notifier).showAddProfile();
-                return;
-              }
-              await ref.read(connectionNotifierProvider.notifier).executeManualCommand(manualCommand);
-            },
-            _ => null,
-          };
+    final onTap = switch (status) {
+      // A visible active/transient session is always actionable, including
+      // AsyncLoading with a retained value while the provider is rebuilding.
+      // The captured command is a stop intent and can never become Connect.
+      Connecting() || Connected() => () async {
+        await ref.read(connectionNotifierProvider.notifier).executeManualCommand(manualCommand);
+      },
+      Disconnected() when connectionStatus.isLoading => null,
+      Disconnected() => () async {
+        if (ref.read(activeProfileProvider).valueOrNull == null) {
+          ref.read(bottomSheetsNotifierProvider.notifier).showAddProfile();
+          return;
+        }
+        await ref.read(connectionNotifierProvider.notifier).executeManualCommand(manualCommand);
+      },
+      Disconnecting() => null,
+    };
 
     return _ConnectionCircle(size: size, label: label, status: status, onTap: onTap);
   }
 }
 
-ConnectionStatus connectionButtonStatus(ConnectionStatus? status) {
-  if (status != null) return status;
-  return const Disconnected();
+ConnectionStatus connectionButtonStatus(AsyncValue<ConnectionStatus> state) {
+  // AsyncError may retain the previous AsyncData value. Treat an error as a
+  // terminal idle state instead of rendering a stale Connecting indefinitely.
+  if (state.hasError) return const Disconnected();
+  return state.valueOrNull ?? const Disconnected();
 }
 
 class _ConnectionCircle extends HookWidget {

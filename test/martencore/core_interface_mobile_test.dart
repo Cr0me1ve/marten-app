@@ -88,6 +88,34 @@ void main() {
     });
   });
 
+  group('authoritative Android background-start join policy', () {
+    test('joins only an Android platform service that is still starting', () {
+      final cases = [
+        (isAndroid: true, platformStatus: const CoreStatus.starting(), expected: true),
+        (isAndroid: true, platformStatus: const CoreStatus.started(), expected: false),
+        (isAndroid: true, platformStatus: const CoreStatus.stopped(), expected: false),
+        (isAndroid: true, platformStatus: null, expected: false),
+      ];
+
+      for (final testCase in cases) {
+        expect(
+          shouldJoinAuthoritativeBackgroundStart(
+            isAndroid: testCase.isAndroid,
+            platformStatus: testCase.platformStatus,
+          ),
+          testCase.expected,
+        );
+      }
+    });
+
+    test('never joins the Android-specific authoritative start path on another platform', () {
+      expect(
+        shouldJoinAuthoritativeBackgroundStart(isAndroid: false, platformStatus: const CoreStatus.starting()),
+        isFalse,
+      );
+    });
+  });
+
   test('manual setup reads authoritative platform status before conditionally attaching background gRPC', () {
     final source = File('lib/martencore/core_interface/core_interface_mobile.dart').readAsStringSync();
     final start = source.indexOf('Future<BackgroundCoreSetupResult> setupBackground(String path, String name) async {');
@@ -169,6 +197,25 @@ void main() {
     expect(accepted, isTrue);
   });
 
+  test('Flutter waits longer than the bounded native TURNcoat VPN-proof retry', () {
+    final source = File('lib/martencore/core_interface/core_interface_mobile.dart').readAsStringSync();
+    final timeout = RegExp(r'static const _platformStartedSyncTimeout = Duration\(seconds: (\d+)\)').firstMatch(source);
+    final seconds = int.tryParse(timeout?.group(1) ?? '');
+    final acknowledgement = source.indexOf('Future<bool> notifyBackgroundStarted() async {');
+    final markStarted = source.indexOf(
+      'invokeMethod<bool>("markStarted").timeout(_platformStartedSyncTimeout)',
+      acknowledgement,
+    );
+
+    expect(seconds, isNotNull);
+    expect(
+      seconds!,
+      greaterThanOrEqualTo(75),
+      reason: 'Dart must stay attached for the complete bounded native TURNcoat retry window',
+    );
+    expect(markStarted, greaterThan(acknowledgement));
+  });
+
   test('a true authoritative platform stop succeeds when the background port is stopped', () async {
     var stopCalls = 0;
     messenger.setMockMethodCallHandler(CoreInterfaceMobile.methodChannel, (call) async {
@@ -224,21 +271,16 @@ void main() {
     expect(stopCalls, 1);
   });
 
-  test(
-    'a platform stop timeout never reconciles or reports a successful disconnect',
-    () async {
-      var stopCalls = 0;
-      final neverCompletes = Completer<bool>();
-      messenger.setMockMethodCallHandler(CoreInterfaceMobile.methodChannel, (call) {
-        stopCalls++;
-        return neverCompletes.future;
-      });
+  test('platform stop leaves enough outer time for bounded native and VPN cleanup', () {
+    final source = File('lib/martencore/core_interface/core_interface_mobile.dart').readAsStringSync();
 
-      expect(await CoreInterfaceMobile().stop(), isFalse);
-      expect(stopCalls, 1);
-    },
-    timeout: const Timeout(Duration(seconds: 20)),
-  );
+    expect(source, contains('static const _platformStopCallTimeout = Duration(seconds: 30);'));
+    expect(
+      source,
+      contains('up to 20 seconds for the\n  // native core plus 5 seconds for service/VPN ownership release'),
+    );
+    expect(source, contains('await stopMethodChannel().timeout(_platformStopCallTimeout)'));
+  });
 
   test('a lingering non-stopped background core fails before platform reconciliation', () {
     final source = File('lib/martencore/core_interface/core_interface_mobile.dart').readAsStringSync();

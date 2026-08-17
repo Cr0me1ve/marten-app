@@ -24,14 +24,10 @@ void main() {
       );
       expect(updateNotifier, isNot(contains('upsertRemote(')));
       expect(updateNotifier, isNot(matches(RegExp(r'loggy\.warning\([\s\S]*?(?:err|error)'))));
-      expect(
-        updateNotifier,
-        contains(
-          'if (active != null && active.id == profile.id) {\n'
-          '          await ref.read(connectionNotifierProvider.notifier).reconnect(active);',
-        ),
-      );
+      expect(updateNotifier, isNot(contains('connectionNotifierProvider')));
+      expect(updateNotifier, isNot(contains('reconnect(active)')));
       expect(updateNotifier, isNot(contains('reconnect(profile)')));
+      expect(updateNotifier, contains('subscription_refresh outcome=updated source=manual'));
     });
 
     test('subscription download markers keep endpoint and error details private', () {

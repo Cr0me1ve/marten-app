@@ -11,6 +11,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import android.net.TrafficStats
 import android.net.Uri
 import android.os.Build
 import android.os.Handler
@@ -30,7 +31,7 @@ import app.marten.client.Settings
 import app.marten.client.constant.Action
 import app.marten.client.constant.Alert
 import app.marten.client.constant.Status
-import app.marten.client.security.NativeResumeConfigStore
+import app.marten.native_resume.NativeResumeConfigStore
 import app.marten.client.utils.GrpcClientProvider
 
 import go.Seq
@@ -76,7 +77,6 @@ class BoxService(
 
     companion object {
         private const val TAG = "A/BoxService"
-        private const val CORE_WATCHDOG_POLL_MS = 750L
         private const val CORE_WATCHDOG_CONFIRM_MS = 250L
         private const val CORE_WATCHDOG_GRPC_TIMEOUT_MS = 2_500L
         private const val CORE_RUNTIME_MONITOR_POLL_MS = 250L
@@ -98,14 +98,18 @@ class BoxService(
         private const val CORE_RECOVERY_TURNCOAT_STALL_TIMEOUT_MS = 120_000L
         private const val CORE_FLUTTER_START_GRACE_MS = 5_000L
         private const val CORE_FLUTTER_STARTING_STALL_MS = 45_000L
-        private const val CORE_UNVERIFIED_STARTUP_RECOVERY_GRACE_MS = 3_000L
+        // Flutter first verifies the selected outbound, then Android performs
+        // an independent VPN-network probe. Allow both bounded checks to finish
+        // before native recovery is admitted; the shorter window raced a
+        // successful slow route and could close the core during acknowledgement.
+        // The Android VPN-bound GET can spend up to 30s bringing up a lazy
+        // TURNcoat carrier on restricted mobile networks. Native recovery must
+        // not tear that verified-route acknowledgement down mid-probe.
+        private const val CORE_UNVERIFIED_STARTUP_RECOVERY_GRACE_MS = 45_000L
         private const val ROUTE_WATCHDOG_GROUP = "select"
         private const val ROUTE_WATCHDOG_INITIAL_DELAY_MS = 6_000L
         private const val ROUTE_WATCHDOG_ICMP_INITIAL_DELAY_MS = 2_000L
-        private const val ROUTE_WATCHDOG_TURNCOAT_INITIAL_DELAY_MS = 75_000L
-        private const val ROUTE_WATCHDOG_POLL_MS = 10_000L
-        private const val ROUTE_WATCHDOG_ICMP_POLL_MS = 3_000L
-        private const val ROUTE_WATCHDOG_DEGRADED_POLL_MS = 500L
+        private const val ROUTE_WATCHDOG_TURNCOAT_INITIAL_DELAY_MS = 60_000L
         private const val ROUTE_WATCHDOG_GRPC_TIMEOUT_MS = 8_000L
         private const val ROUTE_WATCHDOG_OPERATION_TIMEOUT_MS = 11_000L
         private const val ROUTE_RECOVERY_BACKOFF_MS = 10_000L
@@ -117,14 +121,16 @@ class BoxService(
         private const val STARTUP_ROUTE_VERIFY_TIMEOUT_MS = 12_000L
         private const val STARTUP_ROUTE_VERIFY_TURNCOAT_TIMEOUT_MS = 75_000L
         private const val STARTUP_ROUTE_VERIFY_RETRY_MS = 700L
-        private const val EXTERNAL_VPN_WATCHDOG_POLL_MS = 1_000L
         private const val EXTERNAL_VPN_OWNERSHIP_LOSS_CONFIRMATIONS = 2
         private const val MARK_STARTED_TUN_SETTLE_MS = 750L
         private const val MARK_STARTED_TUN_POLL_MS = 100L
 
         private data class VpnOwnershipSnapshot(
+            val visibilityKnown: Boolean,
             val known: Boolean,
+            val anyActive: Boolean,
             val active: Boolean,
+            val externalActive: Boolean,
             val interfaceNames: Set<String>,
         )
 
@@ -171,7 +177,7 @@ class BoxService(
             ContextCompat.startForegroundService(Application.application, intent)
         }
 
-        fun connect(userInitiated: Boolean = true) {
+        fun connect(userInitiated: Boolean = false) {
             Settings.startCoreAfterStartingService = true
             val intent = Intent(Application.application, Settings.serviceClass())
                 .setAction(Action.SERVICE_CONNECT)
@@ -208,7 +214,7 @@ class BoxService(
                 Log.w(TAG, "refusing verified-route acknowledgement: Android service instance is absent")
                 return false
             }
-            return instance.markCoreRuntimeStarted(routeVerified = true)
+            return instance.acknowledgeVerifiedRouteFromFlutter()
         }
 
         fun currentPlatformStatus(): Status =
@@ -224,47 +230,118 @@ class BoxService(
         fun currentActiveOwnerToken(): Long? = activeInstance?.serviceOwnerToken
 
         fun isExternalVpnActive(context: Context, reason: String): Boolean {
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return false
-            val connectivity = context.getSystemService(ConnectivityManager::class.java) ?: return false
-            val ownUid = context.applicationInfo.uid
-            return connectivity.allNetworks.any { network ->
-                val capabilities = connectivity.getNetworkCapabilities(network) ?: return@any false
-                if (!capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return@any false
-                val ownerUid = capabilities.ownerUid
-                val external = ownerUid != -1 && ownerUid != ownUid
-                if (external) {
-                    Log.w(TAG, "external VPN is active during $reason; ownerUid=$ownerUid ownUid=$ownUid")
-                }
-                external
+            val ownership = readVpnOwnership(context)
+            // ConnectivityManager can briefly retain the deactivated network
+            // while Android transfers the single slot. Exact Marten ownership
+            // wins that overlap; onRevoke()/prepare() still detect a real loss.
+            val externalOwnsSlot = ownership.externalActive && !ownership.active
+            if (externalOwnsSlot) {
+                Log.w(TAG, "another app owns an active VPN network during $reason")
             }
+            return externalOwnsSlot
         }
 
         fun isOwnVpnActive(context: Context): Boolean {
             return readVpnOwnership(context).active
         }
 
-        private fun readVpnOwnership(context: Context): VpnOwnershipSnapshot {
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
-                return VpnOwnershipSnapshot(
-                    known = false,
-                    active = false,
-                    interfaceNames = emptySet(),
+        fun shouldRejectNewVpnStart(
+            context: Context,
+            reason: String,
+            explicitUserStart: Boolean = false,
+        ): Boolean {
+            val ownership = readVpnOwnership(context)
+            val instance = activeInstance
+            val retainedDescriptorValid = instance?.let {
+                synchronized(it.fileDescriptorLock) {
+                    it.fileDescriptor?.fileDescriptor?.valid() == true
+                }
+            } == true
+            val currentGenerationOwnsVpn =
+                retainedDescriptorValid &&
+                    instance?.status?.value != Status.Stopping &&
+                    instance?.status?.value != Status.Stopped &&
+                    (!ownership.known || ownership.active)
+            val externalOwnsSlot = ownership.externalActive && !ownership.active
+            val rejected = shouldRejectNewVpnGeneration(
+                vpnMode = Settings.serviceMode == ServiceMode.VPN,
+                explicitUserStart = explicitUserStart,
+                currentGenerationOwnsVpn = currentGenerationOwnsVpn,
+                vpnNetworkVisibilityKnown = ownership.visibilityKnown,
+                anyVpnNetworkActive = ownership.anyActive,
+                externalVpnNetworkActive = externalOwnsSlot,
+            )
+            if (rejected) {
+                Log.w(
+                    TAG,
+                    "rejecting new Marten VPN generation during $reason; " +
+                        "visibility_known=${ownership.visibilityKnown} " +
+                        "any_vpn=${ownership.anyActive} external_vpn_owns_slot=$externalOwnsSlot " +
+                        "current_generation_owns_vpn=$currentGenerationOwnsVpn " +
+                        "explicit_user_start=$explicitUserStart",
                 )
             }
+            return rejected
+        }
+
+        private fun readVpnOwnership(context: Context): VpnOwnershipSnapshot {
             val connectivity = context.getSystemService(ConnectivityManager::class.java)
                 ?: return VpnOwnershipSnapshot(
+                    visibilityKnown = false,
                     known = false,
+                    anyActive = false,
                     active = false,
+                    externalActive = false,
                     interfaceNames = emptySet(),
                 )
-            val ownUid = context.applicationInfo.uid
-            val ownNetworks = connectivity.allNetworks.filter { network ->
-                val capabilities = connectivity.getNetworkCapabilities(network) ?: return@filter false
-                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN) && capabilities.ownerUid == ownUid
+            val vpnNetworks = runCatching {
+                connectivity.allNetworks.filter { network ->
+                    connectivity.getNetworkCapabilities(network)
+                        ?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
+                }
+            }.onFailure {
+                Log.w(TAG, "failed to inspect active Android VPN networks", it)
+            }.getOrElse {
+                return VpnOwnershipSnapshot(
+                    visibilityKnown = false,
+                    known = false,
+                    anyActive = false,
+                    active = false,
+                    externalActive = false,
+                    interfaceNames = emptySet(),
+                )
             }
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+                return VpnOwnershipSnapshot(
+                    visibilityKnown = true,
+                    known = false,
+                    anyActive = vpnNetworks.isNotEmpty(),
+                    active = false,
+                    externalActive = false,
+                    interfaceNames = emptySet(),
+                )
+            }
+            val ownUid = context.applicationInfo.uid
+            val ownerUids = vpnNetworks.associateWith { network ->
+                connectivity.getNetworkCapabilities(network)?.ownerUid ?: -1
+            }
+            // Android can redact ownerUid even on API levels that expose the
+            // property. Treat that as unknown ownership so runtime health uses
+            // its conservative retained-descriptor/interface fallback. New
+            // generation admission still sees anyActive and remains blocked.
+            val ownershipKnown = ownerUids.values.none { it == -1 }
+            val ownNetworks = if (ownershipKnown) {
+                ownerUids.filterValues { it == ownUid }.keys
+            } else {
+                emptySet()
+            }
+            val externalActive = ownershipKnown && ownerUids.values.any { it != ownUid }
             return VpnOwnershipSnapshot(
-                known = true,
+                visibilityKnown = true,
+                known = ownershipKnown,
+                anyActive = vpnNetworks.isNotEmpty(),
                 active = ownNetworks.isNotEmpty(),
+                externalActive = externalActive,
                 interfaceNames = ownNetworks.mapNotNull { network ->
                     connectivity.getLinkProperties(network)?.interfaceName
                 }.toSet(),
@@ -323,6 +400,8 @@ class BoxService(
     private val fileDescriptorLock = Any()
     private var fileDescriptor: ParcelFileDescriptor? = null
     private var tunDescriptorAdmissionClosed = false
+    @Volatile
+    private var tunGeneration = 0L
     private val serviceOwnerToken = ServiceLifecycleOwnership.acquire()
     private val serviceJob = SupervisorJob()
     private val serviceScope = CoroutineScope(serviceJob + Dispatchers.IO)
@@ -378,13 +457,19 @@ class BoxService(
     @Volatile
     private var externalVpnWatchdogJob: Job? = null
     @Volatile
-    private var explicitVpnTakeoverPending = false
+    private var vpnOwnershipRevoked = false
     @Volatile
     private var vpnOwnershipWasEstablished = false
+    @Volatile
+    private var explicitUserVpnStartPending = false
     @Volatile
     private var routeWatchdogHealthyChecks = 0
     @Volatile
     private var routeWatchdogDegraded = false
+    @Volatile
+    private var lastVpnDataPlaneProof: VpnDataPlaneProof? = null
+    @Volatile
+    private var lastTunTrafficSnapshot: TunTrafficSnapshot? = null
     @Volatile
     private var lastSelectedOutboundType = ""
     @Volatile
@@ -396,8 +481,9 @@ class BoxService(
     @Volatile
     private var networkRecoveryJob: Job? = null
     private val routeWatchdogCheckLock = Any()
-    private var runningWakeLock: PowerManager.WakeLock? = null
+    private val vpnDataPlaneProofLock = Any()
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val vpnDataPlaneProbe = VpnDataPlaneProbe(service)
 
     init {
         activeInstance = this
@@ -485,7 +571,7 @@ class BoxService(
             return
         }
         Log.w(TAG, "service start cancelled after $reason; closing mobile core")
-        releaseRunningWakeLock()
+        explicitUserVpnStartPending = false
         stopCoreRuntimeMonitor()
         stopCoreWatchdog()
         stopRouteWatchdog()
@@ -545,6 +631,7 @@ class BoxService(
         try {
             keepStoppedNotificationOnDestroy = false
             routeWatchdogDegraded = false
+            invalidateVpnDataPlaneProof("service start")
             lastSelectedOutboundType = ""
             Log.d(TAG, "starting service")
             withContext(Dispatchers.Main) {
@@ -587,6 +674,7 @@ class BoxService(
             }
             closedByStopService = false
             coreShutdownCompleted = false
+            vpnOwnershipRevoked = false
             vpnOwnershipWasEstablished = false
             if (Settings.serviceMode == ServiceMode.VPN) {
                 // Ownership can be lost after Builder.establish() but before
@@ -604,7 +692,7 @@ class BoxService(
                 finishCancelledStart(generation, "default network monitor start")
                 return
             }
-            if (isExternalVpnActive("service start before mobile setup")) {
+            if (shouldYieldToExternalVpn("service start before mobile setup")) {
                 stopForExternalVpnOnMain("service start before mobile setup")
                 return
             }
@@ -656,7 +744,7 @@ class BoxService(
                     finishCancelledStart(generation, "before mobile start")
                     return
                 }
-                if (isExternalVpnActive("service start before mobile start")) {
+                if (shouldYieldToExternalVpn("service start before mobile start")) {
                     stopForExternalVpnOnMain("service start before mobile start")
                     return
                 }
@@ -666,19 +754,10 @@ class BoxService(
                     Settings.activeConfigPath,
                     "service start",
                     generation,
-                    stopServiceOnRouteFailure = false,
+                    stopServiceOnRouteFailure = true,
                 )
                 if (!routeVerified) {
-                    val startStillCurrent = shouldContinueStart(generation)
-                    if (shouldRetryFailedNativeStartup(
-                            routeVerified = false,
-                            userSessionActive = Settings.startedByUser,
-                            startStillCurrent = startStillCurrent,
-                        )
-                    ) {
-                        Log.w(TAG, "native service start route is not ready; entering retry recovery")
-                        requestCoreRecovery("native service start route is not ready", generation)
-                    }
+                    Log.w(TAG, "native service startup ended after terminal VPN data-plane failure")
                     return
                 }
             }
@@ -736,6 +815,7 @@ class BoxService(
             ) {
                 return@run null
             }
+            DefaultNetworkMonitor.clearListener(serviceOwnerToken)
             runCatching {
                 Mobile.stop()
             }.onFailure {
@@ -800,9 +880,12 @@ class BoxService(
             Log.i(TAG, "stale service stop ignored")
             return
         }
-        explicitVpnTakeoverPending = false
+        // A user-mediated takeover authorizes exactly one TUN creation attempt.
+        // No stop, revoke, or later recovery may inherit that authorization.
+        explicitUserVpnStartPending = false
         cancelProcessRecovery()
         if (vpnRevoked) {
+            vpnOwnershipRevoked = true
             Log.w(TAG, "VPN permission revoked by Android; stopping without session restore")
             Settings.startedByUser = false
             Settings.startCoreAfterStartingService = false
@@ -843,7 +926,6 @@ class BoxService(
         } else {
             notification.show(activeProfileName, R.string.status_stopping)
         }
-        releaseRunningWakeLock()
         stopCoreRuntimeMonitor()
         stopCoreWatchdog()
         stopRouteWatchdog()
@@ -863,6 +945,7 @@ class BoxService(
                     Log.i(TAG, "discarding stale service stop generation=$stopGeneration")
                     return@run null
                 }
+                DefaultNetworkMonitor.clearListener(serviceOwnerToken)
                 runCatching {
                     Mobile.stop()
                 }.onFailure {
@@ -877,13 +960,28 @@ class BoxService(
             }
             if (coreClosed == null) return@launch
             coreShutdownCompleted = coreClosed.completed
-            if (coreClosed.completed && service is VPNService) {
-                if (!service.retirePlatformVpnSessionAfterCoreStop()) {
+            val externalVpnActive = isExternalVpnActive(service, "platform VPN retirement")
+            val ownershipRevoked = vpnOwnershipRevoked
+            val vpnService = service as? VPNService
+            if (shouldRetirePlatformVpnAfterCoreStop(
+                    coreStopped = coreClosed.completed,
+                    vpnService = vpnService != null,
+                    vpnOwnershipRevoked = ownershipRevoked,
+                    externalVpnActive = externalVpnActive,
+                )
+            ) {
+                if (!vpnService!!.retirePlatformVpnSessionAfterCoreStop {
+                        !vpnOwnershipRevoked &&
+                            !isExternalVpnActive(service, "platform VPN retirement final gate")
+                    }
+                ) {
                     Log.w(
                         TAG,
                         "Android framework VPN retirement is deferred after completed core stop",
                     )
                 }
+            } else if (coreClosed.completed && service is VPNService && ownershipRevoked) {
+                Log.i(TAG, "skipping Android VPN retirement after ownership revoke")
             }
             if (requiresCoreCleanupEscalation(
                     coreClosed.closeCompleted,
@@ -936,6 +1034,7 @@ class BoxService(
 
     fun replaceTunFileDescriptor(pfd: ParcelFileDescriptor): Boolean {
         var accepted = false
+        var acceptedTunGeneration = 0L
         val previous = synchronized(fileDescriptorLock) {
             if (
                 !tunDescriptorAdmissionClosed &&
@@ -948,6 +1047,8 @@ class BoxService(
                 accepted = true
                 val previous = fileDescriptor
                 fileDescriptor = pfd
+                tunGeneration += 1
+                acceptedTunGeneration = tunGeneration
                 previous
             } else {
                 null
@@ -961,6 +1062,11 @@ class BoxService(
             MobileCoreCloser.closeAsync("late tun after service stop")
             return false
         }
+        if (Settings.serviceMode == ServiceMode.VPN) {
+            vpnOwnershipWasEstablished = true
+            explicitUserVpnStartPending = false
+            invalidateVpnDataPlaneProof("Android TUN generation=$acceptedTunGeneration")
+        }
         if (previous != null && previous !== pfd) {
             runCatching { previous.close() }.onFailure {
                 Log.w(TAG, "error closing previous tun file descriptor", it)
@@ -969,39 +1075,29 @@ class BoxService(
         return true
     }
 
+    fun onTunCreationFailed() {
+        // Builder.establish() is the single attempt authorized by the user's
+        // prepare flow. A retry must pass fresh ownership admission and must
+        // never take a VPN that the user selected after this attempt began.
+        explicitUserVpnStartPending = false
+    }
+
     private fun closeTunFileDescriptor() {
+        var closedTunGeneration = 0L
         val pfd = synchronized(fileDescriptorLock) {
             val pfd = fileDescriptor
             fileDescriptor = null
+            if (pfd != null) {
+                tunGeneration += 1
+                closedTunGeneration = tunGeneration
+            }
             pfd
         }
         if (pfd != null) {
+            invalidateVpnDataPlaneProof("closed Android TUN generation=$closedTunGeneration")
             runCatching { pfd.close() }.onFailure {
                 Log.w(TAG, "error closing tun file descriptor", it)
             }
-        }
-    }
-
-    private fun acquireRunningWakeLock() {
-        val existing = runningWakeLock
-        if (existing?.isHeld == true) return
-
-        val wakeLock = Application.powerManager.newWakeLock(
-            PowerManager.PARTIAL_WAKE_LOCK,
-            "Marten:VpnService",
-        )
-        wakeLock.setReferenceCounted(false)
-        wakeLock.acquire()
-        runningWakeLock = wakeLock
-        Log.i(TAG, "vpn runtime wake lock acquired")
-    }
-
-    private fun releaseRunningWakeLock() {
-        val wakeLock = runningWakeLock
-        runningWakeLock = null
-        if (wakeLock?.isHeld == true) {
-            wakeLock.release()
-            Log.i(TAG, "vpn runtime wake lock released")
         }
     }
 
@@ -1145,9 +1241,9 @@ class BoxService(
         externalVpnWatchdogJob = serviceScope.launch(Dispatchers.IO) {
             var consecutiveOwnVpnMisses = 0
             while (isActive) {
-                delay(EXTERNAL_VPN_WATCHDOG_POLL_MS)
+                delay(vpnOwnershipWatchdogPollDelayMs(Application.powerManager.isInteractive))
                 if (!shouldWatchCore()) continue
-                val externalVpnActive = isExternalVpnActive("runtime watchdog")
+                val externalVpnActive = shouldYieldToExternalVpn("runtime watchdog")
                 if (externalVpnActive) {
                     stopForExternalVpnOnMain("runtime watchdog")
                     return@launch
@@ -1155,7 +1251,6 @@ class BoxService(
                 val ownership = readVpnOwnership(service)
                 if (ownership.active) {
                     vpnOwnershipWasEstablished = true
-                    explicitVpnTakeoverPending = false
                     consecutiveOwnVpnMisses = 0
                     continue
                 }
@@ -1164,10 +1259,9 @@ class BoxService(
                     continue
                 }
                 consecutiveOwnVpnMisses += 1
-                val authorizationRevoked = isVpnAuthorizationRevoked("runtime watchdog")
                 if (shouldStopForLostVpnOwnership(
                         externalVpnActive = externalVpnActive,
-                        authorizationRevoked = authorizationRevoked,
+                        authorizationRevoked = false,
                         ownershipKnown = ownership.known,
                         ownVpnActive = ownership.active,
                         consecutiveOwnVpnMisses = consecutiveOwnVpnMisses,
@@ -1196,17 +1290,88 @@ class BoxService(
             usesTurncoat = configUsesTurncoat(Settings.activeConfigPath),
             reason = reason,
             generation = generation,
-            stopServiceOnFailure = false,
+            stopServiceOnFailure = true,
         )
         if (routeVerified) {
             markCoreRuntimeStarted(routeVerified = true, generation = generation)
-        } else if (shouldWatchCore(generation)) {
-            launchNetworkRouteRecovery(
-                generation = networkGeneration,
-                reason = "$reason did not produce a fresh selected-route proof",
-                settleDelayMs = 0L,
-                replaceActive = false,
+        }
+    }
+
+    private suspend fun acknowledgeVerifiedRouteFromFlutter(): Boolean {
+        val generation = currentStartGeneration()
+        if (!shouldContinueStart(generation)) return false
+        if (Settings.serviceMode == ServiceMode.VPN && !hasReusableVpnDataPlaneProof(generation)) {
+            // Flutter may reach this acknowledgement before the lazy
+            // TURNcoat/Hysteria carrier has finished its first recovery. Use
+            // the same bounded, real VPN-network retry gate as native startup
+            // instead of tearing the service down after one slow GET.
+            val verified = verifyNativeStartupRoute(
+                usesTurncoat = configUsesTurncoat(Settings.activeConfigPath),
+                reason = "Flutter started acknowledgement",
+                generation = generation,
+                stopServiceOnFailure = true,
             )
+            if (!verified) return false
+        }
+        return markCoreRuntimeStarted(routeVerified = true, generation = generation)
+    }
+
+    private fun hasReusableVpnDataPlaneProof(generation: Long): Boolean {
+        if (Settings.serviceMode != ServiceMode.VPN) return true
+        val proof = currentVpnDataPlaneProof(generation) ?: return false
+        val proofAgeMs = SystemClock.elapsedRealtime() - proof.completedAtElapsedRealtimeMs
+        return proofAgeMs in 0..VPN_DATA_PLANE_PROOF_REUSE_MS
+    }
+
+    private fun currentVpnDataPlaneProof(generation: Long): VpnDataPlaneProof? {
+        return synchronized(vpnDataPlaneProofLock) {
+            val proof = lastVpnDataPlaneProof ?: return@synchronized null
+            proof.takeIf {
+                it.startGeneration == generation &&
+                    it.networkGeneration == networkGeneration &&
+                    it.tunGeneration == tunGeneration &&
+                    it.vpnNetworkHandle == vpnDataPlaneProbe.currentVpnNetworkHandle()
+            }
+        }
+    }
+
+    private fun recordVpnDataPlaneProof(
+        proofStartGeneration: Long,
+        proofNetworkGeneration: Long,
+        proofTunGeneration: Long,
+        proofVpnNetworkHandle: Long,
+    ): Boolean {
+        val trafficSnapshot = readTunTrafficSnapshot(readTunRuntimeHealth())
+        return synchronized(vpnDataPlaneProofLock) {
+            if (
+                proofStartGeneration != startGeneration ||
+                proofNetworkGeneration != networkGeneration ||
+                proofTunGeneration != tunGeneration ||
+                proofVpnNetworkHandle != vpnDataPlaneProbe.currentVpnNetworkHandle()
+            ) {
+                return@synchronized false
+            }
+            lastVpnDataPlaneProof = VpnDataPlaneProof(
+                startGeneration = proofStartGeneration,
+                networkGeneration = proofNetworkGeneration,
+                tunGeneration = proofTunGeneration,
+                vpnNetworkHandle = proofVpnNetworkHandle,
+                completedAtElapsedRealtimeMs = SystemClock.elapsedRealtime(),
+            )
+            lastTunTrafficSnapshot = trafficSnapshot
+            true
+        }
+    }
+
+    private fun invalidateVpnDataPlaneProof(reason: String) {
+        val invalidated = synchronized(vpnDataPlaneProofLock) {
+            val hadProof = lastVpnDataPlaneProof != null
+            lastVpnDataPlaneProof = null
+            lastTunTrafficSnapshot = null
+            hadProof
+        }
+        if (invalidated) {
+            Log.i(TAG, "invalidating VPN data-plane proof: $reason")
         }
     }
 
@@ -1220,6 +1385,16 @@ class BoxService(
         }
         if (coreRecoveryInProgress && !routeVerified) {
             Log.w(TAG, "ignoring unverified core started signal while route recovery is in progress")
+            return false
+        }
+        if (!hasReusableVpnDataPlaneProof(generation)) {
+            Log.w(TAG, "refusing Started without a fresh current-generation VPN data-plane proof")
+            withContext(Dispatchers.Main) {
+                if (shouldContinueStart(generation)) {
+                    status.value = Status.Starting
+                    notification.show(activeProfileName, R.string.status_starting)
+                }
+            }
             return false
         }
         val tunHealth = awaitTunRuntimeHealthForStarted()
@@ -1247,16 +1422,31 @@ class BoxService(
             if (!shouldContinueStart(generation)) {
                 return@withContext false
             }
+            // TUN or Android Network ownership can change after the first
+            // proof check while TUN health settles. Revalidate at the exact
+            // publication point so a proof from the replaced generation can
+            // never promote the new generation to Started.
+            if (!hasReusableVpnDataPlaneProof(generation)) {
+                Log.w(TAG, "refusing Started because VPN data-plane proof changed before publication")
+                status.value = Status.Starting
+                notification.show(activeProfileName, R.string.status_starting)
+                return@withContext false
+            }
             status.value = Status.Started
             notification.show(activeProfileName, R.string.status_started)
             true
         }
-        if (!marked) return false
+        if (!marked) {
+            if (shouldContinueStart(generation)) {
+                routeWatchdogDegraded = true
+                requestRouteWatchdogCheck("VPN data-plane proof changed before Started", delayMs = 0L)
+            }
+            return false
+        }
         if (Settings.serviceMode == ServiceMode.VPN) {
             vpnOwnershipWasEstablished = true
         }
         notification.start()
-        acquireRunningWakeLock()
         startExternalVpnWatchdog()
         startCoreWatchdog()
         startRouteWatchdog()
@@ -1286,7 +1476,7 @@ class BoxService(
 
             while (isActive) {
                 try {
-                    delay(CORE_WATCHDOG_POLL_MS)
+                    delay(coreWatchdogPollDelayMs(coreRecoveryInProgress))
                     if (!shouldWatchCore(generation)) {
                         coreWatchdogSawHealthyCore = false
                         continue
@@ -1397,6 +1587,7 @@ class BoxService(
     private fun resetUnderlyingNetworkGeneration() {
         networkRecoveryJob?.cancel()
         networkRecoveryJob = null
+        invalidateVpnDataPlaneProof("underlying network monitor reset")
         networkGeneration = 0L
         observedUnderlyingNetwork = null
         underlyingNetworkInitialized = false
@@ -1416,7 +1607,12 @@ class BoxService(
         }
         if (previous == network) return
 
+        if (service is VPNService) {
+            service.updateUnderlyingNetwork(network)
+        }
+
         val generation = ++networkGeneration
+        invalidateVpnDataPlaneProof("underlying network generation=$generation")
         Log.w(TAG, "underlying network changed generation=$generation available=${network != null}")
         val wasConnected = status.value == Status.Started
         val wasRecovering = networkRecoveryJob?.isActive == true
@@ -1435,6 +1631,7 @@ class BoxService(
         reason: String,
         settleDelayMs: Long,
         replaceActive: Boolean,
+        forceTurncoatCarrierRetirement: Boolean = false,
     ) {
         if (!shouldWatchCore() || status.value == Status.Stopped || status.value == Status.Stopping) return
         val activeJob = networkRecoveryJob
@@ -1463,7 +1660,11 @@ class BoxService(
             val currentJob = currentCoroutineContext()[Job]
             try {
                 if (settleDelayMs > 0L) delay(settleDelayMs)
-                recoverNetworkRoute(generation, reason)
+                recoverNetworkRoute(
+                    generation = generation,
+                    reason = reason,
+                    forceTurncoatCarrierRetirement = forceTurncoatCarrierRetirement,
+                )
             } finally {
                 synchronized(lifecycleLock) {
                     if (networkRecoveryJob === currentJob) {
@@ -1474,10 +1675,15 @@ class BoxService(
         }
     }
 
-    private suspend fun recoverNetworkRoute(generation: Long, reason: String) {
+    private suspend fun recoverNetworkRoute(
+        generation: Long,
+        reason: String,
+        forceTurncoatCarrierRetirement: Boolean,
+    ) {
         val healthClient = GrpcClientProvider.coreClient(CORE_WATCHDOG_GRPC_TIMEOUT_MS)
         val routeClient = GrpcClientProvider.coreClient(ROUTE_WATCHDOG_GRPC_TIMEOUT_MS)
         var routeAttempt = 0
+        var forcedTurncoatRetirementAttempted = false
 
         while (currentCoroutineContext().isActive) {
             if (generation != networkGeneration || !shouldWatchCore()) {
@@ -1489,7 +1695,7 @@ class BoxService(
                 delay(NETWORK_ROUTE_RECOVERY_RETRY_MS)
                 continue
             }
-            if (isExternalVpnActive("network route recovery")) {
+            if (shouldYieldToExternalVpn("network route recovery")) {
                 stopForExternalVpnOnMain("network route recovery")
                 return
             }
@@ -1505,17 +1711,30 @@ class BoxService(
                 return
             }
 
+            val forceTurncoatCarrier = forceTurncoatCarrierRetirement && !forcedTurncoatRetirementAttempted
+            if (forceTurncoatCarrier) {
+                // Consume the stronger reset before crossing the native boundary:
+                // a partial failure must not repeatedly retire a freshly rebuilding
+                // carrier on every retry.
+                forcedTurncoatRetirementAttempted = true
+            }
             val resetResult = runCatching {
                 MobileCoreLifecycle.run {
-                    Mobile.resetNetwork()
+                    if (forceTurncoatCarrier) {
+                        Mobile.resetNetworkForRouteRecovery()
+                    } else {
+                        Mobile.resetNetwork()
+                    }
                 }
             }
             if (resetResult.isFailure) {
-                Log.w(TAG, "native network reset failed ($reason); retrying", resetResult.exceptionOrNull())
+                val resetKind = if (forceTurncoatCarrier) "forced TURNcoat carrier reset" else "network reset"
+                Log.w(TAG, "native $resetKind failed ($reason); retrying", resetResult.exceptionOrNull())
                 delay(NETWORK_ROUTE_RECOVERY_RETRY_MS)
                 continue
             }
-            Log.i(TAG, "native network reset completed ($reason); awaiting fresh selected-route proof")
+            val resetKind = if (forceTurncoatCarrier) "forced TURNcoat carrier reset" else "network reset"
+            Log.i(TAG, "native $resetKind completed ($reason); awaiting fresh VPN data-plane proof")
 
             if (!beginRouteWatchdogCheck()) {
                 delay(NETWORK_ROUTE_RECOVERY_RETRY_MS)
@@ -1523,7 +1742,7 @@ class BoxService(
             }
             val result = try {
                 runCatching {
-                    checkSelectedRoute(routeClient)
+                    checkSelectedRoute(routeClient, requireVpnDataPlane = true)
                 }.getOrElse {
                     if (it is CancellationException) throw it
                     RouteHealth(false, "network route check error: ${it.message ?: it.javaClass.simpleName}")
@@ -1532,7 +1751,7 @@ class BoxService(
                 endRouteWatchdogCheck()
             }
             if (generation != networkGeneration || !shouldWatchCore()) {
-                Log.i(TAG, "discarding stale selected-route result ($reason)")
+                Log.i(TAG, "discarding stale VPN data-plane result ($reason)")
                 return
             }
             if (result.outboundType.isNotBlank()) {
@@ -1556,6 +1775,13 @@ class BoxService(
             }
 
             Log.w(TAG, "network route still unavailable ($reason, attempt $routeAttempt): ${result.summary}")
+            if (result.requiresCoreRecovery && routeAttempt >= 2) {
+                Log.w(TAG, "VPN data plane remained unavailable after network reset; rebuilding core and TUN")
+                requestCoreRecovery(
+                    "network route recovery could not restore the VPN data plane: ${result.summary}",
+                )
+                return
+            }
             delay(NETWORK_ROUTE_RECOVERY_RETRY_MS)
         }
     }
@@ -1586,7 +1812,7 @@ class BoxService(
         }
 
         try {
-            if (isExternalVpnActive("route watchdog check")) {
+            if (shouldYieldToExternalVpn("route watchdog check")) {
                 routeWatchdogFailures = 0
                 stopForExternalVpnOnMain("route watchdog check")
                 return
@@ -1604,13 +1830,33 @@ class BoxService(
                 if (logSkips) Log.i(TAG, "route watchdog skipped ($reason): network recovery already owns validation")
                 return
             }
-            if (!isCoreRuntimeHealthy(readCoreStateSnapshot(healthClient))) {
+            val coreState = readCoreStateSnapshot(healthClient)
+            if (!isCoreRuntimeHealthy(coreState)) {
                 routeWatchdogFailures = 0
-                if (logSkips) Log.w(TAG, "route watchdog skipped ($reason): local core runtime is not started")
+                Log.w(TAG, "route watchdog found an unhealthy local core ($reason): state=$coreState")
+                requestCoreRecovery("route watchdog found an unhealthy core: state=$coreState")
                 return
             }
 
-            val turncoatEvidence = if (configUsesTurncoat(Settings.activeConfigPath)) {
+            val tunHealth = readTunRuntimeHealth()
+            val tunTrafficAdvanced = hasTunTrafficAdvanced(
+                previous = lastTunTrafficSnapshot,
+                current = readTunTrafficSnapshot(tunHealth),
+            )
+            val nowElapsedRealtimeMs = SystemClock.elapsedRealtime()
+            val currentProof = currentVpnDataPlaneProof(currentStartGeneration())
+            val usesTurncoat = configUsesTurncoat(Settings.activeConfigPath)
+            val scheduledVpnDataPlaneProof = Settings.serviceMode == ServiceMode.VPN &&
+                shouldRunVpnDataPlaneProbe(
+                    forced = status.value == Status.Starting,
+                    degraded = routeWatchdogDegraded,
+                    turncoatRoute = usesTurncoat,
+                    deviceInteractive = Application.powerManager.isInteractive,
+                    tunTrafficAdvanced = tunTrafficAdvanced,
+                    lastProofElapsedRealtimeMs = currentProof?.completedAtElapsedRealtimeMs ?: 0L,
+                    nowElapsedRealtimeMs = nowElapsedRealtimeMs,
+                )
+            val turncoatEvidence = if (tunHealth.healthy && usesTurncoat) {
                 runCatching {
                     readTurncoatRouteEvidence(routeClient)
                 }.onFailure {
@@ -1619,7 +1865,14 @@ class BoxService(
             } else {
                 null
             }
-            val tunHealth = readTunRuntimeHealth()
+            val turncoatCarrierNeedsProof = usesTurncoat && (
+                turncoatEvidence == null ||
+                    !isLiveTurncoatCarrier(
+                        rxProofCount = turncoatEvidence.rx_proof_count,
+                        activeSessions = turncoatEvidence.active_sessions,
+                    )
+            )
+            val requireVpnDataPlane = scheduledVpnDataPlaneProof || turncoatCarrierNeedsProof
             val result = if (!tunHealth.healthy) {
                 RouteHealth(
                     healthy = false,
@@ -1627,18 +1880,33 @@ class BoxService(
                     outboundType = lastSelectedOutboundType,
                     requiresCoreRecovery = true,
                 )
-            } else if (
-                turncoatEvidence != null &&
-                isLiveTurncoatCarrier(
-                    rxProofCount = turncoatEvidence.rx_proof_count,
-                    healthReportCount = turncoatEvidence.health_report_count,
-                    activeSessions = turncoatEvidence.active_sessions,
-                )
-            ) {
+            } else if (requireVpnDataPlane) {
+                runCatching {
+                    checkSelectedRoute(routeClient, requireVpnDataPlane = true)
+                }.getOrElse {
+                    if (it is CancellationException) throw it
+                    RouteHealth(
+                        false,
+                        "VPN data-plane watchdog error: ${it.javaClass.simpleName}",
+                        lastSelectedOutboundType,
+                        requiresCoreRecovery = true,
+                    )
+                }
+            } else if (usesTurncoat && currentProof != null) {
+                val proofAgeMs = (nowElapsedRealtimeMs - currentProof.completedAtElapsedRealtimeMs)
+                    .coerceAtLeast(0L)
                 RouteHealth(
                     true,
-                    "TURNcoat carrier live: active=${turncoatEvidence.active_sessions} " +
-                        "ready=${turncoatEvidence.ready_sessions}",
+                    "recent VPN data-plane proof retained age=${proofAgeMs}ms; " +
+                        "TURNcoat carrier telemetry active=${turncoatEvidence?.active_sessions ?: -1} " +
+                        "ready=${turncoatEvidence?.ready_sessions ?: -1}",
+                )
+            } else if (usesTurncoat) {
+                RouteHealth(
+                    false,
+                    "TURNcoat route has no current VPN data-plane proof",
+                    lastSelectedOutboundType,
+                    requiresCoreRecovery = true,
                 )
             } else {
                 runCatching {
@@ -1734,11 +2002,11 @@ class BoxService(
         }
     }
 
-    private fun routeWatchdogPollDelayMs(): Long = when {
-        routeWatchdogDegraded -> ROUTE_WATCHDOG_DEGRADED_POLL_MS
-        lastSelectedOutboundType.equals("icmp", ignoreCase = true) -> ROUTE_WATCHDOG_ICMP_POLL_MS
-        else -> ROUTE_WATCHDOG_POLL_MS
-    }
+    private fun routeWatchdogPollDelayMs(): Long = selectedRouteWatchdogPollDelayMs(
+        degraded = routeWatchdogDegraded,
+        icmpRoute = lastSelectedOutboundType.equals("icmp", ignoreCase = true),
+        deviceInteractive = Application.powerManager.isInteractive,
+    )
 
     private fun configUsesTurncoat(configPath: String): Boolean {
         if (configPath.isBlank()) return false
@@ -1748,7 +2016,17 @@ class BoxService(
         }.getOrDefault(false)
     }
 
-    private suspend fun checkSelectedRoute(coreClient: CoreClient): RouteHealth {
+    private suspend fun checkSelectedRoute(
+        coreClient: CoreClient,
+        requireVpnDataPlane: Boolean = false,
+        dataPlaneAttemptTimeoutMs: Long? = null,
+    ): RouteHealth {
+        if (requireVpnDataPlane && Settings.serviceMode == ServiceMode.VPN) {
+            val timeoutMs = dataPlaneAttemptTimeoutMs ?: vpnDataPlaneAttemptTimeoutMs(
+                turncoatRoute = configUsesTurncoat(Settings.activeConfigPath),
+            )
+            return checkVpnDataPlaneRoute(timeoutMs)
+        }
         val result = withTimeoutOrNull(ROUTE_WATCHDOG_OPERATION_TIMEOUT_MS) {
             val selected = coreClient.ProbeSelectedRoute().executeBlocking(
                 UrlTestRequest(group_tag = ROUTE_WATCHDOG_GROUP),
@@ -1782,6 +2060,76 @@ class BoxService(
         )
     }
 
+    private suspend fun checkVpnDataPlaneRoute(attemptTimeoutMs: Long): RouteHealth {
+        if (Settings.serviceMode != ServiceMode.VPN) {
+            return RouteHealth(true, "proxy service mode does not use Android TUN", lastSelectedOutboundType)
+        }
+        val proofStartGeneration = currentStartGeneration()
+        val proofNetworkGeneration = networkGeneration
+        val proofTunGeneration = tunGeneration
+        val result = vpnDataPlaneProbe.run(
+            DefaultNetworkMonitor.defaultNetwork,
+            timeoutMs = attemptTimeoutMs,
+        )
+        if (
+            proofStartGeneration != currentStartGeneration() ||
+            proofNetworkGeneration != networkGeneration ||
+            proofTunGeneration != tunGeneration ||
+            !shouldWatchCore(proofStartGeneration)
+        ) {
+            invalidateVpnDataPlaneProof("stale probe generation")
+            return RouteHealth(
+                false,
+                "VPN data-plane proof became stale during network/session transition",
+                lastSelectedOutboundType,
+                requiresCoreRecovery = true,
+            )
+        }
+        if (!result.healthy) {
+            invalidateVpnDataPlaneProof(result.summary)
+            return RouteHealth(
+                false,
+                result.summary,
+                lastSelectedOutboundType,
+                requiresCoreRecovery = true,
+            )
+        }
+        val proofVpnNetworkHandle = result.vpnNetworkHandle
+            ?: return RouteHealth(
+                false,
+                "VPN data-plane proof did not identify its Android Network",
+                lastSelectedOutboundType,
+                requiresCoreRecovery = true,
+            )
+        if (
+            !recordVpnDataPlaneProof(
+                proofStartGeneration,
+                proofNetworkGeneration,
+                proofTunGeneration,
+                proofVpnNetworkHandle,
+            )
+        ) {
+            return RouteHealth(
+                false,
+                "VPN data-plane proof became stale before publication",
+                lastSelectedOutboundType,
+                requiresCoreRecovery = true,
+            )
+        }
+        return RouteHealth(true, result.summary, lastSelectedOutboundType)
+    }
+
+    private fun readTunTrafficSnapshot(health: TunRuntimeHealth): TunTrafficSnapshot? {
+        val interfaceName = health.interfaceName ?: return null
+        val (rxBytes, txBytes) = runCatching {
+            TrafficStats.getRxBytes(interfaceName) to TrafficStats.getTxBytes(interfaceName)
+        }.getOrNull() ?: return null
+        if (rxBytes == TrafficStats.UNSUPPORTED.toLong() || txBytes == TrafficStats.UNSUPPORTED.toLong()) {
+            return null
+        }
+        return TunTrafficSnapshot(interfaceName, rxBytes, txBytes)
+    }
+
     private fun isUsableRouteDelay(delay: Int): Boolean {
         return delay > 0 && delay < ROUTE_WATCHDOG_TIMEOUT_DELAY
     }
@@ -1799,6 +2147,7 @@ class BoxService(
                 reason = "route watchdog recovery: $reason",
                 settleDelayMs = 0L,
                 replaceActive = false,
+                forceTurncoatCarrierRetirement = configUsesTurncoat(Settings.activeConfigPath),
             )
         } else {
             requestCoreRecovery("route watchdog recovery: $reason")
@@ -1812,6 +2161,14 @@ class BoxService(
         val requiresCoreRecovery: Boolean = false,
     )
 
+    private data class VpnDataPlaneProof(
+        val startGeneration: Long,
+        val networkGeneration: Long,
+        val tunGeneration: Long,
+        val vpnNetworkHandle: Long,
+        val completedAtElapsedRealtimeMs: Long,
+    )
+
     private data class TunRuntimeHealth(
         val healthy: Boolean,
         val descriptorValid: Boolean,
@@ -1819,6 +2176,7 @@ class BoxService(
         val ownershipKnown: Boolean,
         val ownedCandidateCount: Int,
         val globalCandidateCount: Int,
+        val interfaceName: String?,
         val summary: String,
     )
 
@@ -1839,6 +2197,7 @@ class BoxService(
                 ownershipKnown = true,
                 ownedCandidateCount = 0,
                 globalCandidateCount = 0,
+                interfaceName = null,
                 summary = "proxy service mode",
             )
         }
@@ -1887,6 +2246,7 @@ class BoxService(
             ownership.known,
             ownedCandidateCount,
             globalCandidateCount,
+            tunnel?.name,
             "Android TUN health: fd_valid=$descriptorValid interface=${tunnel?.name ?: "missing"} " +
                 "up=$interfaceUp mtu=${tunnel?.mtu ?: 0} addresses=${tunnel?.addressCount ?: 0} " +
                 "own_vpn=${ownership.active} owner_known=${ownership.known} " +
@@ -1896,6 +2256,22 @@ class BoxService(
     }
 
     internal fun requireTunCreationPrecondition() {
+        val allowPlatformVpnReplacement = explicitUserVpnStartPending
+        if (
+            shouldRejectNewVpnStart(
+                service,
+                "TUN creation",
+                explicitUserStart = allowPlatformVpnReplacement,
+            )
+        ) {
+            vpnOwnershipRevoked = true
+            mainHandler.post {
+                if (ServiceLifecycleOwnership.isCurrent(serviceOwnerToken)) {
+                    stopForExternalVpn("TUN creation ownership conflict")
+                }
+            }
+            error("android: another VPN is already active")
+        }
         val health = readTunRuntimeHealth()
         if (
             isOwnedTunRuntimeQuiescent(
@@ -1903,6 +2279,7 @@ class BoxService(
                 ownVpnActive = health.ownVpnActive,
                 ownershipKnown = health.ownershipKnown,
                 globalCandidateCount = health.globalCandidateCount,
+                allowPlatformVpnReplacement = allowPlatformVpnReplacement,
             )
         ) {
             return
@@ -1965,8 +2342,23 @@ class BoxService(
         if (!closeCompleted) {
             Log.w(TAG, "Mobile.close did not fully finish during $reason")
         }
+        val platformVpnRetired = if (
+            closeCompleted &&
+            !serviceStopping &&
+            service is VPNService
+        ) {
+            service.retirePlatformVpnSessionAfterCoreStop {
+                !vpnOwnershipRevoked &&
+                    !isExternalVpnActive("core restart VPN retirement")
+            }
+        } else {
+            true
+        }
+        if (!platformVpnRetired) {
+            Log.w(TAG, "Android framework VPN retirement did not finish during $reason")
+        }
         val tunQuiescent = awaitTunRuntimeQuiescence(reason, serviceStopping)
-        return CoreCleanupResult(closeCompleted, tunQuiescent)
+        return CoreCleanupResult(closeCompleted && platformVpnRetired, tunQuiescent)
     }
 
     private suspend fun markRouteDegraded(reason: String) {
@@ -2000,31 +2392,24 @@ class BoxService(
     }
 
     private fun isExternalVpnActive(reason: String): Boolean {
-        val external = isExternalVpnActive(service, reason)
-        if (
-            external &&
-            explicitVpnTakeoverPending
-        ) {
-            Log.i(TAG, "allowing user-initiated Marten VPN takeover during $reason")
-            return false
-        }
-        return external
+        return isExternalVpnActive(service, reason)
     }
 
-    private fun isVpnAuthorizationRevoked(reason: String): Boolean {
-        if (service !is VPNService) return false
-        val revoked = runCatching {
-            android.net.VpnService.prepare(service) != null
-        }.getOrDefault(false)
-        if (revoked) {
-            Log.w(TAG, "Marten VPN authorization is no longer prepared during $reason")
+    private fun shouldYieldToExternalVpn(reason: String): Boolean {
+        val externalVpnActive = isExternalVpnActive(reason)
+        if (
+            externalVpnActive &&
+            explicitUserVpnStartPending &&
+            !vpnOwnershipWasEstablished
+        ) {
+            Log.i(TAG, "allowing one explicit user VPN ownership transfer during $reason")
+            return false
         }
-        return revoked
+        return externalVpnActive
     }
 
     private fun stopForExternalVpn(reason: String) {
         Log.w(TAG, "stopping Marten because Android VPN ownership was lost: $reason")
-        explicitVpnTakeoverPending = false
         stopService(vpnRevoked = true)
     }
 
@@ -2297,7 +2682,7 @@ class BoxService(
                 coreRecoveryAttemptStartedAtElapsed = SystemClock.elapsedRealtime()
                 val configPath = Settings.activeConfigPath
                 if (configPath.isBlank()) return
-                if (isExternalVpnActive("core watchdog recovery")) {
+                if (shouldYieldToExternalVpn("core watchdog recovery")) {
                     stopForExternalVpnOnMain("core watchdog recovery")
                     return
                 }
@@ -2313,6 +2698,7 @@ class BoxService(
                 val prepared = try {
                     MobileCoreLifecycle.run {
                         if (!shouldWatchCore(generation)) return@run false
+                        DefaultNetworkMonitor.clearListener(serviceOwnerToken)
                         runCatching {
                             Mobile.stop()
                         }.onFailure {
@@ -2333,7 +2719,7 @@ class BoxService(
                             return@run false
                         }
                         if (!shouldWatchCore(generation)) return@run false
-                        if (isExternalVpnActive("core watchdog recovery before mobile setup")) {
+                        if (shouldYieldToExternalVpn("core watchdog recovery before mobile setup")) {
                             return@run false
                         }
                         Mobile.setup(
@@ -2363,7 +2749,7 @@ class BoxService(
                         )
                         return
                     }
-                    if (isExternalVpnActive("core watchdog recovery preparation")) {
+                    if (shouldYieldToExternalVpn("core watchdog recovery preparation")) {
                         stopForExternalVpnOnMain("core watchdog recovery preparation")
                         return
                     }
@@ -2371,7 +2757,7 @@ class BoxService(
 
                 val started = if (prepared && shouldWatchCore(generation)) {
                     try {
-                        if (isExternalVpnActive("core watchdog recovery before mobile start")) {
+                        if (shouldYieldToExternalVpn("core watchdog recovery before mobile start")) {
                             stopForExternalVpnOnMain("core watchdog recovery before mobile start")
                             return
                         }
@@ -2397,7 +2783,7 @@ class BoxService(
                         Log.i(TAG, "core watchdog recovery started mobile core after $attempt attempt(s)")
                         return
                     }
-                    Log.w(TAG, "core watchdog recovery route passed without a healthy Android TUN")
+                    Log.w(TAG, "core watchdog recovery did not produce a current healthy Android VPN generation")
                 }
 
                 failedAttempts = attempt
@@ -2433,6 +2819,7 @@ class BoxService(
         runNonCancellableServiceCleanup {
             MobileCoreLifecycle.run {
                 if (!shouldWatchCore(generation)) return@run null
+                DefaultNetworkMonitor.clearListener(serviceOwnerToken)
                 runCatching {
                     Mobile.stop()
                 }.onFailure {
@@ -2448,15 +2835,14 @@ class BoxService(
             Log.i(TAG, "stale service alert ignored: $type")
             return
         }
+        explicitUserVpnStartPending = false
         // This path can run inside a watchdog that it cancels below. Cleanup must still reach
         // Mobile.close() and stopSelf(), otherwise Android keeps a dead VPN network active.
         runNonCancellableServiceCleanup {
             val stopGeneration = cancelPendingStarts()
-            explicitVpnTakeoverPending = false
             Settings.startedByUser = false
             Settings.startCoreAfterStartingService = false
             closedByStopService = true
-            releaseRunningWakeLock()
             stopCoreRuntimeMonitor()
             stopCoreWatchdog()
             stopRouteWatchdog()
@@ -2469,6 +2855,7 @@ class BoxService(
                 ) {
                     return@run null
                 }
+                DefaultNetworkMonitor.clearListener(serviceOwnerToken)
                 runCatching {
                     Mobile.stop()
                 }.onFailure {
@@ -2524,13 +2911,6 @@ class BoxService(
     internal fun onStartCommand(intent: Intent?, flags: Int): Int {
         val connectFromNotification = intent?.action == Action.SERVICE_CONNECT
         val processRecoveryRequested = intent?.action == Action.SERVICE_RECOVER
-        val userInitiatedConnect = intent?.getBooleanExtra(
-            Action.EXTRA_USER_INITIATED,
-            connectFromNotification,
-        ) == true
-        if (userInitiatedConnect) {
-            explicitVpnTakeoverPending = true
-        }
         if (processRecoveryRequested) {
             // AlarmManager delivers recovery through startForegroundService on
             // Android O+. A stale alarm may race a manual Disconnect, but every
@@ -2541,6 +2921,10 @@ class BoxService(
         val restartedBySystem = intent == null ||
             (flags and Service.START_FLAG_REDELIVERY) != 0 ||
             (flags and Service.START_FLAG_RETRY) != 0
+        val explicitUserStartRequested =
+            !restartedBySystem &&
+                !processRecoveryRequested &&
+                intent?.getBooleanExtra(Action.EXTRA_USER_INITIATED, false) == true
         val shouldRestoreUserSession = shouldRestoreUserSessionFromServiceCommand(
             restartedBySystem = restartedBySystem,
             processRecoveryRequested = processRecoveryRequested,
@@ -2549,7 +2933,13 @@ class BoxService(
             activeConfigAvailable = Settings.activeConfigPath.isNotBlank(),
         )
 
-        if (isExternalVpnActive("service start")) {
+        if (
+            shouldRejectNewVpnStart(
+                service,
+                "service start",
+                explicitUserStart = explicitUserStartRequested,
+            )
+        ) {
             Settings.startedByUser = false
             Settings.startCoreAfterStartingService = false
             if (status.value != Status.Stopped) {
@@ -2606,6 +2996,8 @@ class BoxService(
             }
             return Service.START_STICKY
         }
+        explicitUserVpnStartPending =
+            explicitUserStartRequested && Settings.serviceMode == ServiceMode.VPN
         synchronized(fileDescriptorLock) {
             // A bound VpnService instance can survive stopSelf() after a clean
             // Disconnect. Re-open descriptor admission only for this newly
@@ -2662,7 +3054,7 @@ class BoxService(
 
     private suspend fun startStoredCoreFromNativeEntryPoint() {
         val generation = currentStartGeneration()
-        if (isExternalVpnActive("native core start")) {
+        if (shouldYieldToExternalVpn("native core start")) {
             stopForExternalVpnOnMain("native core start")
             return
         }
@@ -2686,25 +3078,13 @@ class BoxService(
                 configPath,
                 "native core start",
                 generation = generation,
-                stopServiceOnRouteFailure = false,
+                stopServiceOnRouteFailure = true,
             )
             if (routeVerified) {
                 markCoreRuntimeStarted(routeVerified = true, generation = generation)
                 return
             }
-
-            val startStillCurrent = Settings.startedByUser &&
-                status.value != Status.Stopping &&
-                status.value != Status.Stopped
-            if (shouldRetryFailedNativeStartup(
-                    routeVerified = false,
-                    userSessionActive = Settings.startedByUser,
-                    startStillCurrent = startStillCurrent,
-                )
-            ) {
-                Log.w(TAG, "native entry-point route is not ready; entering retry recovery")
-                requestCoreRecovery("native entry-point route is not ready", generation)
-            }
+            Log.w(TAG, "native entry-point startup ended after terminal VPN data-plane failure")
         } catch (error: CancellationException) {
             throw error
         } catch (error: Throwable) {
@@ -2756,7 +3136,7 @@ class BoxService(
         } else {
             STARTUP_ROUTE_VERIFY_TIMEOUT_MS
         }
-        val deadline = System.currentTimeMillis() + timeoutMs
+        val deadline = SystemClock.elapsedRealtime() + timeoutMs
         val routeClient = GrpcClientProvider.coreClient(ROUTE_WATCHDOG_GRPC_TIMEOUT_MS)
         var attempt = 0
         var lastSummary = "not checked"
@@ -2764,18 +3144,18 @@ class BoxService(
             lastSelectedOutboundType = "turncoat"
         }
 
-        while (System.currentTimeMillis() < deadline) {
+        while (SystemClock.elapsedRealtime() < deadline) {
             if (generation != null && !shouldContinueStart(generation)) {
                 finishCancelledStart(generation, "startup route verification")
                 return false
             }
-            if (isExternalVpnActive("startup route verification")) {
+            if (shouldYieldToExternalVpn("startup route verification")) {
                 stopForExternalVpnOnMain("startup route verification")
                 return false
             }
             if (underlyingNetworkInitialized && observedUnderlyingNetwork == null) {
                 lastSummary = "waiting for an underlying network"
-                val remainingMs = deadline - System.currentTimeMillis()
+                val remainingMs = deadline - SystemClock.elapsedRealtime()
                 if (remainingMs <= 0L) break
                 delay(minOf(STARTUP_ROUTE_VERIFY_RETRY_MS, remainingMs))
                 continue
@@ -2783,57 +3163,30 @@ class BoxService(
 
             attempt += 1
             val probeNetworkGeneration = networkGeneration
-            if (usesTurncoat) {
-                val current = runCatching {
-                    readTurncoatRouteEvidence(routeClient)
-                }.onFailure {
-                    Log.w(TAG, "failed to read current-generation TURNcoat route evidence", it)
-                }.getOrNull()
-                if (probeNetworkGeneration != networkGeneration) {
-                    lastSummary =
-                        "discarded stale TURNcoat proof from network generation=$probeNetworkGeneration"
-                    Log.w(TAG, "native startup route changed during probe ($reason): $lastSummary")
-                    val remainingMs = deadline - System.currentTimeMillis()
-                    if (remainingMs <= 0L) break
-                    delay(minOf(STARTUP_ROUTE_VERIFY_RETRY_MS, remainingMs))
-                    continue
-                }
-                if (current != null && current.rx_proof_count > 0) {
-                    if (generation != null && !shouldContinueStart(generation)) {
-                        finishCancelledStart(generation, "TURNcoat route evidence")
-                        return false
-                    }
-                    Log.i(TAG, "native startup route verified ($reason): current-generation TURNcoat backend RX proof")
-                    return true
-                }
-                if (
-                    current != null &&
-                    current.health_report_count > 0 &&
-                    current.active_sessions > 0
-                ) {
-                    if (generation != null && !shouldContinueStart(generation)) {
-                        finishCancelledStart(generation, "TURNcoat health evidence")
-                        return false
-                    }
-                    Log.i(
-                        TAG,
-                        "native startup route verified ($reason): current-generation TURNcoat health " +
-                            "active=${current.active_sessions} ready=${current.ready_sessions}",
-                    )
-                    return true
-                }
-            }
+            val remainingBudgetMs = deadline - SystemClock.elapsedRealtime()
+            val attemptTimeoutMs = vpnDataPlaneAttemptTimeoutMs(
+                turncoatRoute = usesTurncoat,
+                remainingBudgetMs = remainingBudgetMs,
+            )
             val result = runCatching {
-                checkSelectedRoute(routeClient)
+                // Carrier telemetry and direct outbound urltest remain useful
+                // diagnostics, but neither proves that Android application
+                // traffic crossed the current TUN. Startup is admitted only
+                // by the real VPN Network GET below.
+                checkSelectedRoute(
+                    routeClient,
+                    requireVpnDataPlane = true,
+                    dataPlaneAttemptTimeoutMs = attemptTimeoutMs,
+                )
             }.getOrElse {
                 if (it is CancellationException) throw it
                 RouteHealth(false, "startup route check error: ${it.message ?: it.javaClass.simpleName}")
             }
             if (probeNetworkGeneration != networkGeneration) {
                 lastSummary =
-                    "discarded stale selected-route proof from network generation=$probeNetworkGeneration"
+                    "discarded stale VPN data-plane proof from network generation=$probeNetworkGeneration"
                 Log.w(TAG, "native startup route changed during probe ($reason): $lastSummary")
-                val remainingMs = deadline - System.currentTimeMillis()
+                val remainingMs = deadline - SystemClock.elapsedRealtime()
                 if (remainingMs <= 0L) break
                 delay(minOf(STARTUP_ROUTE_VERIFY_RETRY_MS, remainingMs))
                 continue
@@ -2851,14 +3204,14 @@ class BoxService(
                 return true
             }
             Log.w(TAG, "native startup route not ready ($reason, attempt $attempt): ${result.summary}")
-            val remainingMs = deadline - System.currentTimeMillis()
+            val remainingMs = deadline - SystemClock.elapsedRealtime()
             if (remainingMs <= 0L) break
             delay(minOf(STARTUP_ROUTE_VERIFY_RETRY_MS, remainingMs))
         }
 
         Log.w(TAG, "native startup route failed ($reason): $lastSummary")
         if (stopServiceOnFailure) {
-            stopAndAlert(Alert.StartService, "selected route failed startup connectivity check: $lastSummary")
+            stopAndAlert(Alert.StartService, "VPN data plane failed startup connectivity check: $lastSummary")
         } else {
             Log.w(TAG, "native startup route will be closed and retried ($reason)")
         }
@@ -2881,6 +3234,7 @@ class BoxService(
         if (activeInstance === this) {
             activeInstance = null
         }
+        explicitUserVpnStartPending = false
         synchronized(fileDescriptorLock) {
             tunDescriptorAdmissionClosed = true
         }
@@ -2893,21 +3247,19 @@ class BoxService(
                 vpnOwnershipWasEstablished &&
                 ownership.known &&
                 !ownership.active
-        val vpnAuthorizationRevoked = isVpnAuthorizationRevoked("service destroy")
         val shouldPreserveUserSession =
             !stopWasRequested &&
                 !externalVpnActive &&
                 !establishedVpnOwnershipLost &&
-                !vpnAuthorizationRevoked &&
+                !vpnOwnershipRevoked &&
                 Settings.startedByUser &&
                 Settings.activeConfigPath.isNotBlank()
-        if (establishedVpnOwnershipLost || vpnAuthorizationRevoked) {
+        if (establishedVpnOwnershipLost || vpnOwnershipRevoked) {
             Log.w(
                 TAG,
                 "service destroy observed lost Marten VPN ownership; sticky restore disabled",
             )
         }
-        releaseRunningWakeLock()
         stopCoreRuntimeMonitor()
         stopCoreWatchdog()
         stopRouteWatchdog()

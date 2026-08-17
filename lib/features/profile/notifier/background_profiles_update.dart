@@ -11,8 +11,11 @@ import 'package:marten/core/device/device_identity.dart';
 import 'package:marten/core/directories/directories_provider.dart';
 import 'package:marten/core/model/environment.dart';
 import 'package:marten/core/preferences/preferences_provider.dart';
+import 'package:marten/features/connection/data/connection_data_providers.dart';
 import 'package:marten/features/profile/data/profile_auto_update_service.dart';
 import 'package:marten/features/profile/data/profile_data_providers.dart';
+import 'package:marten/features/profile/data/subscription_compatibility.dart';
+import 'package:marten/features/profile/notifier/active_profile_notifier.dart';
 import 'package:marten/riverpod_observer.dart';
 import 'package:workmanager/workmanager.dart';
 
@@ -34,6 +37,7 @@ void profilesBackgroundCallbackDispatcher() {
 Future<void> initializeProfilesBackgroundRefresh({required bool debug}) async {
   if (kIsWeb || (!Platform.isAndroid && !Platform.isIOS)) return;
   if (debug) debugPrint('initializing background subscription refresh');
+  await SubscriptionCompatibility.primeAndroidMetadata();
   await Workmanager().initialize(profilesBackgroundCallbackDispatcher);
   await Workmanager().registerPeriodicTask(
     profilesBackgroundRefreshUniqueName,
@@ -62,11 +66,27 @@ Future<bool> _runBackgroundRefresh() async {
     await container.read(profileRepositoryProvider.future);
 
     final results = await container.read(profileAutoUpdateServiceProvider).updateProfiles(validate: false);
-    return !results.any((result) => result.outcome == ProfileAutoUpdateOutcome.failed);
+    final resumeConfigSynchronized = await syncBackgroundNativeResumeConfig(container);
+    return resumeConfigSynchronized && !results.any((result) => result.outcome == ProfileAutoUpdateOutcome.failed);
   } catch (err) {
     debugPrint('background subscription refresh failed (${err.runtimeType})');
     return false;
   } finally {
     container.dispose();
+  }
+}
+
+Future<bool> syncBackgroundNativeResumeConfig(ProviderContainer container) async {
+  if (!Platform.isAndroid) return true;
+  try {
+    final activeProfile = await container.read(activeProfileProvider.future);
+    final result = await container.read(connectionRepositoryProvider).syncNativeResumeConfig(activeProfile).run();
+    return result.match((failure) {
+      debugPrint('background native resume sync failed (${failure.runtimeType})');
+      return false;
+    }, (_) => true);
+  } catch (error) {
+    debugPrint('background native resume sync failed (${error.runtimeType})');
+    return false;
   }
 }

@@ -5,6 +5,7 @@ import 'package:marten/features/captcha/data/captcha_event.dart';
 import 'package:marten/features/captcha/data/captcha_notifier.dart';
 import 'package:marten/features/captcha/widget/captcha_page.dart';
 import 'package:marten/utils/custom_loggers.dart';
+import 'package:marten/utils/platform_utils.dart';
 
 const _captchaAutoRevealDelay = Duration(seconds: 4);
 
@@ -49,6 +50,10 @@ class _CaptchaListenerState extends ConsumerState<CaptchaListener> with InfraLog
         return;
       }
       if (_shouldRunInBackground(next.url)) {
+        if (PlatformUtils.isAndroid) {
+          loggy.info('captcha listener: persistent Android runner owns background challenge');
+          return;
+        }
         if (_backgroundEvent?.url == next.url) {
           loggy.info('captcha listener: background captcha already running, skipping re-open');
           return;
@@ -109,18 +114,28 @@ class _CaptchaListenerState extends ConsumerState<CaptchaListener> with InfraLog
   @override
   Widget build(BuildContext context) {
     final backgroundEvent = _backgroundEvent;
-    if (backgroundEvent == null) return widget.child;
+    if (backgroundEvent == null && !PlatformUtils.isAndroid) return widget.child;
     return Stack(
       children: [
         widget.child,
-        Positioned.fill(
-          child: CaptchaPage(
-            key: ValueKey(backgroundEvent.url),
-            url: backgroundEvent.url,
-            revealDelay: _captchaAutoRevealDelay,
-            background: true,
+        if (PlatformUtils.isAndroid)
+          const Positioned.fill(
+            child: CaptchaPage(
+              key: ValueKey('persistent-android-captcha-runner'),
+              url: 'about:blank',
+              background: true,
+              persistentBackgroundRunner: true,
+            ),
           ),
-        ),
+        if (backgroundEvent != null)
+          Positioned.fill(
+            child: CaptchaPage(
+              key: ValueKey(backgroundEvent.url),
+              url: backgroundEvent.url,
+              revealDelay: _captchaAutoRevealDelay,
+              background: true,
+            ),
+          ),
       ],
     );
   }

@@ -11,6 +11,8 @@ import 'package:marten/core/device/device_identity.dart';
 import 'package:marten/core/http_client/dio_http_client.dart';
 import 'package:marten/features/profile/data/profile_data_mapper.dart';
 import 'package:marten/features/profile/data/profile_refresh_diagnostics.dart';
+import 'package:marten/features/profile/data/subscription_compatibility.dart';
+import 'package:marten/features/profile/data/subscription_content_adapter.dart';
 import 'package:marten/features/profile/model/profile_entity.dart';
 import 'package:marten/features/profile/model/profile_failure.dart';
 import 'package:marten/features/settings/data/config_option_repository.dart';
@@ -46,6 +48,10 @@ class ProfileParser with InfraLogger {
   static const maxExpandedProfileBytes = DioHttpClient.maxResponseBytes;
 
   static const _retryableStatusCodes = {502, 503, 504};
+  static final _unsupportedClientResponsePattern = RegExp(
+    r'(?:приложени[ея].{0,24}не поддерж|app(?:lication)?\s+(?:is\s+)?not supported|unsupported\s+(?:app|application|client)|不支持.{0,12}(?:应用|客户端)|(?:应用|客户端).{0,12}不支持)',
+    caseSensitive: false,
+  );
   static const _supportedOutboundTypes = {
     'direct',
     'block',
@@ -88,6 +94,11 @@ class ProfileParser with InfraLogger {
     'servers',
     'subscription',
   };
+  static const _supportedOutboundExtensionKeys = {
+    'turncoat': {'credential_cache'},
+  };
+  static const _outboundOptionsMetadataKey = 'outbound_options';
+  static const _nonSelectableOutboundTypes = {'direct', 'block', 'dns', 'selector', 'urltest', 'custom', 'turncoat'};
   static const allowedOverrideConfigs = [
     'connection-test-url',
     'direct-dns-address',
@@ -111,6 +122,21 @@ class ProfileParser with InfraLogger {
   final DioHttpClient _httpClient;
 
   ProfileParser({required Ref ref, required DioHttpClient httpClient}) : _ref = ref, _httpClient = httpClient;
+
+  @visibleForTesting
+  static bool isUnsupportedClientSubscription(String content) {
+    final decoded = safeDecodeBase64(content).trim();
+    if (decoded.isEmpty) return false;
+    try {
+      return _unsupportedClientResponsePattern.hasMatch(Uri.decodeFull(decoded));
+    } catch (error) {
+      if (error is FormatException || error is ArgumentError) {
+        return _unsupportedClientResponsePattern.hasMatch(decoded);
+      }
+      rethrow;
+    }
+  }
+
   TaskEither<ProfileFailure, ProfileEntriesCompanion> addLocal({
     required String id,
     required String content,
@@ -225,14 +251,19 @@ class ProfileParser with InfraLogger {
       'X-Marten-Capabilities': 'icmp-v1',
     };
 
-    Future<Response> download(String targetUrl, {String method = 'GET'}) {
+    Future<Response> download(
+      String targetUrl, {
+      String method = 'GET',
+      String? compatibilityUserAgent,
+      Map<String, String> compatibilityHeaders = const {},
+    }) {
       return _httpClient.download(
         targetUrl,
         tempFilePath,
         method: method,
         cancelToken: cancelToken,
-        userAgent: userAgent,
-        extraHeaders: extraHeaders,
+        userAgent: compatibilityUserAgent ?? userAgent,
+        extraHeaders: compatibilityUserAgent == null ? extraHeaders : compatibilityHeaders,
       );
     }
 
@@ -345,11 +376,57 @@ class ProfileParser with InfraLogger {
       loggy.debug('subscription_download phase=exhausted candidate_count=${candidates.length}');
       _throwDownloadFailure(lastError ?? StateError('subscription download failed'));
     }
+    var selectedResponse = rs;
+
+    var rawContent = await File(tempFilePath).readAsString();
+    if (!SubscriptionEnvelope.isEnvelope(rawContent) && isUnsupportedClientSubscription(rawContent)) {
+      var acceptedCompatibilityResponse = false;
+      final compatibilityAttempts = await SubscriptionCompatibility.attempts();
+
+      for (var index = 0; index < compatibilityAttempts.length; index++) {
+        final compatibility = compatibilityAttempts[index];
+        loggy.debug(
+          'subscription_download phase=compatibility_fallback '
+          'attempt=${index + 1} total=${compatibilityAttempts.length}',
+        );
+        try {
+          final candidateResponse = await download(
+            successfulUrl,
+            compatibilityUserAgent: compatibility.userAgent,
+            compatibilityHeaders: compatibility.headers,
+          );
+          final candidateContent = await File(tempFilePath).readAsString();
+          final isEnvelope = SubscriptionEnvelope.isEnvelope(candidateContent);
+          final isUnsupported = isUnsupportedClientSubscription(candidateContent);
+          loggy.info(
+            'subscription_download phase=compatibility_fallback_result '
+            'attempt=${index + 1} bytes=${utf8.encode(candidateContent).length} '
+            'classification=${isEnvelope ? 'envelope' : (isUnsupported ? 'unsupported' : 'compatible')}',
+          );
+          if (isEnvelope || !isUnsupported) {
+            selectedResponse = candidateResponse;
+            rawContent = candidateContent;
+            acceptedCompatibilityResponse = true;
+            break;
+          }
+        } catch (error) {
+          final diagnostic = profileRefreshUnexpectedErrorDiagnostic(error);
+          loggy.info(
+            'subscription_download phase=compatibility_fallback_failure '
+            'attempt=${index + 1} error_type=${diagnostic.errorType} '
+            'runtime_type=${error.runtimeType}',
+          );
+        }
+      }
+
+      if (!acceptedCompatibilityResponse) {
+        throw const ProfileFailure.invalidConfig('subscription server returned no supported client representation');
+      }
+    }
 
     // decrypt envelope if the server sent one
-    final rawContent = await File(tempFilePath).readAsString();
     if (SubscriptionEnvelope.isEnvelope(rawContent)) {
-      final serverDeviceSecret = rs.headers.value('x-device-secret') ?? '';
+      final serverDeviceSecret = selectedResponse.headers.value('x-device-secret') ?? '';
       final plaintext = await SubscriptionEnvelope.decrypt(rawContent, serverDeviceSecret, deviceIdentity.clientSecret);
       await File(tempFilePath).writeAsString(plaintext);
     }
@@ -360,13 +437,18 @@ class ProfileParser with InfraLogger {
       cancelToken: cancelToken ?? CancelToken(),
       ref: _ref,
     );
-    final parsedEndpoints = subscriptionEndpointsFromContent(await File(tempFilePath).readAsString());
+    final expandedContent = await File(tempFilePath).readAsString();
+    final normalizedContent = SubscriptionContentAdapter.normalize(expandedContent);
+    if (normalizedContent != expandedContent) {
+      await File(tempFilePath).writeAsString(normalizedContent, flush: true);
+    }
+    final parsedEndpoints = subscriptionEndpointsFromContent(normalizedContent);
     final fallbackEndpoint = subscriptionEndpointFor(successfulUrl);
     final endpoints = parsedEndpoints.isNotEmpty ? parsedEndpoints : [if (fallbackEndpoint != null) fallbackEndpoint];
     final currentEndpoint = fallbackEndpoint != null && endpoints.contains(fallbackEndpoint)
         ? fallbackEndpoint
         : (endpoints.isNotEmpty ? endpoints.first : fallbackEndpoint);
-    final headers = rs.headers.map.map((key, value) {
+    final headers = selectedResponse.headers.map.map((key, value) {
       if (value.length == 1) return MapEntry(key, value.first);
       return MapEntry(key, value);
     });
@@ -625,7 +707,10 @@ class ProfileParser with InfraLogger {
 
         // Non-URL
         if (!line.startsWith('http://') && !line.startsWith('https://')) {
-          storeResult(currentIndex, line.trim());
+          // Keep structural whitespace intact. Clash YAML (and other
+          // indentation-sensitive formats) becomes invalid if every line is
+          // trimmed while expanding standalone remote include lines.
+          storeResult(currentIndex, line);
           continue;
         }
 
@@ -928,6 +1013,11 @@ class ProfileParser with InfraLogger {
       if (decoded is! Map) return content;
       final config = _sanitizeUnsupportedOutbounds(Map<String, dynamic>.from(decoded));
 
+      // Optional outbound extensions live under subscription metadata so an
+      // older client can discard them before its strict native decoder sees
+      // them. Materialize only fields this client version explicitly knows.
+      _applySupportedOutboundOptions(config);
+
       // These keys are Marten app metadata. sing-box strict-decodes the
       // top-level config and rejects them if they reach the native core.
       for (final key in const ['split_tunnel', 'split_tunneling', 'servers', 'subscription']) {
@@ -944,9 +1034,60 @@ class ProfileParser with InfraLogger {
       final canonical = canonicalJsonContent(content);
       final decoded = jsonDecode(canonical);
       if (decoded is! Map) return canonical;
-      return jsonEncode(_sanitizeUnsupportedOutbounds(Map<String, dynamic>.from(decoded)));
+      final config = Map<String, dynamic>.from(decoded);
+      _moveInlineOutboundOptionsToMetadata(config);
+      return jsonEncode(_sanitizeUnsupportedOutbounds(config));
     } catch (_) {
       return content;
+    }
+  }
+
+  /// Keeps the native parser's canonical sing-box JSON while restoring the
+  /// app-only metadata that was deliberately stripped before validation.
+  ///
+  /// Storing canonical output makes every source format supported by the core
+  /// (Clash YAML, Base64/plain share lists, URI links, and JSON) readable by
+  /// the disconnected Home UI without duplicating all native parsers in Dart.
+  static String restoreMartenSubscriptionMetadata({required String parsedContent, required String sourceContent}) {
+    try {
+      final parsed = decodeJsonContent(parsedContent);
+      if (parsed is! Map) return parsedContent;
+      final result = Map<String, dynamic>.from(parsed);
+      _moveInlineOutboundOptionsToMetadata(result);
+
+      final source = decodeJsonContent(sourceContent);
+      if (source is Map) {
+        for (final key in const ['split_tunnel', 'split_tunneling', 'servers', 'subscription']) {
+          if (source.containsKey(key)) result[key] = source[key];
+        }
+      }
+      // The native parser may have discarded a malformed known outbound.
+      // Re-run metadata cleanup after restoration so app-only server rows and
+      // extension options cannot keep references to entries that did not
+      // survive canonical parsing.
+      return jsonEncode(_sanitizeUnsupportedOutbounds(result));
+    } catch (_) {
+      return parsedContent;
+    }
+  }
+
+  static bool hasSelectableOutbound(String content) {
+    try {
+      final decoded = decodeJsonContent(content);
+      if (decoded is! Map) return false;
+      final outbounds = decoded['outbounds'];
+      if (outbounds is! List) return false;
+      for (final rawOutbound in outbounds) {
+        if (rawOutbound is! Map) continue;
+        final type = rawOutbound['type']?.toString().toLowerCase() ?? '';
+        final tag = rawOutbound['tag']?.toString() ?? '';
+        if (type.isEmpty || !_supportedOutboundTypes.contains(type)) continue;
+        if (_nonSelectableOutboundTypes.contains(type) || tag.contains('§hide§')) continue;
+        return true;
+      }
+      return false;
+    } catch (_) {
+      return false;
     }
   }
 
@@ -956,16 +1097,21 @@ class ProfileParser with InfraLogger {
     if (rawOutbounds is! List) return config;
 
     final removedTags = <String>{};
+    final seenTags = <String>{};
     var outbounds = <Map<String, dynamic>>[];
     for (final rawOutbound in rawOutbounds) {
       if (rawOutbound is! Map) continue;
       final outbound = Map<String, dynamic>.from(rawOutbound);
       final type = outbound['type'];
-      if (type is String && _supportedOutboundTypes.contains(type.toLowerCase())) {
+      final tag = outbound['tag'];
+      final normalizedType = type is String ? type.toLowerCase() : '';
+      if (_supportedOutboundTypes.contains(normalizedType) && tag is String && tag.isNotEmpty && seenTags.add(tag)) {
+        outbound['type'] = normalizedType;
+        removedTags.remove(tag);
         outbounds.add(outbound);
         continue;
       }
-      if (outbound['tag'] case final String tag when tag.isNotEmpty) {
+      if (tag is String && tag.isNotEmpty && !seenTags.contains(tag)) {
         removedTags.add(tag);
       }
     }
@@ -973,33 +1119,42 @@ class ProfileParser with InfraLogger {
     var removedDependency = true;
     while (removedDependency) {
       removedDependency = false;
+      final availableTags = {
+        for (final outbound in outbounds)
+          if (outbound['tag'] case final String tag) tag,
+      };
       final retained = <Map<String, dynamic>>[];
       for (var outbound in outbounds) {
+        final tag = outbound['tag'] as String;
         final detour = outbound['detour'];
-        if (detour is String && removedTags.contains(detour)) {
-          if (outbound['tag'] case final String tag when tag.isNotEmpty) {
-            removedTags.add(tag);
-          }
+        if (detour != null && (detour is! String || (detour.isNotEmpty && !availableTags.contains(detour)))) {
+          removedTags.add(tag);
           removedDependency = true;
           continue;
         }
 
         final type = outbound['type']?.toString().toLowerCase();
         final references = outbound['outbounds'];
-        if ((type == 'selector' || type == 'urltest') && references is List) {
-          final filtered = [
-            for (final reference in references)
-              if (reference is! String || !removedTags.contains(reference)) reference,
-          ];
-          if (references.isNotEmpty && filtered.isEmpty) {
-            if (outbound['tag'] case final String tag when tag.isNotEmpty) {
-              removedTags.add(tag);
-            }
+        if (type == 'selector' || type == 'urltest') {
+          if (references is! List) {
+            removedTags.add(tag);
             removedDependency = true;
             continue;
           }
-          if (filtered.length != references.length) {
+          final filtered = [
+            for (final reference in references)
+              if (reference is String && reference != tag && availableTags.contains(reference)) reference,
+          ];
+          if (filtered.isEmpty) {
+            removedTags.add(tag);
+            removedDependency = true;
+            continue;
+          }
+          final defaultTag = outbound['default'];
+          final removeDefault = type == 'selector' && defaultTag is String && !filtered.contains(defaultTag);
+          if (filtered.length != references.length || removeDefault) {
             outbound = Map<String, dynamic>.from(outbound)..['outbounds'] = filtered;
+            if (removeDefault) outbound.remove('default');
           }
         }
         retained.add(outbound);
@@ -1007,6 +1162,7 @@ class ProfileParser with InfraLogger {
       outbounds = retained;
     }
     config['outbounds'] = outbounds;
+    final retainedTags = {for (final outbound in outbounds) outbound['tag'] as String};
 
     if (!outbounds.any((outbound) => outbound['type']?.toString().toLowerCase() == 'turncoat')) {
       config.remove('providers');
@@ -1014,9 +1170,10 @@ class ProfileParser with InfraLogger {
     if (config['servers'] case final List servers) {
       config['servers'] = [
         for (final server in servers)
-          if (server is! Map || server['tag'] is! String || !removedTags.contains(server['tag'])) server,
+          if (server is Map && retainedTags.contains(server['tag'])) server,
       ];
     }
+    _pruneOutboundOptionsMetadata(config, retainedTags);
     if (config['route'] case final Map route) {
       final sanitizedRoute = Map<String, dynamic>.from(route);
       if (sanitizedRoute['final'] case final String finalTag when removedTags.contains(finalTag)) {
@@ -1041,6 +1198,89 @@ class ProfileParser with InfraLogger {
       config['dns'] = sanitizedDNS;
     }
     return config;
+  }
+
+  static void _moveInlineOutboundOptionsToMetadata(Map<String, dynamic> config) {
+    final rawOutbounds = config['outbounds'];
+    if (rawOutbounds is! List) return;
+
+    final existingSubscription = config['subscription'];
+    final subscription = existingSubscription is Map
+        ? Map<String, dynamic>.from(existingSubscription)
+        : <String, dynamic>{};
+    final existingOptions = subscription[_outboundOptionsMetadataKey];
+    final outboundOptions = existingOptions is Map ? Map<String, dynamic>.from(existingOptions) : <String, dynamic>{};
+    var changed = false;
+
+    final normalizedOutbounds = <dynamic>[];
+    for (final rawOutbound in rawOutbounds) {
+      if (rawOutbound is! Map) {
+        normalizedOutbounds.add(rawOutbound);
+        continue;
+      }
+      final outbound = Map<String, dynamic>.from(rawOutbound);
+      final type = outbound['type']?.toString().toLowerCase() ?? '';
+      final tag = outbound['tag'];
+      final supportedKeys = _supportedOutboundExtensionKeys[type];
+      if (tag is String && tag.isNotEmpty && supportedKeys != null) {
+        final existingForTag = outboundOptions[tag];
+        final optionsForTag = existingForTag is Map ? Map<String, dynamic>.from(existingForTag) : <String, dynamic>{};
+        for (final key in supportedKeys) {
+          if (!outbound.containsKey(key)) continue;
+          optionsForTag.putIfAbsent(key, () => outbound[key]);
+          outbound.remove(key);
+          changed = true;
+        }
+        if (optionsForTag.isNotEmpty) outboundOptions[tag] = optionsForTag;
+      }
+      normalizedOutbounds.add(outbound);
+    }
+
+    if (!changed && existingOptions is! Map) return;
+    subscription[_outboundOptionsMetadataKey] = outboundOptions;
+    config['subscription'] = subscription;
+    config['outbounds'] = normalizedOutbounds;
+  }
+
+  static void _applySupportedOutboundOptions(Map<String, dynamic> config) {
+    final rawOutbounds = config['outbounds'];
+    final subscription = config['subscription'];
+    if (rawOutbounds is! List || subscription is! Map) return;
+    final rawOptions = subscription[_outboundOptionsMetadataKey];
+    if (rawOptions is! Map) return;
+
+    for (final rawOutbound in rawOutbounds) {
+      if (rawOutbound is! Map) continue;
+      final type = rawOutbound['type']?.toString().toLowerCase() ?? '';
+      final tag = rawOutbound['tag'];
+      final supportedKeys = _supportedOutboundExtensionKeys[type];
+      if (tag is! String || supportedKeys == null) continue;
+      final optionsForTag = rawOptions[tag];
+      if (optionsForTag is! Map) continue;
+      for (final key in supportedKeys) {
+        if (optionsForTag.containsKey(key)) rawOutbound[key] = optionsForTag[key];
+      }
+    }
+  }
+
+  static void _pruneOutboundOptionsMetadata(Map<String, dynamic> config, Set<String> retainedTags) {
+    final rawSubscription = config['subscription'];
+    if (rawSubscription is! Map) return;
+    final subscription = Map<String, dynamic>.from(rawSubscription);
+    final rawOptions = subscription[_outboundOptionsMetadataKey];
+    if (rawOptions is! Map) return;
+
+    final filtered = <String, dynamic>{};
+    for (final entry in rawOptions.entries) {
+      final tag = entry.key.toString();
+      if (retainedTags.contains(tag) && entry.value is Map) filtered[tag] = entry.value;
+    }
+    if (filtered.isEmpty) {
+      subscription.remove(_outboundOptionsMetadataKey);
+    } else {
+      subscription[_outboundOptionsMetadataKey] = filtered;
+    }
+    config['subscription'] = subscription;
   }
 
   static dynamic _sanitizeRouteRule(dynamic rawRule, Set<String> removedTags) {
@@ -1073,7 +1313,7 @@ class ProfileParser with InfraLogger {
 
         if (normalizedInput.startsWith('{') || normalizedInput.startsWith('[')) {
           final decoded = jsonDecode(normalizedInput);
-          if (decoded is! Map || decoded['outbounds'] is! List || (decoded['outbounds'] as List).isEmpty) {
+          if (decoded is! Map || !hasSelectableOutbound(normalizedInput)) {
             throw const ProfileFailure.invalidConfig('background subscription update has no outbounds');
           }
           return jsonEncode(decoded);

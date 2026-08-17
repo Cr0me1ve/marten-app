@@ -28,6 +28,45 @@ internal fun shouldAcceptTunFileDescriptor(
         status != Status.Stopping &&
         status != Status.Stopped
 
+/**
+ * Android exposes a single device-wide VPN slot. A fresh Marten generation
+ * must not claim that slot while another VPN may own it unless Android has
+ * just mediated an explicit user transfer through VpnService.prepare(). Exact
+ * ownership of an already-running Marten generation is the other exception.
+ */
+internal fun shouldRejectNewVpnGeneration(
+    vpnMode: Boolean,
+    explicitUserStart: Boolean,
+    currentGenerationOwnsVpn: Boolean,
+    vpnNetworkVisibilityKnown: Boolean,
+    anyVpnNetworkActive: Boolean,
+    externalVpnNetworkActive: Boolean,
+): Boolean {
+    if (!vpnMode) return false
+    // VpnService.prepare() is Android's user-mediated ownership transfer.
+    // Only that one explicit start may replace the currently prepared VPN.
+    if (explicitUserStart) return false
+    if (externalVpnNetworkActive) return true
+    if (currentGenerationOwnsVpn) return false
+    return !vpnNetworkVisibilityKnown || anyVpnNetworkActive
+}
+
+/**
+ * The no-route replacement session is only a manual Marten-disconnect aid.
+ * Re-establishing it after Android revoked Marten would compete with the VPN
+ * that has just taken ownership of the system slot.
+ */
+internal fun shouldRetirePlatformVpnAfterCoreStop(
+    coreStopped: Boolean,
+    vpnService: Boolean,
+    vpnOwnershipRevoked: Boolean,
+    externalVpnActive: Boolean,
+): Boolean =
+    coreStopped &&
+        vpnService &&
+        !vpnOwnershipRevoked &&
+        !externalVpnActive
+
 internal suspend fun requestAuthoritativePlatformStop(
     requestCoreStop: () -> Unit,
     awaitCoreStop: suspend () -> Boolean,

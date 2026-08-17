@@ -20,6 +20,7 @@ import 'package:marten/features/profile/data/profile_data_providers.dart';
 import 'package:marten/features/profile/data/profile_parser.dart';
 import 'package:marten/features/profile/data/profile_repository.dart';
 import 'package:marten/features/profile/model/profile_entity.dart';
+import 'package:marten/features/profile/notifier/background_profiles_update.dart';
 import 'package:marten/riverpod_observer.dart';
 import 'package:marten/utils/custom_loggers.dart';
 import 'package:marten/utils/platform_utils.dart';
@@ -177,6 +178,9 @@ Future<void> _runBackgroundSubscriptionPushRefresh(Map<String, dynamic> data) as
     await container.read(deviceIdentityProvider.future);
     await container.read(profileRepositoryProvider.future);
     await handleSubscriptionRefreshPushDataInContainer(container, data);
+    if (!await syncBackgroundNativeResumeConfig(container)) {
+      throw StateError('background native resume sync failed');
+    }
   } finally {
     container.dispose();
   }

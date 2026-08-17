@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:marten/core/localization/translations.dart';
 import 'package:marten/features/connection/model/connection_failure.dart';
@@ -53,78 +55,53 @@ void main() {
     );
   });
 
-  test('Android-selected-route startup failures should be delegated to native recovery', () async {
+  test('persistent connection status stream does not self-invalidate lifecycle work', () {
+    final source = File('lib/features/connection/notifier/connection_notifier.dart').readAsStringSync();
+
+    expect(source, isNot(contains('ref.watch(coreRestartSignalProvider)')));
+  });
+
+  test('Android-selected-route startup failures are terminal and never delegated to recovery', () async {
     final t = await loadRuTranslations();
     const routeFailure = ConnectionFailure.unexpected('selected route failed startup connectivity check');
-    const coreFailure = ConnectionFailure.unexpected('background core is not started yet');
-    const configFailure = ConnectionFailure.invalidConfig(missingProfileConfigFailureMessage);
 
     expect(
-      shouldDelegateFailedConnectionToAndroidRecovery(
-        isAndroid: true,
-        failure: routeFailure,
-        platformStatus: const CoreStatus.starting(),
-        platformStartedByUser: true,
-        nativeRecoveryInProgress: false,
-      ),
-      isTrue,
-      reason: 'android selected-route failure should be recoverable by native path',
-    );
-    expect(
-      shouldDelegateFailedConnectionToAndroidRecovery(
-        isAndroid: false,
-        failure: routeFailure,
-        platformStatus: const CoreStatus.starting(),
-        platformStartedByUser: true,
-        nativeRecoveryInProgress: false,
-      ),
-      isFalse,
-      reason: 'non-android must not delegate startup route failure to service recovery',
-    );
-    expect(
-      shouldDelegateFailedConnectionToAndroidRecovery(
-        isAndroid: true,
-        failure: coreFailure,
-        platformStatus: const CoreStatus.starting(),
-        platformStartedByUser: true,
-        nativeRecoveryInProgress: false,
-      ),
-      isFalse,
-      reason: 'non-selected-route startup failure should stay in Flutter recovery',
-    );
-    expect(
-      shouldDelegateFailedConnectionToAndroidRecovery(
-        isAndroid: true,
-        failure: configFailure,
-        platformStatus: const CoreStatus.starting(),
-        platformStartedByUser: true,
-        nativeRecoveryInProgress: false,
-      ),
-      isFalse,
-      reason: 'config failures should not be delegated to Android startup recovery',
-    );
-    expect(
-      shouldDelegateFailedConnectionToAndroidRecovery(
-        isAndroid: true,
-        failure: routeFailure,
-        platformStatus: const CoreStatus.started(),
-        platformStartedByUser: true,
-        nativeRecoveryInProgress: false,
-      ),
-      isTrue,
-      reason: 'android selected-route failure should delegate once ownership and a live status are both confirmed',
-    );
-    expect(
-      shouldDelegateFailedConnectionToAndroidRecovery(
-        isAndroid: true,
-        failure: routeFailure,
-        platformStatus: const CoreStatus.starting(),
-        platformStartedByUser: false,
-        nativeRecoveryInProgress: false,
-      ),
-      isFalse,
-      reason: 'android selected-route failure must be started by platform user to delegate',
+      File('lib/features/connection/notifier/connection_notifier.dart').readAsStringSync(),
+      isNot(contains('shouldDelegateFailedConnectionToAndroidRecovery')),
+      reason: 'a failed startup already awaited native Stop/Close and must publish its terminal result',
     );
     expect(routeFailure.present(t).type, 'сервер недоступен');
+  });
+
+  test('owned Android cold attach arms CAPTCHA before existing-session route verification', () {
+    final source = File('lib/features/connection/notifier/connection_notifier.dart').readAsStringSync();
+    final verificationStart = source.indexOf('Future<void> _verifyExistingStartedRoute() async {');
+    final verificationEnd = source.indexOf(
+      '\n  void _scheduleExistingStartedRouteVerificationRetry',
+      verificationStart,
+    );
+    expect(verificationStart, isNonNegative);
+    expect(verificationEnd, greaterThan(verificationStart));
+    final verification = source.substring(verificationStart, verificationEnd);
+
+    final unownedStart = verification.indexOf('if (!ownsSession) {');
+    final routeProof = verification.indexOf('verifyConnectedRoute(holdStartupRouteReady: true)');
+    final captchaArm = verification.indexOf('captchaNotifierProvider.notifier).arm(enabled: true)');
+    final androidGate = verification.lastIndexOf('if (Platform.isAndroid)', captchaArm);
+    expect(unownedStart, isNonNegative);
+    expect(routeProof, isNonNegative);
+    expect(androidGate, greaterThan(unownedStart));
+    expect(androidGate, lessThan(captchaArm));
+    expect(captchaArm, greaterThan(unownedStart));
+    expect(captchaArm, lessThan(routeProof));
+
+    final unownedBranch = verification.substring(unownedStart, captchaArm);
+    expect(unownedBranch, contains('await _disconnect(showError: false)'));
+    expect(unownedBranch, contains('state = const AsyncData(Disconnected())'));
+    expect(unownedBranch, isNot(contains('captchaNotifierProvider.notifier).arm(')));
+
+    final ownedSetup = verification.substring(androidGate, routeProof);
+    expect(ownedSetup, contains('if (Platform.isAndroid)'));
+    expect(ownedSetup, contains('captchaNotifierProvider.notifier).arm(enabled: true)'));
   });
 }

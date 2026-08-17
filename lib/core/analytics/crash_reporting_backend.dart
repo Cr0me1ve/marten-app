@@ -13,6 +13,8 @@ abstract interface class CrashReportingBackend {
 
   Future<void> setCustomKey(String key, Object value);
 
+  Future<void> log(String message);
+
   Future<void> deleteUnsentReports();
 }
 
@@ -43,6 +45,9 @@ class FirebaseCrashReportingBackend implements CrashReportingBackend {
 
   @override
   Future<void> setCustomKey(String key, Object value) => _crashlytics.setCustomKey(key, value);
+
+  @override
+  Future<void> log(String message) => _crashlytics.log(message);
 
   @override
   Future<void> deleteUnsentReports() => _crashlytics.deleteUnsentReports();

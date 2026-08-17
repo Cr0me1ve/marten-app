@@ -1,7 +1,7 @@
 name: marten
 description: Cross-platform multi-protocol network client.
 publish_to: "none"
-version: 0.6.8+608
+version: 0.7.7+707
 
 environment:
   sdk: ^3.10.4
@@ -14,6 +14,8 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  marten_native_resume:
+    path: packages/marten_native_resume
   flutter_localizations:
     sdk: flutter
   intl: ^0.20.2

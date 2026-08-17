@@ -1,4 +1,5 @@
 import 'package:dio/dio.dart';
+import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:loggy/loggy.dart';
 import 'package:marten/core/analytics/analytics_logger.dart';
@@ -19,7 +20,43 @@ void main() {
     expect(reporter.contextSnapshot.single, contains('local diagnostic'));
     expect(backend.collectionEnabled, isEmpty);
     expect(backend.customKeyUpdates, isEmpty);
+    expect(backend.loggedMessages, isEmpty);
     expect(backend.reports, isEmpty);
+  });
+
+  test('enabled privacy-safe reporter redacts and logs each unique context message', () async {
+    final backend = FakeCrashReportingBackend();
+    final reporter = CrashlyticsLoggyIntegration(backend: backend);
+
+    reporter.setContextCollectionEnabled(true);
+    await reporter.enable();
+    reporter.onLog(LogRecord(LogLevel.info, 'user=alice@example.com token=${'a' * 40} ip=203.0.113.5', 'app'));
+    reporter.onLog(
+      LogRecord(
+        LogLevel.error,
+        'expected failure for outbound/icmp[SECRET PROFILE]',
+        'app',
+        StateError('private token should be redacted'),
+      ),
+    );
+    await reporter.recordError(
+      StateError('recorded failure for person@example.com'),
+      StackTrace.fromString('stack with 198.51.100.10'),
+      reason: 'fatal error with token',
+    );
+
+    await reporter.disable();
+
+    expect(backend.loggedMessages.length, greaterThanOrEqualTo(2));
+    expect(backend.loggedMessages.join('\n'), isNot(contains('alice@example.com')));
+    expect(backend.loggedMessages.join('\n'), isNot(contains('a' * 40)));
+    expect(backend.loggedMessages.join('\n'), isNot(contains('203.0.113.5')));
+    expect(backend.loggedMessages.join('\n'), isNot(contains('person@example.com')));
+    expect(backend.loggedMessages.join('\n'), isNot(contains('198.51.100.10')));
+    expect(backend.loggedMessages.join('\n'), isNot(contains('SECRET PROFILE')));
+    expect(backend.customKeys, containsPair('last_logger', 'app'));
+    expect(backend.customKeys, containsPair('last_level', 'Error'));
+    expect(backend.customKeys, containsPair('error_context_records', 2));
   });
 
   test('optionally discards unsent reports before enabling collection', () async {
@@ -90,6 +127,21 @@ void main() {
     expect(nativeContext, contains('context-$crashContextRecordLimit'));
   });
 
+  test('buffers context before enable and seeds it during collection start', () async {
+    final backend = FakeCrashReportingBackend();
+    final reporter = CrashlyticsLoggyIntegration(backend: backend);
+
+    reporter.setContextCollectionEnabled(true);
+    reporter.onLog(LogRecord(LogLevel.info, 'buffered before enable', 'app'));
+    reporter.onLog(LogRecord(LogLevel.warning, 'buffered warning before enable', 'app'));
+    await reporter.enable();
+
+    expect(backend.customKeys['context_00'], contains('buffered before enable'));
+    expect(backend.customKeys['context_01'], contains('buffered warning before enable'));
+
+    await reporter.disable();
+  });
+
   test('redacts sensitive context and crash data before delivery and bounds line length', () async {
     final backend = FakeCrashReportingBackend();
     final reporter = CrashlyticsLoggyIntegration(backend: backend, contextLineLengthLimit: 120);
@@ -150,6 +202,57 @@ void main() {
     );
   });
 
+  test('logs lifecycle transitions as context updates', () async {
+    final backend = FakeCrashReportingBackend();
+    final reporter = CrashlyticsLoggyIntegration(backend: backend);
+
+    reporter.setContextCollectionEnabled(true);
+    await reporter.enable();
+    reporter.didChangeAppLifecycleState(AppLifecycleState.resumed);
+    reporter.didChangeAppLifecycleState(AppLifecycleState.paused);
+
+    await reporter.disable();
+
+    expect(backend.loggedMessages.where((line) => line.contains('[lifecycle]') && line.contains('app=')).length, 2);
+  });
+
+  test('keeps explicit recordError working after enabling', () async {
+    final backend = FakeCrashReportingBackend();
+    final reporter = CrashlyticsLoggyIntegration(backend: backend);
+
+    await reporter.enable();
+    await reporter.recordError(StateError('manual report failure'), StackTrace.current, reason: 'manual');
+
+    await reporter.disable();
+
+    expect(backend.reports, hasLength(1));
+    expect(backend.reports.single.fatal, isFalse);
+    expect(backend.reports.single.reason, contains('manual'));
+  });
+
+  test('treats error-level logs without error objects as context-only for core log lines', () async {
+    final backend = FakeCrashReportingBackend();
+    final reporter = CrashlyticsLoggyIntegration(backend: backend);
+
+    await reporter.enable();
+    reporter.onLog(
+      LogRecord(LogLevel.error, 'verifying startup route outbound/icmp[SECRET PROFILE]', 'MartenCoreService'),
+    );
+    reporter.onLog(LogRecord(LogLevel.error, 'peer(1USf…2wVA) authentication warning', 'raw'));
+    reporter.onLog(LogRecord(LogLevel.info, 'context after core error', 'MartenCoreService'));
+
+    expect(reporter.contextSnapshot.any((line) => line.contains('verifying startup route')), isTrue);
+    expect(
+      reporter.contextSnapshot.any((line) => line.contains('peer(') && line.contains('authentication warning')),
+      isTrue,
+    );
+    expect(reporter.contextSnapshot.any((line) => line.contains('context after core error')), isTrue);
+
+    await reporter.disable();
+
+    expect(backend.reports, isEmpty);
+  });
+
   test('does not create non-fatal events for network or expected failures', () async {
     final backend = FakeCrashReportingBackend();
     final reporter = CrashlyticsLoggyIntegration(backend: backend);
@@ -164,6 +267,34 @@ void main() {
     await reporter.disable();
 
     expect(backend.reports, isEmpty);
+  });
+
+  test('marks layout overflow Flutter errors as non-fatal while keeping general Flutter errors fatal', () async {
+    final backend = FakeCrashReportingBackend();
+    final reporter = CrashlyticsLoggyIntegration(backend: backend);
+
+    await reporter.enable();
+    reporter.onLog(
+      LogRecord(
+        LogLevel.error,
+        'Flutter Error: A RenderFlex overflowed by 24 pixels on the right.',
+        'app',
+        FlutterError('A RenderFlex overflowed by 24 pixels on the right.'),
+      ),
+    );
+    reporter.onLog(
+      LogRecord(
+        LogLevel.error,
+        'Flutter Error: widget build failed for app startup',
+        'app',
+        StateError('startup failure'),
+      ),
+    );
+    await reporter.disable();
+
+    expect(backend.reports, hasLength(2));
+    expect(backend.reports.first.fatal, isFalse);
+    expect(backend.reports.last.fatal, isTrue);
   });
 
   test('classifies controlled Flutter and platform dispatcher errors as fatal', () async {
@@ -224,6 +355,7 @@ class FakeCrashReportingBackend implements CrashReportingBackend {
   final List<bool> collectionEnabled = <bool>[];
   final Map<String, Object> customKeys = <String, Object>{};
   final List<({String key, Object value})> customKeyUpdates = <({String key, Object value})>[];
+  final List<String> loggedMessages = <String>[];
   final List<RecordedCrashReport> reports = <RecordedCrashReport>[];
   final List<String> operations = <String>[];
   int deleteUnsentReportsCalls = 0;
@@ -268,6 +400,13 @@ class FakeCrashReportingBackend implements CrashReportingBackend {
     customKeys[key] = value;
     customKeyUpdates.add((key: key, value: value));
     operations.add('key:$key');
+  }
+
+  @override
+  Future<void> log(String message) async {
+    _throwIfNeeded();
+    loggedMessages.add(message);
+    operations.add('log');
   }
 
   void _throwIfNeeded() {

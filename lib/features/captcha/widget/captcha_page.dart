@@ -3,19 +3,63 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
+import 'package:marten/features/captcha/data/captcha_event.dart';
 import 'package:marten/features/captcha/data/captcha_notifier.dart';
 import 'package:marten/utils/custom_loggers.dart';
 import 'package:marten/utils/platform_utils.dart';
+import 'package:marten_native_resume/marten_native_resume.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:webview_windows/webview_windows.dart' as win_webview;
 
 const _captchaAutomationRevealDelay = Duration(seconds: 30);
 const _captchaAutomationChannel = 'MartenCaptchaAutomation';
 const _captchaWindowsLoadWatchdogDelay = Duration(seconds: 8);
+const _captchaAutomationDiagnosticEvents = <String>{
+  'monitor-installed',
+  'driver-installed',
+  'request-bridge-installed',
+  'fetch-input-normalized',
+  'fetch-request-normalized',
+  'fetch-request-content-preserved',
+  'fetch-normalization-error',
+  'xhr-input-normalized',
+  'check-request-observed',
+  'check-response-received',
+  'check-response-rejected',
+  'check-request-error',
+  'callback-request-observed',
+  'callback-response-accepted',
+  'callback-response-rejected',
+  'callback-request-error',
+  'checkbox-seen',
+  'checkbox-click',
+  'checkbox-checked',
+  'autoclick-scheduled',
+  'autoclick-fired',
+  'autoclick-retry',
+  'autoclick-unconfirmed',
+  'autoclick-error',
+  'autoclick-timeout',
+  'pow-function-absent-compat-ready',
+  'pow-result-missing-wait',
+  'pow-result-error-wait',
+  'pow-result-invalid-wait',
+  'pow-hash-missing-wait',
+  'pow-ready',
+};
+const _captchaAutomationImmediateRevealEvents = <String>{
+  'fetch-normalization-error',
+  'check-response-rejected',
+  'check-request-error',
+  'callback-response-rejected',
+  'callback-request-error',
+  'autoclick-unconfirmed',
+  'autoclick-error',
+  'autoclick-timeout',
+};
 const _captchaAutomationScript = '''
 (function(){
-  if (window.__martenCaptchaAutomationWatchInstalled) return;
-  window.__martenCaptchaAutomationWatchInstalled = true;
+  var retryStorageKey = '__martenCaptchaRetryCountV1';
 
   function post(kind) {
     try { MartenCaptchaAutomation.postMessage(kind); } catch (e) {}
@@ -26,6 +70,246 @@ const _captchaAutomationScript = '''
     } catch (e) {}
   }
 
+  function readRetryCount() {
+    try {
+      return window.sessionStorage.getItem(retryStorageKey) === '1' ? 1 : 0;
+    } catch (e) {
+      return 0;
+    }
+  }
+
+  function writeRetryCount(value) {
+    try {
+      if (value === 1) window.sessionStorage.setItem(retryStorageKey, '1');
+      else window.sessionStorage.removeItem(retryStorageKey);
+    } catch (e) {}
+  }
+
+  function normalizeUrlLike(input) {
+    if (typeof input === 'string') return input;
+    if (!input) return null;
+    try {
+      if (typeof URL === 'function' && input instanceof URL) return input.href;
+    } catch (e) {}
+    try {
+      if (typeof input.href === 'string') return input.href;
+    } catch (e) {}
+    try {
+      if (typeof input.url === 'string') return input.url;
+    } catch (e) {}
+    return null;
+  }
+
+  function requestKindAfterClick(input) {
+    if (!window.__martenCaptchaClickFiredAt) return '';
+    var url = normalizeUrlLike(input);
+    if (!url) return '';
+
+    try {
+      if (new URL(url, window.location.href).pathname === '/local-captcha-result') {
+        return 'callback';
+      }
+    } catch (e) {}
+
+    var detectors = window.__captchaDetectors || [];
+    for (var i = 0; i < detectors.length; i++) {
+      try {
+        if (detectors[i] && typeof detectors[i].match === 'function' && detectors[i].match(url)) {
+          return 'check';
+        }
+      } catch (e) {}
+    }
+    return '';
+  }
+
+  function markRequestAfterClick(input) {
+    var kind = requestKindAfterClick(input);
+    if (kind === 'check' && !window.__martenCaptchaCheckRequestSeen) {
+      window.__martenCaptchaCheckRequestSeen = true;
+      post('check-request-observed');
+    } else if (kind === 'callback' && !window.__martenCaptchaCallbackRequestSeen) {
+      window.__martenCaptchaCallbackRequestSeen = true;
+      post('callback-request-observed');
+    }
+    return kind;
+  }
+
+  function markResponseAfterClick(kind, accepted) {
+    if (!window.__martenCaptchaClickFiredAt || !kind) return;
+    if (kind === 'check') {
+      if (accepted) {
+        post('check-response-received');
+        return;
+      }
+      window.__martenCaptchaCheckRequestFailed = true;
+      post('check-response-rejected');
+      return;
+    }
+    if (accepted) {
+      window.__martenCaptchaCallbackAccepted = true;
+      writeRetryCount(0);
+      post('callback-response-accepted');
+      return;
+    }
+    window.__martenCaptchaCheckRequestFailed = true;
+    post('callback-response-rejected');
+  }
+
+  function markRequestErrorAfterClick(kind) {
+    if (!window.__martenCaptchaClickFiredAt || !kind) return;
+    window.__martenCaptchaCheckRequestFailed = true;
+    post(kind === 'callback' ? 'callback-request-error' : 'check-request-error');
+  }
+
+  function observeFetchResult(result, kind) {
+    if (!kind) return result;
+    return Promise.resolve(result).then(function(response) {
+      markResponseAfterClick(kind, !!response && response.ok === true);
+      return response;
+    }, function(error) {
+      markRequestErrorAfterClick(kind);
+      throw error;
+    });
+  }
+
+  function isRequestLike(input) {
+    if (!input || typeof input !== 'object') return false;
+    try {
+      if (typeof Request === 'function' && input instanceof Request) return true;
+    } catch (e) {}
+    try {
+      return typeof input.url === 'string' &&
+          typeof input.method === 'string' &&
+          typeof input.clone === 'function' &&
+          input.headers != null;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function requestInit(request) {
+    var init = {
+      method: request.method,
+      headers: request.headers,
+      credentials: request.credentials,
+      cache: request.cache,
+      redirect: request.redirect,
+      referrer: request.referrer,
+      referrerPolicy: request.referrerPolicy,
+      integrity: request.integrity,
+      keepalive: request.keepalive,
+      signal: request.signal
+    };
+    // `navigate` is valid on a browser-created Request but cannot be supplied
+    // in RequestInit. Captcha checks use cors/same-origin modes.
+    if (request.mode && request.mode !== 'navigate') init.mode = request.mode;
+    return init;
+  }
+
+  function forwardRequest(previousFetch, receiver, input, suppliedInit) {
+    var effective = suppliedInit === undefined
+        ? input.clone()
+        : new Request(input, suppliedInit);
+    var url = effective.url;
+    var init = requestInit(effective);
+    var method = String(effective.method || 'GET').toUpperCase();
+    post('fetch-request-normalized');
+    if (method === 'GET' || method === 'HEAD' || effective.body == null) {
+      return previousFetch.call(receiver, url, init);
+    }
+    return effective.arrayBuffer().then(function(body) {
+      init.body = body;
+      post('fetch-request-content-preserved');
+      return previousFetch.call(receiver, url, init);
+    }, function(error) {
+      post('fetch-normalization-error');
+      throw error;
+    });
+  }
+
+  function installRequestBridge() {
+    var installed = false;
+    try {
+      var previousFetch = window.fetch;
+      if (typeof previousFetch === 'function' && !previousFetch.__martenCaptchaRequestBridge) {
+        var bridgedFetch = function(input, init) {
+          var kind = markRequestAfterClick(input);
+          try {
+            if (isRequestLike(input)) {
+              return observeFetchResult(forwardRequest(previousFetch, this, input, init), kind);
+            }
+            var normalized = normalizeUrlLike(input);
+            if (typeof input !== 'string' && normalized !== null) {
+              post('fetch-input-normalized');
+              return observeFetchResult(previousFetch.call(this, normalized, init), kind);
+            }
+            return observeFetchResult(previousFetch.apply(this, arguments), kind);
+          } catch (e) {
+            post('fetch-normalization-error');
+            if (kind) markRequestErrorAfterClick(kind);
+            return Promise.reject(e);
+          }
+        };
+        bridgedFetch.__martenCaptchaRequestBridge = true;
+        window.fetch = bridgedFetch;
+        installed = true;
+      }
+    } catch (e) {
+      post('fetch-normalization-error');
+    }
+
+    try {
+      var proto = window.XMLHttpRequest && window.XMLHttpRequest.prototype;
+      if (proto) {
+        var previousOpen = proto.open;
+        if (typeof previousOpen === 'function' && !previousOpen.__martenCaptchaRequestBridge) {
+          var bridgedOpen = function(method, url) {
+            var normalized = normalizeUrlLike(url);
+            this.__martenCaptchaOriginalRequest = normalized;
+            if (typeof url !== 'string' && normalized !== null) {
+              arguments[1] = normalized;
+              post('xhr-input-normalized');
+            }
+            return previousOpen.apply(this, arguments);
+          };
+          bridgedOpen.__martenCaptchaRequestBridge = true;
+          proto.open = bridgedOpen;
+          installed = true;
+        }
+
+        var previousSend = proto.send;
+        if (typeof previousSend === 'function' && !previousSend.__martenCaptchaRequestBridge) {
+          var bridgedSend = function() {
+            var kind = markRequestAfterClick(this.__martenCaptchaOriginalRequest);
+            if (kind && typeof this.addEventListener === 'function') {
+              var xhr = this;
+              this.addEventListener('load', function() {
+                markResponseAfterClick(kind, xhr.status >= 200 && xhr.status < 400);
+              }, {once: true});
+              var onError = function() { markRequestErrorAfterClick(kind); };
+              this.addEventListener('error', onError, {once: true});
+              this.addEventListener('abort', onError, {once: true});
+              this.addEventListener('timeout', onError, {once: true});
+            }
+            return previousSend.apply(this, arguments);
+          };
+          bridgedSend.__martenCaptchaRequestBridge = true;
+          proto.send = bridgedSend;
+          installed = true;
+        }
+      }
+    } catch (e) {
+      post('fetch-normalization-error');
+    }
+
+    if (installed) post('request-bridge-installed');
+  }
+
+  // The local proxy installs its own fetch/XHR wrappers from page JavaScript.
+  // Re-running this function makes our compatibility layer the outer wrapper
+  // regardless of whether it executes before or after the proxy script.
+  installRequestBridge();
+
   function isCheckbox(el) {
     return el && el.tagName === 'INPUT' && String(el.type).toLowerCase() === 'checkbox';
   }
@@ -34,7 +318,10 @@ const _captchaAutomationScript = '''
     if (!isCheckbox(el) || el.__martenCaptchaAutomationWatched) return;
     el.__martenCaptchaAutomationWatched = true;
     post('checkbox-seen');
-    el.addEventListener('click', function(){ post('checkbox-click'); }, true);
+    el.addEventListener('click', function(){
+      window.__martenCaptchaClickFiredAt = Date.now();
+      post('checkbox-click');
+    }, true);
     el.addEventListener('change', function(){
       if (el.checked) post('checkbox-checked');
     }, true);
@@ -49,75 +336,145 @@ const _captchaAutomationScript = '''
     for (var i = 0; i < nodes.length; i++) watch(nodes[i]);
   }
 
-  scan(document);
-  if (window.MutationObserver && document.documentElement) {
-    new MutationObserver(function(mutations) {
-      for (var i = 0; i < mutations.length; i++) {
-        var mutation = mutations[i];
-        if (mutation.type === 'attributes') {
-          watch(mutation.target);
-          if (isCheckbox(mutation.target) && mutation.target.checked) {
-            post('checkbox-checked');
+  if (!window.__martenCaptchaAutomationWatchInstalled) {
+    window.__martenCaptchaAutomationWatchInstalled = true;
+    post('monitor-installed');
+    scan(document);
+    if (window.MutationObserver && document.documentElement) {
+      new MutationObserver(function(mutations) {
+        for (var i = 0; i < mutations.length; i++) {
+          var mutation = mutations[i];
+          if (mutation.type === 'attributes') {
+            watch(mutation.target);
+            if (isCheckbox(mutation.target) && mutation.target.checked) {
+              post('checkbox-checked');
+            }
+            continue;
           }
-          continue;
+          for (var j = 0; j < mutation.addedNodes.length; j++) {
+            scan(mutation.addedNodes[j]);
+          }
         }
-        for (var j = 0; j < mutation.addedNodes.length; j++) {
-          scan(mutation.addedNodes[j]);
-        }
-      }
-    }).observe(document.documentElement, {
-      childList: true,
-      subtree: true,
-      attributes: true,
-      attributeFilter: ['checked', 'type']
-    });
+      }).observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['checked', 'type']
+      });
+    }
   }
 
   if (String(window.location.href).indexOf('blank=1') !== -1 &&
       !window.__martenCaptchaAutoDriveInstalled) {
     window.__martenCaptchaAutoDriveInstalled = true;
+    post('driver-installed');
     var deadline = Date.now() + 30000;
-    var clicked = false;
+    var phase = 'idle';
+    var firedAt = 0;
+    var retries = readRetryCount();
+    var maxRetries = 1;
+    var lastPowDiagnostic = '';
+
+    function powDiagnosticState() {
+      if (typeof performPoW !== 'function') return 'function-absent';
+      if (typeof window.captchaPowResult === 'undefined') return 'result-missing';
+
+      var raw = window.captchaPowResult;
+      if (typeof raw !== 'string' || raw.indexOf('v2.') !== 0) return 'result-invalid';
+      try {
+        var encoded = raw.slice(3).replace(/-/g, '+').replace(/_/g, '/');
+        while (encoded.length % 4 !== 0) encoded += '=';
+        var payload = JSON.parse(atob(encoded));
+        if (payload && payload.error) return 'result-error';
+        if (payload && typeof payload.hash === 'string' && payload.hash.trim() !== '') return 'ready';
+        return 'hash-missing';
+      } catch (e) {
+        return 'result-invalid';
+      }
+    }
+
+    function reportPowDiagnostic(state) {
+      var event;
+      if (state === 'function-absent') event = 'pow-function-absent-compat-ready';
+      else if (state === 'ready') event = 'pow-ready';
+      else event = 'pow-' + state + '-wait';
+      if (event === lastPowDiagnostic) return;
+      lastPowDiagnostic = event;
+      post(event);
+    }
 
     function powReady() {
-      return typeof performPoW !== 'function' || typeof window.captchaPowResult !== 'undefined';
+      var state = powDiagnosticState();
+      reportPowDiagnostic(state);
+      return state === 'function-absent' || state === 'ready';
     }
 
     function attemptAutoClick() {
-      if (clicked) return true;
+      installRequestBridge();
+      if (window.__martenCaptchaCallbackAccepted) {
+        writeRetryCount(0);
+        return true;
+      }
+      if (phase === 'failed') return true;
       if (Date.now() > deadline) {
+        writeRetryCount(0);
         post('autoclick-timeout');
         return true;
       }
       var el = document.getElementById('not-robot-captcha-checkbox') ||
           (document.querySelector ? document.querySelector('input[type="checkbox"]') : null);
-      if (!isCheckbox(el)) return false;
-      watch(el);
-      if (el.checked) {
-        post('checkbox-checked');
-        clicked = true;
+      if (isCheckbox(el)) watch(el);
+
+      if (phase === 'scheduled') return false;
+      if (phase === 'fired' || (isCheckbox(el) && el.checked)) {
+        if (!firedAt) firedAt = window.__martenCaptchaClickFiredAt || Date.now();
+        phase = 'fired';
+        if (!window.__martenCaptchaCheckRequestFailed && Date.now() - firedAt < 6000) return false;
+        if (retries >= maxRetries) {
+          writeRetryCount(0);
+          post('autoclick-unconfirmed');
+          return true;
+        }
+        retries += 1;
+        writeRetryCount(retries);
+        post('autoclick-retry');
+        // A completed check may leave the widget in a terminal internal state
+        // or remove its checkbox. Reload once to obtain a fresh widget and PoW;
+        // sessionStorage keeps this retry bounded across the reload.
+        try {
+          window.location.reload();
+        } catch (e) {
+          writeRetryCount(0);
+          post('autoclick-error');
+        }
         return true;
       }
+      if (!isCheckbox(el)) return false;
       if (!powReady()) return false;
-      clicked = true;
+      phase = 'scheduled';
       post('autoclick-scheduled');
       setTimeout(function() {
         try {
+          installRequestBridge();
           el.focus();
+          firedAt = Date.now();
+          window.__martenCaptchaClickFiredAt = firedAt;
           el.click();
+          phase = 'fired';
           post('autoclick-fired');
         } catch (e) {
+          phase = 'failed';
+          writeRetryCount(0);
           post('autoclick-error');
         }
       }, 400 + Math.random() * 600);
-      return true;
+      return false;
     }
 
-    if (!attemptAutoClick()) {
-      var autoClickInterval = setInterval(function() {
-        if (attemptAutoClick()) clearInterval(autoClickInterval);
-      }, 120);
-    }
+    var autoClickInterval = setInterval(function() {
+      if (attemptAutoClick()) clearInterval(autoClickInterval);
+    }, 120);
+    if (attemptAutoClick()) clearInterval(autoClickInterval);
   }
 })();
 ''';
@@ -130,11 +487,21 @@ const _captchaAutomationScript = '''
 /// simply close the page when the dialer signals `MARTEN_CAPTCHA_DONE` (state
 /// flipping back to null) or when the user dismisses it manually.
 class CaptchaPage extends ConsumerStatefulWidget {
-  const CaptchaPage({super.key, required this.url, this.revealDelay = Duration.zero, this.background = false});
+  const CaptchaPage({
+    super.key,
+    required this.url,
+    this.revealDelay = Duration.zero,
+    this.background = false,
+    this.persistentBackgroundRunner = false,
+  }) : assert(!persistentBackgroundRunner || background);
 
   final String url;
   final Duration revealDelay;
   final bool background;
+
+  /// Keeps one already-mounted Android WebView ready to receive replayable
+  /// CAPTCHA events while Flutter is paused behind another application.
+  final bool persistentBackgroundRunner;
 
   @override
   ConsumerState<CaptchaPage> createState() => _CaptchaPageState();
@@ -144,7 +511,8 @@ class _CaptchaPageState extends ConsumerState<CaptchaPage> with InfraLogger {
   WebViewController? _controller;
   win_webview.WebviewController? _windowsController;
   final List<StreamSubscription<dynamic>> _windowsSubscriptions = [];
-  late final String _resolvedUrl;
+  ProviderSubscription<CaptchaEvent?>? _persistentCaptchaSubscription;
+  String _resolvedUrl = 'about:blank';
   Timer? _revealTimer;
   Timer? _windowsLoadWatchdog;
   bool _loading = true;
@@ -172,24 +540,33 @@ class _CaptchaPageState extends ConsumerState<CaptchaPage> with InfraLogger {
     // explicit IPv4 loopback for mobile WebView only. Windows WebView2 keeps the
     // original localhost origin because TURNcoat's injected captcha JS expects
     // http://localhost:8765 when rewriting proxied requests.
-    _resolvedUrl = _useWindowsWebView
-        ? widget.url
-        : widget.url.replaceFirst(RegExp('^http://localhost:'), 'http://127.0.0.1:');
-    loggy.info('captcha page loading');
+    _resolvedUrl = _resolveUrl(widget.url);
+    loggy.info(
+      'captcha page loading webview=${_useWindowsWebView ? 'windows' : 'mobile'} '
+      'background=${widget.background} delayedReveal=${!_revealed}',
+    );
 
     if (_useWindowsWebView) {
       unawaited(_initWindowsWebView());
       return;
     }
 
-    _controller = WebViewController()
+    final controller = WebViewController();
+    _controller = controller;
+    controller
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
       ..setBackgroundColor(Colors.white)
       ..addJavaScriptChannel(_captchaAutomationChannel, onMessageReceived: _handleAutomationMessage)
       ..setNavigationDelegate(
         NavigationDelegate(
           onPageStarted: (url) {
-            loggy.info('captcha page started');
+            loggy.info('captcha page started background=${widget.background}');
+            // Android may postpone onPageFinished indefinitely when Marten is
+            // behind another app even though the local proxy already returned
+            // the CAPTCHA HTML. Install against the new document as soon as
+            // navigation starts; the script observes later DOM additions and
+            // onPageFinished still re-injects it for WebView/OEM variance.
+            unawaited(_installAutomationMonitor());
             if (mounted) {
               setState(() {
                 _loading = true;
@@ -198,7 +575,7 @@ class _CaptchaPageState extends ConsumerState<CaptchaPage> with InfraLogger {
             }
           },
           onPageFinished: (url) {
-            loggy.info('captcha page finished');
+            loggy.info('captcha page finished background=${widget.background}');
             unawaited(_installAutomationMonitor());
             if (mounted) setState(() => _loading = false);
           },
@@ -208,7 +585,7 @@ class _CaptchaPageState extends ConsumerState<CaptchaPage> with InfraLogger {
             final isMain = error.isForMainFrame ?? false;
             loggy.warning(
               'captcha webview error: code=${error.errorCode} type=${error.errorType} '
-              'mainFrame=$isMain desc=${error.description}',
+              'mainFrame=$isMain',
             );
             if (!isMain || !mounted) return;
             setState(() {
@@ -225,10 +602,24 @@ class _CaptchaPageState extends ConsumerState<CaptchaPage> with InfraLogger {
         ),
       )
       ..loadRequest(Uri.parse(_resolvedUrl));
+
+    if (widget.persistentBackgroundRunner) {
+      _persistentCaptchaSubscription = ref.listenManual<CaptchaEvent?>(captchaNotifierProvider, (previous, next) {
+        final nextUrl = next?.url;
+        if (nextUrl != null && _isBackgroundChallenge(nextUrl)) {
+          unawaited(_loadPersistentBackgroundUrl(nextUrl));
+          return;
+        }
+        if (next == null && _resolvedUrl != 'about:blank') {
+          unawaited(_loadPersistentBackgroundUrl('about:blank'));
+        }
+      }, fireImmediately: true);
+    }
   }
 
   @override
   void dispose() {
+    _persistentCaptchaSubscription?.close();
     _revealTimer?.cancel();
     _windowsLoadWatchdog?.cancel();
     for (final subscription in _windowsSubscriptions) {
@@ -239,6 +630,55 @@ class _CaptchaPageState extends ConsumerState<CaptchaPage> with InfraLogger {
       unawaited(windowsController.dispose());
     }
     super.dispose();
+  }
+
+  String _resolveUrl(String url) {
+    if (_useWindowsWebView) return url;
+    return url.replaceFirst(RegExp('^http://localhost:'), 'http://127.0.0.1:');
+  }
+
+  bool _isBackgroundChallenge(String url) => Uri.tryParse(url)?.queryParameters['blank'] == '1';
+
+  Future<void> _loadPersistentBackgroundUrl(String url) async {
+    final resolvedUrl = _resolveUrl(url);
+    if (_resolvedUrl == resolvedUrl) {
+      loggy.info('captcha persistent runner: challenge already loaded');
+      return;
+    }
+    _resolvedUrl = resolvedUrl;
+    _automationSignalSeen = false;
+    _errorMessage = null;
+    _loading = resolvedUrl != 'about:blank';
+    loggy.info('captcha persistent runner: loading challenge=${resolvedUrl != 'about:blank'}');
+
+    if (PlatformUtils.isAndroid) {
+      var nativeAccepted = false;
+      try {
+        nativeAccepted = resolvedUrl == 'about:blank'
+            ? await MartenNativeResume.clearHeadlessCaptcha()
+            : await MartenNativeResume.loadHeadlessCaptcha(
+                url: resolvedUrl,
+                automationScript: _captchaAutomationScript,
+              );
+        if (!nativeAccepted) loggy.warning('captcha native headless runner rejected navigation');
+      } catch (_) {
+        // The platform error may embed a private challenge URL. Keep the log
+        // fixed and let the still-mounted Flutter WebView remain a foreground
+        // fallback rather than exposing exception contents.
+        loggy.warning('captcha native headless runner navigation failed');
+      }
+      if (nativeAccepted) return;
+    }
+
+    final controller = _controller;
+    if (controller == null || !mounted) return;
+    try {
+      await controller.loadRequest(Uri.parse(resolvedUrl));
+    } catch (_) {
+      // Do not include the platform exception: some WebView implementations
+      // embed the challenge URL in it, and provider URLs are private.
+      loggy.warning('captcha persistent runner navigation failed');
+    }
   }
 
   void _scheduleReveal(Duration delay) {
@@ -262,7 +702,16 @@ class _CaptchaPageState extends ConsumerState<CaptchaPage> with InfraLogger {
   void _handleAutomationSignal(String message) {
     final firstSignal = !_automationSignalSeen;
     _automationSignalSeen = true;
-    loggy.info('captcha automation signal received');
+    final event = _captchaAutomationDiagnosticEvents.contains(message) ? message : 'unknown';
+    loggy.info(
+      'captcha automation event=$event first=$firstSignal '
+      'revealed=$_revealed background=${widget.background}',
+    );
+    if (!_revealed && !widget.background && _captchaAutomationImmediateRevealEvents.contains(event)) {
+      _revealTimer?.cancel();
+      setState(() => _revealed = true);
+      return;
+    }
     if (firstSignal && !_revealed && !widget.background) {
       _scheduleReveal(_captchaAutomationRevealDelay);
     }
@@ -352,6 +801,7 @@ class _CaptchaPageState extends ConsumerState<CaptchaPage> with InfraLogger {
     if (controller == null) return;
     try {
       await controller.runJavaScript(_captchaAutomationScript);
+      loggy.info('captcha automation monitor install completed webview=mobile');
     } catch (error) {
       loggy.warning('captcha automation monitor failed: $error');
     }
@@ -362,6 +812,7 @@ class _CaptchaPageState extends ConsumerState<CaptchaPage> with InfraLogger {
     if (controller == null || !controller.value.isInitialized) return;
     try {
       await controller.executeScript(_captchaAutomationScript);
+      loggy.info('captcha automation monitor install completed webview=windows');
     } catch (error) {
       loggy.warning('captcha windows automation monitor failed: $error');
     }

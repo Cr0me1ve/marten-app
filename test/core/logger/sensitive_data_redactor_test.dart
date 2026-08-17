@@ -133,5 +133,41 @@ void main() {
       expect(redacted, contains('shadowrocket://[redacted-host]/[redacted]'));
       expect(redacted, contains('incy://[redacted-host]/[redacted]'));
     });
+
+    test('redacts outbound tags, peer fingerprints, and startup route profile labels', () {
+      final outbound = SensitiveDataRedactor.redact('outbound/icmp[SECRET PROFILE] failed on startup');
+      final peer = SensitiveDataRedactor.redact('peer(1USf…2wVA) handshake error');
+      final startupRoute = SensitiveDataRedactor.redact('verifying startup route [SECRET PROFILE]');
+
+      expect(outbound, contains('outbound/icmp'));
+      expect(outbound, isNot(contains('SECRET PROFILE')));
+      expect(outbound, contains('[redacted]'));
+      expect(peer, contains('peer('));
+      expect(peer, contains(')'));
+      expect(peer, isNot(contains('1USf…2wVA')));
+      expect(startupRoute, contains('verifying startup route'));
+      expect(startupRoute, isNot(contains('SECRET PROFILE')));
+    });
+
+    test('redacts Xray route labels in tags and taking detour phrases', () {
+      final route = SensitiveDataRedactor.redact('tags [SECRET PROFILE] on route, taking detour [INTERNAL]');
+      final detour = SensitiveDataRedactor.redact('detouring through taking detour [PRODUCTION]');
+      final platformDetour = SensitiveDataRedactor.redact('taking platform initialized detour [PRIVATE LABEL]');
+
+      expect(route, contains('tags [redacted]'));
+      expect(route, contains('taking detour [redacted]'));
+      expect(route, isNot(contains('SECRET PROFILE')));
+      expect(route, isNot(contains('INTERNAL')));
+      expect(detour, contains('taking detour [redacted]'));
+      expect(detour, isNot(contains('PRODUCTION')));
+      expect(platformDetour, contains('taking platform initialized detour [redacted]'));
+      expect(platformDetour, isNot(contains('PRIVATE LABEL')));
+    });
+
+    test('does not re-mask already redacted Xray labels', () {
+      final redacted = SensitiveDataRedactor.redact('tags [redacted] taking detour [redacted]');
+
+      expect(redacted, 'tags [redacted] taking detour [redacted]');
+    });
   });
 }

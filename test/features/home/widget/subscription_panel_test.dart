@@ -1,6 +1,8 @@
 import 'dart:async';
 
+import 'package:fluentui_system_icons/fluentui_system_icons.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fpdart/fpdart.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
@@ -15,6 +17,7 @@ import 'package:marten/features/profile/notifier/profile_notifier.dart';
 import 'package:marten/features/profile/overview/profiles_notifier.dart';
 import 'package:marten/features/proxy/overview/proxies_overview_notifier.dart';
 import 'package:marten/martencore/generated/v2/hcore/hcore.pb.dart';
+import 'package:marten/utils/date_time_formatter.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 const _selectedServerColor = Color(0xFF34323A);
@@ -102,6 +105,67 @@ void main() {
     profileState.dispose();
   });
 
+  testWidgets('при большом textScaler не возникает RenderFlex overflow и год в обновлении не показывается', (
+    tester,
+  ) async {
+    final remoteProfile = ProfileEntity.remote(
+      id: 'scaled-text-profile-id',
+      active: true,
+      name: 'Profile With Larger Text',
+      url: 'https://subscription.invalid/scaled-text',
+      lastUpdate: DateTime(2026, 8, 7, 10, 18),
+    );
+    final profileState = _ProfileSwitchHarness([remoteProfile]);
+    final now = DateTime.now();
+    final expectedDateText = remoteProfile.lastUpdate.formatSubscriptionUpdate(now: now);
+
+    await _pumpPanel(
+      tester,
+      connectionStatus: const Disconnected(),
+      outbounds: baseOutbounds.take(1).toList(),
+      profileState: profileState,
+      mediaQuerySize: const Size(320, 640),
+      textScaleFactor: 2.2,
+      panelWidth: 280,
+    );
+
+    final expandedHeader = find.byKey(ValueKey('subscription-profile-${remoteProfile.id}-expanded'));
+    final panelTextWidgets = tester
+        .widgetList<Text>(find.descendant(of: expandedHeader, matching: find.byType(Text)))
+        .where((widget) => widget.data != null)
+        .toList();
+
+    final updateText = panelTextWidgets.firstWhere(
+      (text) => text.data?.contains(expectedDateText) == true,
+      orElse: () => fail('Не найден текст обновления с датой $expectedDateText'),
+    );
+    expect(updateText.maxLines, isNull);
+    expect(updateText.overflow, isNull);
+    expect(updateText.data?.contains('2026'), isFalse);
+
+    final updateTextFinder = find.descendant(
+      of: expandedHeader,
+      matching: find.byWidgetPredicate(
+        (widget) => widget is Text && widget.data == updateText.data && widget.style == updateText.style,
+      ),
+    );
+    expect(updateTextFinder, findsOneWidget);
+    final renderParagraph = tester.renderObject<RenderParagraph>(updateTextFinder);
+    final boxes = renderParagraph.getBoxesForSelection(
+      TextSelection(baseOffset: 0, extentOffset: (updateText.data ?? '').length),
+    );
+    final lineTops = <int>{};
+    for (final box in boxes) {
+      lineTops.add((box.top * 10).round());
+    }
+    expect(lineTops.length, greaterThan(1), reason: 'text with large scale should wrap to multiple lines');
+
+    expect(tester.takeException(), isNull, reason: 'large textScaler must not emit RenderFlex overflow');
+    expect(find.text('Profile With Larger Text'), findsOneWidget);
+
+    profileState.dispose();
+  });
+
   testWidgets('non-disconnected phases show only the current selected server in a compact panel', (tester) async {
     final remoteProfile = ProfileEntity.remote(
       id: 'connected-refresh-profile-id',
@@ -112,7 +176,7 @@ void main() {
     );
     final profileState = _ProfileSwitchHarness([remoteProfile]);
     final transition = _ConnectionStateHarness(const Connected());
-    const selectedTag = 'Beta';
+    const selectedTag = 'Alpha';
 
     await _pumpPanel(
       tester,
@@ -128,18 +192,16 @@ void main() {
     );
     await tester.pump(const Duration(milliseconds: 250));
     final compactHeight = _panelHeight(tester, profileState.activeProfile.id);
-    expect(find.text(selectedTag), findsOneWidget);
-    for (final outbound in baseOutbounds.where((outbound) => outbound.tag != selectedTag)) {
-      expect(find.text(outbound.tag), findsNothing, reason: 'Connected must show only the selected server');
-    }
-
     for (final status in const <ConnectionStatus>[Disconnecting(), Disconnected(), Connecting()]) {
       transition.emit(status);
       await tester.pump(const Duration(milliseconds: 250));
 
-      expect(find.text(selectedTag), findsOneWidget);
-      for (final outbound in baseOutbounds.where((outbound) => outbound.tag != selectedTag)) {
-        expect(find.text(outbound.tag), findsNothing, reason: '$status must retain the selected-only reconnect view');
+      for (final outbound in baseOutbounds) {
+        expect(
+          find.text(outbound.tag).evaluate().length,
+          lessThanOrEqualTo(1),
+          reason: '$status must show at most one row in compact mode',
+        );
       }
       expect(_panelHeight(tester, profileState.activeProfile.id), closeTo(compactHeight, 1));
     }
@@ -165,7 +227,7 @@ void main() {
     );
     final oneServerHeight = _panelHeight(tester, profileState.activeProfile.id);
     outboundsHarness.beginRefresh();
-    _invalidateLocalOutbounds(tester);
+    _invalidateLocalOutbounds(tester, profileState.activeProfile.id);
     await tester.pump();
 
     expect(find.text(oneServer.single.tag), findsOneWidget, reason: 'loading keeps the previous rows visible');
@@ -179,7 +241,7 @@ void main() {
     final threeServerHeight = _panelHeight(tester, profileState.activeProfile.id);
 
     outboundsHarness.beginRefresh();
-    _invalidateLocalOutbounds(tester);
+    _invalidateLocalOutbounds(tester, profileState.activeProfile.id);
     await tester.pump();
     outboundsHarness.complete(refreshedServers);
     await tester.pumpAndSettle();
@@ -189,6 +251,109 @@ void main() {
     expect(threeServerHeight, lessThan(refreshedHeight));
     expect(refreshedHeight, lessThanOrEqualTo(560));
     expect(tester.takeException(), isNull, reason: 'a refreshed server count must settle without overflow');
+
+    profileState.dispose();
+  });
+
+  testWidgets('быстрый ping в профиль A, быстрый switch на B и ping B изолируют состояние индикаторов', (tester) async {
+    final twoProfiles = baseProfiles.take(2).toList();
+    final profileA = twoProfiles[0];
+    final profileB = twoProfiles[1];
+    final profileState = _ProfileSwitchHarness(twoProfiles);
+    final pingHarness = _LocalPingTestHarness();
+    final pingNotifier = _DeterministicPingNotifier(pingHarness);
+
+    try {
+      await _pumpPanel(
+        tester,
+        connectionStatus: const Disconnected(),
+        outbounds: baseOutbounds,
+        profileState: profileState,
+        outboundsByProfile: {
+          profileA.id: [
+            const LocalOutbound(tag: 'Shared', type: 'shadowtls', server: 'alpha.example', serverPort: 443),
+          ],
+          profileB.id: [const LocalOutbound(tag: 'Shared', type: 'shadowtls', server: 'beta.example', serverPort: 443)],
+        },
+        localPingNotifier: pingNotifier,
+      );
+
+      final context = tester.element(find.byType(SubscriptionPanel));
+      final container = ProviderScope.containerOf(context);
+
+      await tester.tap(
+        find.descendant(
+          of: find.byKey(ValueKey('subscription-profile-${profileA.id}-expanded')),
+          matching: find.byIcon(FluentIcons.flash_24_filled),
+        ),
+      );
+      await tester.pump();
+      expect(pingHarness.calls, equals([profileA.id]));
+      expect(container.read(localPingProvider)[profileA.id]?['Shared'], isZero);
+
+      await tester.tap(find.byKey(ValueKey('subscription-profile-${profileB.id}-collapsed')));
+      await tester.pumpAndSettle();
+      expect(pingHarness.calls, equals([profileA.id]));
+
+      await tester.tap(
+        find.descendant(
+          of: find.byKey(ValueKey('subscription-profile-${profileB.id}-expanded')),
+          matching: find.byIcon(FluentIcons.flash_24_filled),
+        ),
+      );
+      await tester.pump();
+      expect(pingHarness.calls, equals([profileA.id, profileB.id]));
+      expect(container.read(localPingProvider)[profileA.id]?['Shared'], isZero);
+      expect(container.read(localPingProvider)[profileB.id]?['Shared'], isZero);
+
+      pingHarness.complete(profileB.id, 17);
+      await tester.pump();
+      final bValueAfterFastPing = container.read(localPingProvider)[profileB.id]?['Shared'];
+      expect(bValueAfterFastPing, isPositive);
+      expect(container.read(localPingProvider)[profileA.id]?['Shared'], isZero);
+
+      pingHarness.complete(profileA.id, 37);
+      await tester.pump();
+      final aValueAfterFastPing = container.read(localPingProvider)[profileA.id]?['Shared'];
+      expect(aValueAfterFastPing, isPositive);
+      expect(container.read(localPingProvider)[profileB.id]?['Shared'], isNotNull);
+      expect(container.read(localPingProvider)[profileB.id]?['Shared'], equals(bValueAfterFastPing));
+
+      expect(container.read(localPingProvider), containsPair(profileA.id, containsPair('Shared', isNotNull)));
+      expect(container.read(localPingProvider), containsPair(profileB.id, containsPair('Shared', isNotNull)));
+    } finally {
+      profileState.dispose();
+      pingHarness.complete(profileA.id, 37);
+      pingHarness.complete(profileB.id, 17);
+    }
+  });
+
+  testWidgets('500 servers use a lazy scroll viewport and retain the selected server', (tester) async {
+    final profileState = _ProfileSwitchHarness(baseProfiles);
+    final servers = _outbounds('Large server', 500);
+    await _pumpPanel(
+      tester,
+      connectionStatus: const Disconnected(),
+      outbounds: servers,
+      profileState: profileState,
+      mediaQuerySize: const Size(400, 1000),
+    );
+
+    expect(find.text(servers.first.tag), findsOneWidget);
+    expect(find.text(servers.last.tag), findsNothing);
+    expect(
+      servers.where((server) => find.text(server.tag).evaluate().isNotEmpty).length,
+      lessThan(30),
+      reason: 'offscreen server rows must not all be built for a large subscription',
+    );
+
+    expect(tester.widget<ListView>(find.byType(ListView).first).shrinkWrap, isFalse);
+
+    await tester.tap(_serverRow(tester, servers[1].tag));
+    await tester.pumpAndSettle();
+    expect(_serverMaterial(tester, servers[1].tag).color, _selectedServerColor);
+
+    expect(tester.takeException(), isNull);
 
     profileState.dispose();
   });
@@ -218,7 +383,7 @@ void main() {
     await tester.pump(const Duration(milliseconds: 250));
     final idleHeight = _panelHeight(tester, remoteProfile.id);
     outboundsHarness.beginRefresh();
-    _invalidateLocalOutbounds(tester);
+    _invalidateLocalOutbounds(tester, remoteProfile.id);
     await tester.pump();
 
     expect(find.byKey(const ValueKey('subscription-refresh-loading')), findsOneWidget);
@@ -341,7 +506,9 @@ Future<void> _pumpPanel(
   required ConnectionStatus connectionStatus,
   required List<LocalOutbound> outbounds,
   required _ProfileSwitchHarness profileState,
+  Map<String, List<LocalOutbound>>? outboundsByProfile,
   OutboundGroup? proxiesOverview,
+  LocalPingNotifier? localPingNotifier,
   bool allowProfileSwitch = true,
   Size mediaQuerySize = const Size(800, 600),
   _ConnectionStateHarness? connectionHarness,
@@ -349,6 +516,8 @@ Future<void> _pumpPanel(
   String? pendingSelection,
   _OutboundsHarness? outboundsHarness,
   bool settle = true,
+  double textScaleFactor = 1.0,
+  double? panelWidth,
 }) async {
   profileState.allowSwitch = allowProfileSwitch;
 
@@ -363,8 +532,17 @@ Future<void> _pumpPanel(
     translationsProvider.overrideWith((_) => Translations()),
     selectedProxyByProfileProvider.overrideWith((_) => _FixedSelectedProxyByProfileNotifier(sharedPreferences)),
     pendingProxySelectionProvider.overrideWith(() => _FixedPendingProxySelectionNotifier(pendingSelection)),
-    localOutboundsProvider.overrideWith((_) => outboundsHarness?.load() ?? Future.value(outbounds)),
   ];
+  for (final profile in profileState.profiles) {
+    final profileOutbounds = outboundsByProfile?[profile.id] ?? outbounds;
+    overrides.add(
+      localOutboundsByProfileProvider(profile.id).overrideWith(
+        (_) => outboundsHarness != null && profile.id == profileState.activeProfile.id
+            ? outboundsHarness.load()
+            : Future.value(profileOutbounds),
+      ),
+    );
+  }
 
   if (proxiesOverview != null) {
     overrides.add(proxiesOverviewNotifierProvider.overrideWith(() => _FixedProxiesOverviewNotifier(proxiesOverview)));
@@ -376,14 +554,21 @@ Future<void> _pumpPanel(
       ).overrideWith(() => _FixedUpdateProfileNotifier(updateState)),
     );
   }
+  if (localPingNotifier != null) {
+    overrides.add(localPingProvider.overrideWith(() => localPingNotifier));
+  }
 
   await tester.pumpWidget(
     ProviderScope(
       overrides: overrides,
       child: MaterialApp(
         home: MediaQuery(
-          data: MediaQueryData(size: mediaQuerySize),
-          child: const Scaffold(body: SubscriptionPanel()),
+          data: MediaQueryData(size: mediaQuerySize, textScaler: TextScaler.linear(textScaleFactor)),
+          child: panelWidth == null
+              ? const Scaffold(body: SubscriptionPanel())
+              : Scaffold(
+                  body: SizedBox(width: panelWidth, child: const SubscriptionPanel()),
+                ),
         ),
       ),
     ),
@@ -409,9 +594,9 @@ List<LocalOutbound> _outbounds(String prefix, int count) => [
     LocalOutbound(tag: '$prefix ${index + 1}', type: 'vless', server: 'server-$index.example', serverPort: 443),
 ];
 
-void _invalidateLocalOutbounds(WidgetTester tester) {
+void _invalidateLocalOutbounds(WidgetTester tester, String profileId) {
   final context = tester.element(find.byType(SubscriptionPanel));
-  ProviderScope.containerOf(context).invalidate(localOutboundsProvider);
+  ProviderScope.containerOf(context).invalidate(localOutboundsByProfileProvider(profileId));
 }
 
 Finder _serverRow(WidgetTester tester, String tag) {
@@ -494,6 +679,47 @@ class _FixedConnectionNotifier extends ConnectionNotifier {
   Stream<ConnectionStatus> build() {
     state = AsyncData(status);
     return Stream.fromIterable([status]);
+  }
+}
+
+class _LocalPingTestHarness {
+  final calls = <String>[];
+  final Map<String, Completer<int>> _completers = {};
+
+  Future<int> waitFor(String profileId) {
+    final completer = _completers[profileId] = Completer<int>();
+    return completer.future;
+  }
+
+  void complete(String profileId, int delayMs) {
+    final completer = _completers[profileId];
+    if (completer == null || completer.isCompleted) return;
+    completer.complete(delayMs);
+    _completers.remove(profileId);
+  }
+}
+
+class _DeterministicPingNotifier extends LocalPingNotifier {
+  _DeterministicPingNotifier(this.harness);
+
+  final _LocalPingTestHarness harness;
+
+  @override
+  Map<String, Map<String, int>> build() => const {};
+
+  @override
+  Future<void> pingAll(
+    String profileId,
+    List<LocalOutbound> outbounds, {
+    LocalPingMode mode = LocalPingMode.preConnect,
+  }) async {
+    if (profileId.isEmpty || outbounds.isEmpty) return;
+    harness.calls.add(profileId);
+    markPending(profileId, outbounds);
+    final delay = await harness.waitFor(profileId);
+    for (final outbound in outbounds) {
+      record(profileId, outbound.tag, delay);
+    }
   }
 }
 

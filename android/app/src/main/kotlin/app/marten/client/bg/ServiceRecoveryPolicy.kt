@@ -31,13 +31,17 @@ internal fun isOwnedTunRuntimeQuiescent(
     ownVpnActive: Boolean,
     ownershipKnown: Boolean,
     globalCandidateCount: Int,
+    allowPlatformVpnReplacement: Boolean = false,
 ): Boolean =
     !descriptorValid &&
-        if (ownershipKnown) {
-            !ownVpnActive
-        } else {
-            globalCandidateCount == 0
-        }
+        (
+            allowPlatformVpnReplacement ||
+                if (ownershipKnown) {
+                    !ownVpnActive
+                } else {
+                    globalCandidateCount == 0
+                }
+            )
 
 internal fun isTunReleaseCompleteForCleanup(
     descriptorValid: Boolean,
@@ -184,6 +188,5 @@ internal fun shouldRestartProcessForStalledCoreRecovery(
 
 internal fun isLiveTurncoatCarrier(
     rxProofCount: Long,
-    healthReportCount: Long,
     activeSessions: Int,
-): Boolean = activeSessions > 0 && (rxProofCount > 0 || healthReportCount > 0)
+): Boolean = activeSessions > 0 && rxProofCount > 0

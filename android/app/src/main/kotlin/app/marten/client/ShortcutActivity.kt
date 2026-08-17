@@ -53,7 +53,7 @@ class ShortcutActivity : Activity(), ServiceConnection.Callback {
     override fun onServiceStatusChanged(status: Status) {
         when (status) {
             Status.Started -> BoxService.stop()
-            Status.Stopped -> BoxService.connect()
+            Status.Stopped -> startActivity(VpnPermissionActivity.createIntent(this))
             else -> {}
         }
         finish()

@@ -12,6 +12,9 @@ import android.os.PowerManager
 import android.util.Log
 import androidx.core.content.getSystemService
 import app.marten.client.bg.AppChangeReceiver
+import app.marten.client.bg.LocalResolver
+import app.marten.client.crashreporting.NativeCrashDiagnostics
+import app.marten.core.libbox.Libbox
 import go.Seq
 import app.marten.client.Application as BoxApplication
 
@@ -31,6 +34,11 @@ class Application : Application() {
         logStartupPhase("application_on_create_start")
 
         Seq.setContext(this)
+        // The native "local" DNS transport must stay on Android's current
+        // physical Network. Without the platform resolver, a cold VPN start can
+        // send bootstrap resolution for the proxy hostname back into the new
+        // TUN and wait forever for the very outbound it is trying to create.
+        Libbox.registerLocalDNSTransport(LocalResolver)
 
         registerReceiver(AppChangeReceiver(), IntentFilter().apply {
             addAction(Intent.ACTION_PACKAGE_ADDED)
@@ -49,6 +57,7 @@ class Application : Application() {
             val start = processStartElapsedRealtimeMs
             val elapsed = if (start == 0L) 0L else SystemClock.elapsedRealtime() - start
             Log.i(STARTUP_TAG, "startup phase=$phase elapsed_ms=$elapsed")
+            NativeCrashDiagnostics.logPhase("application", phase)
         }
 
         lateinit var application: BoxApplication

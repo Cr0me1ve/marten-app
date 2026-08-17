@@ -179,11 +179,8 @@ class UpdateProfileNotifier extends _$UpdateProfileNotifier with AppLogger {
       if (result.outcome != ProfileAutoUpdateOutcome.updated) return unit;
 
       loggy.info('subscription_refresh outcome=updated source=manual');
-      await ref.read(activeProfileProvider.future).then((active) async {
-        if (active != null && active.id == profile.id) {
-          await ref.read(connectionNotifierProvider.notifier).reconnect(active);
-        }
-      });
+      // The active-profile stream owns reconnect and native Quick Settings
+      // snapshot publication for both manual and automatic refreshes.
       return unit;
     });
 

@@ -4,7 +4,6 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fpdart/fpdart.dart';
 import 'package:marten/features/connection/data/connection_repository.dart';
-import 'package:marten/features/connection/data/turncoat_liveness_notifier.dart';
 import 'package:marten/features/connection/model/connection_failure.dart';
 import 'package:marten/features/connection/model/connection_status.dart';
 import 'package:marten/singbox/model/core_status.dart';
@@ -42,36 +41,68 @@ void main() {
       );
       expect(started, (pending: false, routeReady: null));
     });
+
+    test('Android platform recovery opens the route gate only after its final verified Started event', () {
+      final coldStarting = nativeRecoveryRouteGateTransition(
+        previous: const CoreStatus.stopped(),
+        current: const CoreStatus.starting(),
+        pending: false,
+      );
+      final coldStarted = nativeRecoveryRouteGateTransition(
+        previous: const CoreStatus.starting(),
+        current: const CoreStatus.started(),
+        pending: coldStarting.pending,
+      );
+      expect(coldStarting, (pending: false, routeReady: false));
+      expect(coldStarted, (pending: false, routeReady: null));
+
+      final recoveryStarting = nativeRecoveryRouteGateTransition(
+        previous: const CoreStatus.started(),
+        current: const CoreStatus.starting(),
+        pending: false,
+      );
+      final recoveryStarted = nativeRecoveryRouteGateTransition(
+        previous: const CoreStatus.starting(),
+        current: const CoreStatus.started(),
+        pending: recoveryStarting.pending,
+      );
+      expect(recoveryStarting, (pending: true, routeReady: false));
+      expect(recoveryStarted, (pending: false, routeReady: true));
+
+      final stopping = nativeRecoveryRouteGateTransition(
+        previous: const CoreStatus.started(),
+        current: const CoreStatus.stopping(),
+        pending: false,
+      );
+      final stoppedWithAlert = nativeRecoveryRouteGateTransition(
+        previous: const CoreStatus.started(),
+        current: const CoreStatus.stopped(alert: CoreAlert.startFailed, message: 'route failed'),
+        pending: false,
+      );
+      expect(stopping, (pending: false, routeReady: false));
+      expect(stoppedWithAlert, (pending: false, routeReady: false));
+
+      final source = File('lib/features/connection/data/connection_repository.dart').readAsStringSync();
+      final platformStreamStart = source.indexOf('final platformStatus = singbox');
+      final combineStart = source.indexOf('return Rx.combineLatest3', platformStreamStart);
+      expect(platformStreamStart, isNonNegative);
+      expect(combineStart, greaterThan(platformStreamStart));
+      final platformStream = source.substring(platformStreamStart, combineStart);
+      expect(platformStream, contains('nativeRecoveryRouteGateTransition('));
+      expect(platformStream, contains('previous: _lastObservedPlatformStatus'));
+      expect(RegExp(r'pending:\s*_nativePlatformRecoveryRouteGatePending').hasMatch(platformStream), isTrue);
+    });
   });
 
-  group('platform route gate', () {
-    test('holds the route gate closed while Android starts its route', () {
-      expect(platformRouteGateTransition(current: const CoreStatus.starting(), pending: false), (
-        pending: true,
-        routeReady: false,
-      ));
-    });
-
-    test('opens the route gate only for a fresh platform started event', () {
-      final starting = platformRouteGateTransition(current: const CoreStatus.starting(), pending: false);
-
-      expect(platformRouteGateTransition(current: const CoreStatus.started(), pending: starting.pending), (
-        pending: false,
-        routeReady: true,
-      ));
-    });
-
-    test('does not open the gate for an initially retained platform started event', () {
-      expect(platformRouteGateTransition(current: const CoreStatus.started(), pending: false), (
-        pending: false,
-        routeReady: null,
-      ));
-    });
-
-    test('closes and clears the gate for terminal platform states', () {
-      for (final status in [const CoreStatus.stopping(), const CoreStatus.stopped()]) {
-        expect(platformRouteGateTransition(current: status, pending: true), (pending: false, routeReady: false));
+  group('android route gate', () {
+    test('Starting/Stopping/Stopped close the route gate', () {
+      for (final status in [const CoreStatus.starting(), const CoreStatus.stopping(), const CoreStatus.stopped()]) {
+        expect(androidRouteGateReset(status), isFalse);
       }
+    });
+
+    test('Started never opens the route gate by itself', () {
+      expect(androidRouteGateReset(const CoreStatus.started()), isNull);
     });
 
     test('wires the platform status stream into the connection status gate', () {
@@ -84,7 +115,7 @@ void main() {
       final watch = source.substring(watchStart, watchEnd);
       expect(watch, contains('singbox.watchStatus()'));
       expect(watch, contains('watchPlatformServiceStatus()'));
-      expect(watch, contains('platformRouteGateTransition('));
+      expect(watch, contains('androidRouteGateReset('));
       expect(watch, contains('_startupRouteReadyController.stream'));
     });
   });
@@ -162,96 +193,58 @@ void main() {
       expect(isUsableStartupUrlTestDelay(result?.delay), isFalse);
     });
 
-    test('connected route ping keeps a numeric delay when TURNcoat uses fresh traffic evidence', () {
-      expect(connectedRoutePingDelay(reportedDelay: 42, elapsed: 300), 42);
-      expect(connectedRoutePingDelay(reportedDelay: 65535, elapsed: 287), 287);
-      expect(connectedRoutePingDelay(reportedDelay: null, elapsed: 0), 1);
-    });
+    test('TURNcoat probe and RX evidence are carrier-ready only, never startup route verification', () {
+      final source = File('lib/features/connection/data/connection_repository.dart').readAsStringSync();
 
-    test('accepts TURNcoat startup readiness from live transport state', () {
-      expect(isUsableTurncoatStartupLiveness(const TurncoatLivenessState(inUse: true, live: true)), isTrue);
-      expect(isUsableTurncoatStartupLiveness(const TurncoatLivenessState(inUse: true, timedOut: true)), isFalse);
-      expect(isUsableTurncoatStartupLiveness(const TurncoatLivenessState(inUse: true)), isFalse);
-    });
-
-    test('requires TURNcoat liveness plus active probe or selected route traffic for startup readiness', () {
       expect(
-        isUsableTurncoatStartupRoute(
-          routeVerified: true,
-          liveness: const TurncoatLivenessState(inUse: true, live: true),
-        ),
-        isTrue,
+        source,
+        isNot(contains('StartupRouteVerification.turncoatProbeAndLiveness')),
+        reason: 'a transport carrier is not a selected-route proof',
       );
       expect(
-        isUsableTurncoatStartupRoute(routeVerified: true, liveness: const TurncoatLivenessState(inUse: true)),
-        isFalse,
+        source,
+        isNot(contains('_verifyTurncoatStartupRoute')),
+        reason: 'TURNcoat RX/probe must not run a separate startup route gate',
       );
       expect(
-        isUsableTurncoatStartupRoute(
-          routeVerified: false,
-          liveness: const TurncoatLivenessState(inUse: true, live: true),
-        ),
-        isFalse,
+        source,
+        isNot(contains('isUsableTurncoatStartupRoute')),
+        reason: 'carrier liveness and backend RX must not promote startup readiness',
       );
       expect(
-        isUsableTurncoatStartupRoute(
-          routeVerified: false,
-          liveness: const TurncoatLivenessState(inUse: true, live: true, routeActive: true),
-        ),
-        isTrue,
-      );
-    });
-
-    test('bounds route evidence only after the TURNcoat carrier is live', () {
-      expect(turncoatRouteEvidenceGraceAfterFailedProbe(const TurncoatLivenessState(inUse: true)), isNull);
-      expect(
-        turncoatRouteEvidenceGraceAfterFailedProbe(const TurncoatLivenessState(inUse: true, live: true)),
-        const Duration(seconds: 8),
+        source,
+        isNot(contains('waitForLiveSelectedRouteOrTerminal')),
+        reason: 'selected-route traffic logs are not an Android VPN data-plane proof',
       );
       expect(
-        turncoatRouteEvidenceGraceAfterFailedProbe(
-          const TurncoatLivenessState(inUse: true, live: true, routeActive: true),
-        ),
-        isNull,
+        source,
+        isNot(contains('turncoatRouteEvidenceGraceAfterFailedProbe')),
+        reason: 'carrier/RX grace windows belong only to carrier readiness, never route admission',
+      );
+      expect(
+        source,
+        isNot(contains('waitForFreshRouteActivity')),
+        reason: 'selected-route log activity cannot turn a failed Android VPN proof into success',
+      );
+      expect(
+        source,
+        isNot(contains('isSelectedOutboundActivityLogLine')),
+        reason: 'backend log markers are telemetry, not authoritative route-health evidence',
       );
     });
 
-    test('accepts TURNcoat connected health only from fresh selected route traffic', () {
-      expect(
-        isUsableTurncoatConnectedRoute(
-          previousRouteActivityCount: 2,
-          liveness: const TurncoatLivenessState(inUse: true, live: true, routeActive: true, routeActivityCount: 3),
-        ),
-        isTrue,
-      );
-      expect(
-        isUsableTurncoatConnectedRoute(
-          previousRouteActivityCount: 2,
-          liveness: const TurncoatLivenessState(inUse: true, live: true, routeActive: true, routeActivityCount: 2),
-        ),
-        isFalse,
-      );
-      expect(
-        isUsableTurncoatConnectedRoute(
-          previousRouteActivityCount: 2,
-          liveness: const TurncoatLivenessState(inUse: true, routeActive: true, routeActivityCount: 3),
-        ),
-        isFalse,
-      );
-    });
+    test('Flutter exposes Connected only after Android accepts the data-plane gate', () {
+      final source = File('lib/features/connection/data/connection_repository.dart').readAsStringSync();
+      final connectStart = source.indexOf('TaskEither<ConnectionFailure, Unit> _withPreparedConfig(');
+      final connectEnd = source.indexOf('\n  TaskEither<ConnectionFailure, Unit> _unlessConnectionStale', connectStart);
+      final connect = connectStart < 0 || connectEnd < 0 ? '' : source.substring(connectStart, connectEnd);
 
-    test('uses TURNcoat probe and liveness before endpoint fallback when both are available', () {
-      const endpoint = StartupEndpointProbe(tag: 'US', type: 'vless', server: 'us.example', serverPort: 443);
-
-      expect(
-        startupRouteVerificationFor(usesTurncoat: true, startupEndpoint: endpoint),
-        StartupRouteVerification.turncoatProbeAndLiveness,
-      );
-      expect(
-        startupRouteVerificationFor(usesTurncoat: false, startupEndpoint: endpoint),
-        StartupRouteVerification.endpointFallback,
-      );
-      expect(startupRouteVerificationFor(usesTurncoat: false, startupEndpoint: null), StartupRouteVerification.urlTest);
+      expect(connect, isNotEmpty);
+      final platformAccepted = connect.indexOf('await singbox.notifyBackgroundStarted()');
+      final routeGateOpen = connect.indexOf('_setStartupRouteReady(true)');
+      expect(platformAccepted, isNonNegative);
+      expect(routeGateOpen, greaterThan(platformAccepted));
+      expect(connect, contains('Android VPN data plane did not become ready'));
     });
 
     test('accepts a healthy selected route watchdog result', () {
@@ -344,6 +337,47 @@ void main() {
         ),
       );
     });
+  });
+
+  test('syncNativeResumeConfig writes active profile via native resume bridge and clears missing profiles', () {
+    final source = File('lib/features/connection/data/connection_repository.dart').readAsStringSync();
+    final syncStart = source.indexOf('@override\n  TaskEither<ConnectionFailure, Unit> syncNativeResumeConfig(');
+    final syncEnd = source.indexOf(
+      '\n  @override\n  TaskEither<ConnectionFailure, Unit> verifyConnectedRoute',
+      syncStart,
+    );
+    final sync = syncStart < 0 || syncEnd < 0 ? '' : source.substring(syncStart, syncEnd);
+
+    expect(sync, isNotEmpty);
+    expect(sync, contains('if (!Platform.isAndroid)'));
+    expect(sync, contains('if (activeProfile == null)'));
+    expect(sync, contains('singbox.clearNativeResumeConfig();'));
+    expect(sync, contains('final encFile = profilePathResolver.file(activeProfile.id);'));
+    expect(sync, contains('_stripNativeStartMetadata(decFile);'));
+    expect(sync, contains('singbox.storeNativeResumeConfig('));
+    expect(sync, contains('if (!await encFile.exists())'));
+    expect(sync, contains('await decFile.delete();'));
+  });
+
+  test('syncNativeResumeConfig fail-closed clears a stale native resume config after sync errors', () {
+    final source = File('lib/features/connection/data/connection_repository.dart').readAsStringSync();
+    final syncStart = source.indexOf('@override\n  TaskEither<ConnectionFailure, Unit> syncNativeResumeConfig(');
+    final syncEnd = source.indexOf(
+      '\n  @override\n  TaskEither<ConnectionFailure, Unit> verifyConnectedRoute',
+      syncStart,
+    );
+    final sync = syncStart < 0 || syncEnd < 0 ? '' : source.substring(syncStart, syncEnd);
+    final catchStart = sync.indexOf('} catch (error, stackTrace) {');
+    final clear = sync.indexOf('singbox.clearNativeResumeConfig();');
+    final warning = sync.indexOf('failed to clear stale native resume config after sync failure');
+
+    expect(sync, isNotEmpty);
+    expect(catchStart, isNonNegative);
+    expect(clear, isNonNegative);
+    expect(warning, isNonNegative);
+    final catchBlock = sync.substring(catchStart);
+    expect(catchBlock, contains('if (!_isConnectionStale(generation)) {'));
+    expect(catchBlock, contains('failed to clear stale native resume config after sync failure'));
   });
 
   group('disconnect cleanup', () {
@@ -455,10 +489,15 @@ void main() {
     });
   });
 
-  test('failed startup route is preserved only when Android native recovery is allowed', () {
-    expect(shouldPreserveFailedStartupRouteForNativeRecovery(isAndroid: true, allowNativeRecovery: true), isTrue);
-    expect(shouldPreserveFailedStartupRouteForNativeRecovery(isAndroid: true, allowNativeRecovery: false), isFalse);
-    expect(shouldPreserveFailedStartupRouteForNativeRecovery(isAndroid: false, allowNativeRecovery: true), isFalse);
+  test('startup route verification has only endpoint and url-test cases', () {
+    const endpoint = StartupEndpointProbe(tag: 'US', type: 'vless', server: 'us.example', serverPort: 443);
+
+    expect(startupRouteVerificationFor(startupEndpoint: endpoint), StartupRouteVerification.endpointFallback);
+    expect(startupRouteVerificationFor(startupEndpoint: null), StartupRouteVerification.urlTest);
+    expect(StartupRouteVerification.values, [
+      StartupRouteVerification.endpointFallback,
+      StartupRouteVerification.urlTest,
+    ]);
   });
 
   test('reconnectCoreForPlatform<String> uses Android stop+start ordering', () async {

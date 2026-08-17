@@ -349,6 +349,7 @@ Map<String, String>? redirectHeaders(Map<String, String>? headers, {required boo
     'x-api-key',
     'api-key',
     'x-device-id',
+    'x-hwid',
     'x-client-secret',
   };
   return {

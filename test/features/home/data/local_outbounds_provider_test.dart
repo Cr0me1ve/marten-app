@@ -44,6 +44,341 @@ void main() {
       );
     });
 
+    test('pre-connect native VLESS ping uses tls_ping with explicit SNI', () async {
+      MethodCall? captured;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(methodChannel, (
+        call,
+      ) async {
+        captured = call;
+        return 11;
+      });
+
+      addTearDown(
+        () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(
+          methodChannel,
+          null,
+        ),
+      );
+
+      final result = await nativeTLSHandshakeProbe(
+        '203.0.113.21',
+        443,
+        serverName: 'edge.example',
+        channel: methodChannel,
+        isAndroid: true,
+      );
+
+      expect(captured?.method, 'tls_ping');
+      expect(captured?.arguments, {
+        'host': '203.0.113.21',
+        'port': 443,
+        'serverName': 'edge.example',
+        'allowUntrusted': false,
+        'timeoutMs': 4000,
+      });
+      expect(result, 11);
+    });
+
+    test('native TLS handshake probe uses host as fallback SNI when absent', () async {
+      MethodCall? captured;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(methodChannel, (
+        call,
+      ) async {
+        captured = call;
+        return 17;
+      });
+
+      addTearDown(
+        () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(
+          methodChannel,
+          null,
+        ),
+      );
+
+      final result = await nativeTLSHandshakeProbe('203.0.113.31', 443, channel: methodChannel, isAndroid: true);
+
+      expect(captured?.arguments, {
+        'host': '203.0.113.31',
+        'port': 443,
+        'serverName': '203.0.113.31',
+        'allowUntrusted': false,
+        'timeoutMs': 4000,
+      });
+      expect(captured?.method, 'tls_ping');
+      expect(result, 17);
+    });
+
+    test('pre-connect native TLS probe forwards allowUntrusted from parsed policy', () async {
+      MethodCall? captured;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(methodChannel, (
+        call,
+      ) async {
+        captured = call;
+        return 29;
+      });
+      addTearDown(
+        () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(
+          methodChannel,
+          null,
+        ),
+      );
+
+      Future<void> assertProbe(Map<String, dynamic> raw, bool expectedAllowUntrusted) async {
+        captured = null;
+        final outbound = parseLocalOutbounds(jsonEncode(raw)).single;
+        expect(outbound.tlsProbeAllowsUntrusted, expectedAllowUntrusted);
+
+        final result = await nativeTLSHandshakeProbe(
+          outbound.server,
+          outbound.serverPort,
+          serverName: outbound.tlsServerName,
+          allowUntrusted: outbound.tlsProbeAllowsUntrusted,
+          channel: methodChannel,
+          isAndroid: true,
+        );
+
+        expect(result, 29);
+        expect(captured?.arguments, containsPair('allowUntrusted', expectedAllowUntrusted));
+      }
+
+      await assertProbe({
+        'outbounds': [
+          {
+            'type': 'vless',
+            'tag': 'Trusted',
+            'server': '203.0.113.41',
+            'server_port': 443,
+            'tls': {'server_name': 'vless.example'},
+          },
+        ],
+      }, false);
+      await assertProbe({
+        'outbounds': [
+          {
+            'type': 'vless',
+            'tag': 'Reality',
+            'server': '203.0.113.42',
+            'server_port': 443,
+            'tls': {
+              'reality': {'enabled': true},
+            },
+          },
+        ],
+      }, true);
+      await assertProbe({
+        'outbounds': [
+          {
+            'type': 'xray',
+            'tag': 'XrayReality',
+            'xconfig': {
+              'outbounds': [
+                {
+                  'protocol': 'vless',
+                  'settings': {
+                    'vnext': [
+                      {'address': '203.0.113.43', 'port': 443},
+                    ],
+                  },
+                  'streamSettings': {
+                    'security': 'reality',
+                    'realitySettings': {'serverName': 'reality.example'},
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      }, true);
+      await assertProbe({
+        'outbounds': [
+          {
+            'type': 'xray',
+            'tag': 'XrayInsecure',
+            'xconfig': {
+              'outbounds': [
+                {
+                  'protocol': 'vless',
+                  'settings': {
+                    'servers': [
+                      {'address': '203.0.113.44', 'port': 443},
+                    ],
+                  },
+                  'streamSettings': {
+                    'security': 'tls',
+                    'tlsSettings': {'allowInsecure': true},
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      }, true);
+    });
+
+    test('server-port ping is used for VLESS and Xray outbounds', () {
+      expect(
+        localOutboundUsesServerPortPing(
+          const LocalOutbound(tag: 'VLESS', type: 'vless', server: '203.0.113.21', serverPort: 443),
+        ),
+        isTrue,
+      );
+      expect(
+        localOutboundUsesServerPortPing(
+          const LocalOutbound(tag: 'Xray', type: 'xray', server: '203.0.113.31', serverPort: 443),
+        ),
+        isTrue,
+      );
+    });
+
+    test('TURNcoat pre-connect ping keeps existing tcp/turn path and does not call tls_ping', () async {
+      MethodCall? captured;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(methodChannel, (
+        call,
+      ) async {
+        captured = call;
+        return 19;
+      });
+
+      addTearDown(
+        () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(
+          methodChannel,
+          null,
+        ),
+      );
+
+      final tcpServer = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      tcpServer.listen((socket) => socket.destroy());
+      addTearDown(() async {
+        await tcpServer.close();
+      });
+
+      final container = ProviderContainer();
+      addTearDown(container.dispose);
+      const profileId = 'turncoat-turn-profile';
+
+      final host = InternetAddress.loopbackIPv4.address;
+      await container.read(localPingProvider.notifier).pingAll(profileId, [
+        LocalOutbound(
+          tag: 'TURN',
+          type: 'hysteria2',
+          server: host,
+          serverPort: tcpServer.port,
+          usesTurncoat: true,
+          callUrls: ['http://$host:${tcpServer.port}/'],
+        ),
+      ]);
+
+      expect(captured, isNull);
+      expect(container.read(localPingProvider)[profileId]?['TURN'], isNot(-1));
+    });
+
+    test('runs pingAll for different profiles in parallel with shared tag and global concurrency limit', () async {
+      const profileAId = 'parallel-a';
+      const profileBId = 'parallel-b';
+      const sharedTag = 'Shared';
+      const sharedPath = '/shared';
+      final previousHttpOverrides = HttpOverrides.current;
+
+      HttpOverrides.global = null;
+      final httpServer = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() async {
+        HttpOverrides.global = previousHttpOverrides;
+        await httpServer.close(force: true);
+      });
+
+      var requests = 0;
+      var activeRequests = 0;
+      var maxActiveRequests = 0;
+      const totalRequestsPerProfile = 11;
+
+      httpServer.listen((request) async {
+        requests++;
+        activeRequests += 1;
+        if (activeRequests > maxActiveRequests) {
+          maxActiveRequests = activeRequests;
+        }
+
+        await Future.delayed(const Duration(milliseconds: 200));
+        request.response.statusCode = HttpStatus.ok;
+        request.response.write('{"ok":true}');
+        request.response.close();
+        activeRequests -= 1;
+      });
+
+      final container = ProviderContainer();
+      addTearDown(container.dispose);
+
+      final host = InternetAddress.loopbackIPv4.address;
+      final profileAOutbounds = List.generate(
+        totalRequestsPerProfile,
+        (index) => LocalOutbound(
+          tag: index == 0 ? sharedTag : 'A-$index',
+          type: 'hysteria2',
+          server: host,
+          serverPort: 443,
+          usesTurncoat: true,
+          tunnelPingUrl: 'http://$host:${httpServer.port}$sharedPath?profile=$profileAId-$index',
+          callUrls: ['http://$host:${httpServer.port}$sharedPath?profile=$profileAId-$index'],
+        ),
+      );
+      final profileBOutbounds = List.generate(
+        totalRequestsPerProfile,
+        (index) => LocalOutbound(
+          tag: index == 0 ? sharedTag : 'B-$index',
+          type: 'hysteria2',
+          server: host,
+          serverPort: 443,
+          usesTurncoat: true,
+          tunnelPingUrl: 'http://$host:${httpServer.port}$sharedPath?profile=$profileBId-$index',
+          callUrls: ['http://$host:${httpServer.port}$sharedPath?profile=$profileBId-$index'],
+        ),
+      );
+
+      final profileAPing = container
+          .read(localPingProvider.notifier)
+          .pingAll(profileAId, profileAOutbounds, mode: LocalPingMode.connectedRoute);
+      final profileBPing = container
+          .read(localPingProvider.notifier)
+          .pingAll(profileBId, profileBOutbounds, mode: LocalPingMode.connectedRoute);
+
+      await Future.delayed(const Duration(milliseconds: 100));
+      var attempts = 0;
+      while (requests < totalRequestsPerProfile * 2 && attempts < 20) {
+        await Future.delayed(const Duration(milliseconds: 50));
+        attempts++;
+      }
+      expect(requests, greaterThanOrEqualTo(totalRequestsPerProfile * 2));
+      expect(maxActiveRequests, greaterThan(11));
+      expect(maxActiveRequests, lessThanOrEqualTo(20));
+
+      for (final outbound in profileAOutbounds) {
+        expect(container.read(localPingProvider)[profileAId]?[outbound.tag], isNotNull);
+      }
+      for (final outbound in profileBOutbounds) {
+        expect(container.read(localPingProvider)[profileBId]?[outbound.tag], isNotNull);
+      }
+
+      await profileBPing;
+      for (final outbound in profileBOutbounds) {
+        expect(container.read(localPingProvider)[profileBId]?[outbound.tag], isPositive);
+      }
+      expect(container.read(localPingProvider)[profileAId], isNotNull);
+
+      await profileAPing;
+      final profileAState = container.read(localPingProvider)[profileAId]!;
+      final profileBState = container.read(localPingProvider)[profileBId]!;
+      expect(profileAState.length, profileAOutbounds.length);
+      expect(profileBState.length, profileBOutbounds.length);
+      for (final outbound in profileAOutbounds) {
+        expect(profileAState[outbound.tag], isPositive, reason: 'all ping results for $profileAId should be filled');
+      }
+      for (final outbound in profileBOutbounds) {
+        expect(profileBState[outbound.tag], isPositive, reason: 'all ping results for $profileBId should be filled');
+      }
+      expect(profileAState[sharedTag], isPositive);
+      expect(profileBState[sharedTag], isPositive);
+    });
+
     test('parses visible outbounds in subscription order', () {
       final raw = jsonEncode({
         'servers': [
@@ -151,7 +486,7 @@ void main() {
 
       final outbounds = parseLocalOutbounds(raw);
 
-      expect(outbounds.map((outbound) => outbound.displayName), ['🇦🇱 Beta', '🇺🇸 Alpha']);
+      expect(outbounds.map((outbound) => outbound.displayName), ['Beta', 'Alpha']);
     });
 
     test('keeps selectable outbound tags in subscription order', () {
@@ -269,9 +604,9 @@ void main() {
         tunnelPingUrl: 'http://$host:${httpServer.port}/tunnel/ping',
       );
 
-      await container.read(localPingProvider.notifier).pingAll([outbound]);
+      await container.read(localPingProvider.notifier).pingAll('fallback-profile', [outbound]);
 
-      expect(container.read(localPingProvider)['Fallback'], isNonNegative);
+      expect(container.read(localPingProvider)['fallback-profile']?['Fallback'], isNonNegative);
     });
 
     test('displays legacy Xray VLESS Reality outbounds as vless', () {
@@ -346,6 +681,114 @@ void main() {
       expect(germany.serverPort, 443);
       expect(germany.tlsServerName, 'de-01.example');
       expect(localOutboundUsesServerPortPing(germany), isTrue);
+    });
+
+    test('mixed nested Xray picks endpoint, SNI and trust from first protocol=vless only', () {
+      final cases = [
+        (
+          raw: {
+            'outbounds': [
+              {
+                'type': 'xray',
+                'tag': 'Mixed 1',
+                'xconfig': {
+                  'outbounds': [
+                    {
+                      'protocol': 'trojan',
+                      'settings': {
+                        'servers': [
+                          {'address': 'legacy-outer.example', 'port': 443},
+                        ],
+                      },
+                    },
+                    {
+                      'protocol': 'vless',
+                      'settings': {
+                        'vnext': [
+                          {'address': 'vless-outer.example', 'port': 443},
+                        ],
+                      },
+                      'streamSettings': {
+                        'security': 'tls',
+                        'tlsSettings': {'serverName': 'vless-outer.example'},
+                      },
+                    },
+                    {
+                      'protocol': 'vless',
+                      'settings': {
+                        'vnext': [
+                          {'address': 'vless-inner.example', 'port': 443},
+                        ],
+                      },
+                      'streamSettings': {
+                        'security': 'reality',
+                        'realitySettings': {'publicKey': 'AAAA'},
+                      },
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+          expectedServer: 'vless-outer.example',
+          expectedSni: 'vless-outer.example',
+          expectedAllowUntrusted: false,
+        ),
+        (
+          raw: {
+            'outbounds': [
+              {
+                'type': 'xray',
+                'tag': 'Mixed 2',
+                'xconfig': {
+                  'outbounds': [
+                    {
+                      'protocol': 'vless',
+                      'settings': {
+                        'vnext': [
+                          {'address': 'vless-primary.example', 'port': 443},
+                        ],
+                      },
+                      'streamSettings': {
+                        'security': 'tls',
+                        'tlsSettings': {'serverName': 'vless-primary.example'},
+                      },
+                    },
+                    {
+                      'protocol': 'vless',
+                      'settings': {
+                        'vnext': [
+                          {'address': 'vless-reality.example', 'port': 443},
+                        ],
+                      },
+                      'streamSettings': {
+                        'security': 'reality',
+                        'realitySettings': {'publicKey': 'BBBB'},
+                      },
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+          expectedServer: 'vless-primary.example',
+          expectedSni: 'vless-primary.example',
+          expectedAllowUntrusted: false,
+        ),
+      ];
+
+      for (final testCase in cases) {
+        final firstOutbound = (testCase.raw['outbounds'] as List).first as Map<String, Object>;
+        final String tag = firstOutbound['tag'] as String;
+        final raw = jsonEncode(testCase.raw);
+        final outbounds = parseLocalOutbounds(raw);
+        final outbound = outbounds.singleWhere((outbound) => outbound.tag == tag);
+
+        expect(outbound.server, testCase.expectedServer);
+        expect(outbound.tlsServerName, testCase.expectedSni);
+        expect(outbound.tlsProbeAllowsUntrusted, testCase.expectedAllowUntrusted);
+        expect(localOutboundUsesServerPortPing(outbound), isTrue);
+      }
     });
 
     test('normalizes live Xray VLESS protocol labels as vless', () {
@@ -437,9 +880,11 @@ void main() {
           usesTurncoat: true,
         );
 
-        await container.read(localPingProvider.notifier).pingAll([outbound], mode: LocalPingMode.connectedRoute);
+        await container.read(localPingProvider.notifier).pingAll('connected-turn-route-profile', [
+          outbound,
+        ], mode: LocalPingMode.connectedRoute);
         expect(tunnelPingRequests, 1);
-        expect(container.read(localPingProvider)['Turn'], isNonNegative);
+        expect(container.read(localPingProvider)['connected-turn-route-profile']?['Turn'], isNonNegative);
       } finally {
         container.dispose();
         await httpServer.close(force: true);
@@ -473,12 +918,15 @@ void main() {
       final container = ProviderContainer();
       addTearDown(container.dispose);
       const outbound = LocalOutbound(tag: 'Turn', type: 'hysteria2', server: '', serverPort: 0);
+      const profileId = 'explicit-connected-profile';
 
       container.read(localPingProvider.notifier)
-        ..markPending([outbound])
-        ..record(outbound.tag, 287);
+        ..markPending(profileId, [outbound])
+        ..record(profileId, outbound.tag, 287);
 
-      expect(container.read(localPingProvider), {'Turn': 287});
+      expect(container.read(localPingProvider), {
+        profileId: {'Turn': 287},
+      });
     });
 
     test('resolves pending, remembered, then first sorted tag', () {

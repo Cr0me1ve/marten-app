@@ -18,9 +18,20 @@ const String _captchaMarker = 'MARTEN_TURNCOAT_CAPTCHA';
 /// `LogTurncoatCaptchaResolvedMarker` in marten-core.
 const String _captchaDoneMarker = 'MARTEN_TURNCOAT_CAPTCHA_DONE';
 
+/// Terminal marker for an explicitly rejected or timed-out captcha attempt.
+/// It must be checked before [_captchaMarker] because the failed marker shares
+/// that prefix. TURNcoat may emit a fresh request immediately after it rotates
+/// provider app credentials.
+const String _captchaFailedMarker = 'MARTEN_TURNCOAT_CAPTCHA_FAILED';
+
 /// Local origin the TURNcoat dialer always uses for its captcha HTTP server.
 /// Kept in sync with `captchaListenPort` in `TURNcoat/dialer/manual_captcha.go`.
 const String _captchaLocalOrigin = 'http://localhost:8765';
+
+/// TURNcoat cancels one manual CAPTCHA attempt after 60 seconds. A request
+/// observed while the connection flow is arming is therefore safe to replay
+/// only inside that same bounded window.
+const Duration _deferredCaptchaMaxAge = Duration(seconds: 65);
 
 /// Watches the marten-core log stream for captcha events and exposes them as
 /// a single-shot state for the UI to react to.
@@ -33,6 +44,7 @@ class CaptchaNotifier extends _$CaptchaNotifier with InfraLogger {
   StreamSubscription<List<pb.LogMessage>>? _subscription;
   bool _armed = false;
   pb.LogMessage? _lastProcessedLog;
+  CaptchaEvent? _deferredEvent;
 
   @override
   CaptchaEvent? build() {
@@ -55,30 +67,48 @@ class CaptchaNotifier extends _$CaptchaNotifier with InfraLogger {
     final start = _nextLogStartIndex(events);
     String? url;
     var done = false;
+    var failed = false;
     for (var i = start; i < events.length; i++) {
       final msg = events[i];
       _lastProcessedLog = msg;
-      if (!_armed) continue;
       final candidate = _classify(msg.message);
       if (candidate == null) continue;
-      loggy.info('captcha candidate: done=${candidate.done} hasUrl=${candidate.url != null}');
+      loggy.info(
+        'captcha candidate: done=${candidate.done} failed=${candidate.failed} '
+        'hasUrl=${candidate.url != null}',
+      );
+      if (!_armed) {
+        if (candidate.done) {
+          _deferredEvent = null;
+        } else if (candidate.url != null) {
+          _deferredEvent = CaptchaEvent(url: candidate.url!, createdAt: DateTime.now());
+          loggy.info('captcha request deferred until watcher is armed');
+        }
+        continue;
+      }
       if (candidate.done) {
         done = true;
+        failed = candidate.failed;
         url = null;
       } else if (candidate.url != null) {
         url = candidate.url;
         done = false;
+        failed = false;
       }
     }
     if (done) {
+      loggy.info(
+        'captcha terminal event=${failed ? 'failed' : 'resolved'} '
+        'pending=${state != null}',
+      );
       if (state != null) {
-        loggy.info('captcha resolved; dismissing pending event');
+        loggy.info('captcha terminal; dismissing pending event');
         state = null;
       }
       return;
     }
     if (url != null && url != state?.url) {
-      loggy.info('captcha requested');
+      loggy.info('captcha terminal event=request stateChanged=true');
       state = CaptchaEvent(url: url, createdAt: DateTime.now());
     }
   }
@@ -97,6 +127,9 @@ class CaptchaNotifier extends _$CaptchaNotifier with InfraLogger {
   /// paths are tried in order from strictest to most permissive so that minor
   /// log-format changes downstream don't silently break the UI.
   _CaptchaCandidate? _classify(String text) {
+    if (text.contains(_captchaFailedMarker)) {
+      return const _CaptchaCandidate(done: true, failed: true);
+    }
     if (text.contains(_captchaDoneMarker)) {
       return const _CaptchaCandidate(done: true);
     }
@@ -156,8 +189,25 @@ class CaptchaNotifier extends _$CaptchaNotifier with InfraLogger {
 
   void arm({required bool enabled}) {
     _armed = enabled;
-    _lastProcessedLog = ref.read(martenCoreServiceProvider).runtimeLogBuffer.lastOrNull;
-    if (state != null) state = null;
+    if (!enabled) {
+      _deferredEvent = null;
+      _lastProcessedLog = ref.read(martenCoreServiceProvider).runtimeLogBuffer.lastOrNull;
+      if (state != null) state = null;
+      loggy.info('captcha watcher armed=false');
+      return;
+    }
+
+    final deferred = _deferredEvent;
+    _deferredEvent = null;
+    if (deferred != null) {
+      final age = DateTime.now().difference(deferred.createdAt);
+      if (age <= _deferredCaptchaMaxAge) {
+        loggy.info('replaying CAPTCHA request received while watcher was arming');
+        state = deferred;
+      } else {
+        loggy.warning('discarding stale deferred CAPTCHA request age=${age.inSeconds}s');
+      }
+    }
     loggy.info('captcha watcher armed=$enabled');
   }
 
@@ -167,7 +217,8 @@ class CaptchaNotifier extends _$CaptchaNotifier with InfraLogger {
 }
 
 class _CaptchaCandidate {
-  const _CaptchaCandidate({this.url, this.done = false});
+  const _CaptchaCandidate({this.url, this.done = false, this.failed = false});
   final String? url;
   final bool done;
+  final bool failed;
 }

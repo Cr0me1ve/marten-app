@@ -2,11 +2,13 @@ package app.marten.client
 
 import android.content.Context
 import android.content.Intent
+import android.os.Build
 import android.provider.Settings as AndroidSettings
 import android.util.Log
 import app.marten.client.bg.BoxService
 //import app.marten.client.bg.BoxService.Companion.workingDir
 import app.marten.client.bg.MobileCoreLifecycle
+import app.marten.client.bg.PhysicalTlsProbe
 import app.marten.client.bg.ServiceLifecycleOwnership
 import app.marten.client.bg.awaitPlatformStopRelease
 import app.marten.client.bg.isPlatformStopReleaseComplete
@@ -14,7 +16,8 @@ import app.marten.client.bg.isPlatformStopSafeForUser
 import app.marten.client.bg.requestAuthoritativePlatformStop
 import app.marten.client.constant.Action
 import app.marten.client.constant.Status
-import app.marten.client.security.NativeResumeConfigStore
+import app.marten.native_resume.NativeResumeConfigPublisher
+import app.marten.native_resume.NativeResumeConfigStore
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -29,6 +32,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
 import java.security.MessageDigest
+import java.util.Locale
 
 class MethodHandler(private val scope: CoroutineScope) : FlutterPlugin,
     MethodChannel.MethodCallHandler {
@@ -55,7 +59,9 @@ class MethodHandler(private val scope: CoroutineScope) : FlutterPlugin,
             AddGrpcClientPublicKey("add_grpc_client_public_key"),
             GetGrpcServerPublicKey("get_grpc_server_public_key"),
             GetStableDeviceID("get_stable_device_id"),
+            GetSubscriptionClientMetadata("get_subscription_client_metadata"),
             ICMPPing("icmp_ping"),
+            TLSPing("tls_ping"),
 
         }
     }
@@ -86,8 +92,26 @@ class MethodHandler(private val scope: CoroutineScope) : FlutterPlugin,
                 }
             }
 
+            Trigger.TLSPing.method -> {
+                scope.launch(Dispatchers.IO) {
+                    result.runCatching {
+                        val args = call.arguments as? Map<*, *> ?: error("missing TLS ping arguments")
+                        val host = args["host"] as? String ?: error("missing TLS ping host")
+                        val port = (args["port"] as? Number)?.toInt() ?: error("missing TLS ping port")
+                        val serverName = args["serverName"] as? String
+                        val allowUntrusted = args["allowUntrusted"] as? Boolean ?: false
+                        val timeoutMs = (args["timeoutMs"] as? Number)?.toLong() ?: 4_000L
+                        success(PhysicalTlsProbe.measure(host, port, serverName, allowUntrusted, timeoutMs))
+                    }
+                }
+            }
+
             Trigger.GetStableDeviceID.method -> {
                 result.success(stableDeviceId())
+            }
+
+            Trigger.GetSubscriptionClientMetadata.method -> {
+                result.success(subscriptionClientMetadata())
             }
 
             Trigger.AddGrpcClientPublicKey.method -> {
@@ -118,7 +142,7 @@ class MethodHandler(private val scope: CoroutineScope) : FlutterPlugin,
                         Settings.baseDir = args["baseDir"] as String
                         Settings.workingDir = args["workingDir"] as String
                         Settings.tempDir = args["tempDir"] as String
-                        Settings.debugMode = args["debug"] as Boolean? ?: false
+                        Settings.debugMode = args["debug"] as Boolean? ?: true
                         val mode = args["mode"] as Int
                         val grpcPort = args["grpcPort"] as Int
                         Log.d("debugmode","${Settings.debugMode}")
@@ -163,11 +187,8 @@ class MethodHandler(private val scope: CoroutineScope) : FlutterPlugin,
                     result.runCatching {
                         val args = call.arguments as Map<*, *>
                         val preparedPath = args["path"] as String? ?: ""
-                        val stored = NativeResumeConfigStore.storeFromPlaintextFile(appContext, File(preparedPath))
-                        Settings.activeConfigPath = stored.encryptedPath
-                        Settings.activeConfigUsesTurncoat = stored.usesTurncoat
-                        Settings.activeProfileName = args["name"] as String? ?: ""
-                        Settings.debugMode = args["debug"] as Boolean? ?: false
+                        storeNativeResumeConfig(preparedPath, args["name"] as String? ?: "")
+                        Settings.debugMode = args["debug"] as Boolean? ?: true
                         Settings.grpcServiceModePort = args["grpcPort"] as Int
                         // The foreground/background gRPC services are long-lived.
                         // Refresh native diagnostic mode before Flutter or the
@@ -329,6 +350,10 @@ class MethodHandler(private val scope: CoroutineScope) : FlutterPlugin,
         appContext.stopService(Intent(appContext, Settings.serviceClass()))
     }
 
+    private fun storeNativeResumeConfig(preparedPath: String, profileName: String) {
+        NativeResumeConfigPublisher.store(appContext, File(preparedPath), profileName)
+    }
+
     private suspend fun awaitStoppedPlatformServiceRelease(
         ownerToken: Long,
         coreStopped: Boolean,
@@ -389,6 +414,20 @@ class MethodHandler(private val scope: CoroutineScope) : FlutterPlugin,
     }
 
     private fun stableDeviceId(): String? {
+        val androidId = rawAndroidId() ?: return null
+        val material = "marten.android.device-id.v1:${appContext.packageName}:$androidId"
+        return "android-v1:${sha256Hex(material)}"
+    }
+
+    private fun subscriptionClientMetadata(): Map<String, String> = buildMap {
+        rawAndroidId()?.let { put("hwid", it) }
+        put("os", "Android")
+        put("osVersion", Build.VERSION.RELEASE.orEmpty())
+        put("model", Build.MODEL.orEmpty())
+        put("locale", Locale.getDefault().language.orEmpty())
+    }
+
+    private fun rawAndroidId(): String? {
         val androidId = AndroidSettings.Secure.getString(
             appContext.contentResolver,
             AndroidSettings.Secure.ANDROID_ID,
@@ -396,8 +435,7 @@ class MethodHandler(private val scope: CoroutineScope) : FlutterPlugin,
         if (androidId.isNullOrEmpty() || androidId == "9774d56d682e549c" || androidId == "unknown") {
             return null
         }
-        val material = "marten.android.device-id.v1:${appContext.packageName}:$androidId"
-        return "android-v1:${sha256Hex(material)}"
+        return androidId
     }
 
     private fun sha256Hex(value: String): String {

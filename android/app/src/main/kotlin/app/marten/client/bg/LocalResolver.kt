@@ -59,7 +59,10 @@ object LocalResolver : LocalDNSTransport {
                 DnsResolver.getInstance().rawQuery(
                     defaultNetwork,
                     message,
-                    DnsResolver.FLAG_NO_RETRY,
+                    // Use Android's normal cache and retry policy. A single
+                    // best-effort DNS packet is not a valid bootstrap contract
+                    // for a cold VPN start.
+                    DnsResolver.FLAG_EMPTY,
                     Dispatchers.IO.asExecutor(),
                     signal,
                     callback,
@@ -117,7 +120,7 @@ object LocalResolver : LocalDNSTransport {
                             defaultNetwork,
                             domain,
                             type,
-                            DnsResolver.FLAG_NO_RETRY,
+                            DnsResolver.FLAG_EMPTY,
                             Dispatchers.IO.asExecutor(),
                             signal,
                             callback,
@@ -126,7 +129,7 @@ object LocalResolver : LocalDNSTransport {
                         DnsResolver.getInstance().query(
                             defaultNetwork,
                             domain,
-                            DnsResolver.FLAG_NO_RETRY,
+                            DnsResolver.FLAG_EMPTY,
                             Dispatchers.IO.asExecutor(),
                             signal,
                             callback,

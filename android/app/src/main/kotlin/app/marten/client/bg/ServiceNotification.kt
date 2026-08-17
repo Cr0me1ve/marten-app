@@ -18,6 +18,7 @@ import app.marten.client.Application
 import app.marten.client.MainActivity
 import app.marten.client.R
 import app.marten.client.Settings
+import app.marten.client.VpnPermissionActivity
 import app.marten.client.constant.Action
 import app.marten.client.constant.Status
 import app.marten.client.utils.GrpcClientProvider
@@ -30,11 +31,18 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicLong
+
+internal fun shouldStreamDynamicNotificationUpdates(
+    dynamicNotificationEnabled: Boolean,
+    notificationPermissionGranted: Boolean,
+    deviceInteractive: Boolean,
+): Boolean =
+    dynamicNotificationEnabled && notificationPermissionGranted && deviceInteractive
 
 internal class NotificationUpdateGate {
     private val streamingGeneration = AtomicLong()
@@ -152,17 +160,7 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
     }
 
     private fun connectIntent(): PendingIntent {
-        val intent = Intent(service, Settings.serviceClass()).apply {
-            action = Action.SERVICE_CONNECT
-        }
-        val connectFlags =
-            (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_IMMUTABLE else 0) or
-                PendingIntent.FLAG_CANCEL_CURRENT
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            PendingIntent.getForegroundService(service, 3, intent, connectFlags)
-        } else {
-            PendingIntent.getService(service, 3, intent, connectFlags)
-        }
+        return VpnPermissionActivity.pendingIntent(service, 3)
     }
 
     private fun stopIntent(): PendingIntent {
@@ -196,10 +194,25 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
     }
 
     suspend fun start() {
-        if (Settings.dynamicNotification && checkPermission()) {
-            startListenSystemInfo()
-            withContext(Dispatchers.Main) {
+        val permissionGranted = checkPermission()
+        if (Settings.dynamicNotification && permissionGranted) {
+            withContext(Dispatchers.Main.immediate) {
                 registerReceiver()
+                // A service can be restored while the display is already off,
+                // in which case Android sends no new SCREEN_OFF broadcast.
+                // Never start the stats stream solely because the service was
+                // created; it is UI-only work and must not run during sleep.
+                if (
+                    shouldStreamDynamicNotificationUpdates(
+                        dynamicNotificationEnabled = Settings.dynamicNotification,
+                        notificationPermissionGranted = permissionGranted,
+                        deviceInteractive = Application.powerManager.isInteractive,
+                    )
+                ) {
+                    startListenSystemInfo()
+                } else {
+                    stopListenSystemInfo()
+                }
             }
         }
     }
@@ -228,7 +241,17 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
     override fun onReceive(context: Context, intent: Intent) {
         when (intent.action) {
             Intent.ACTION_SCREEN_ON -> {
-                startListenSystemInfo()
+                if (
+                    shouldStreamDynamicNotificationUpdates(
+                        dynamicNotificationEnabled = Settings.dynamicNotification,
+                        notificationPermissionGranted = checkPermission(),
+                        deviceInteractive = Application.powerManager.isInteractive,
+                    )
+                ) {
+                    startListenSystemInfo()
+                } else {
+                    stopListenSystemInfo()
+                }
             }
 
             Intent.ACTION_SCREEN_OFF -> {
@@ -284,18 +307,7 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
             val coreClient = GrpcClientProvider.grpcClient.create(CoreClient::class)
 
             try {
-                var previous = readSystemInfo(coreClient)
-
-                while (isActive) {
-                    delay(1_000)
-                    val current = readSystemInfo(coreClient)
-                    withContext(Dispatchers.Main.immediate) {
-                        if (notificationUpdateGate.permitsUpdate(streamGeneration)) {
-                            updateStatus(previous, current)
-                        }
-                    }
-                    previous = current
-                }
+                streamSystemInfo(coreClient, streamGeneration)
             } catch (e: CancellationException) {
                 Log.d("notification", "SystemInfo polling cancelled")
             } catch (e: Exception) {
@@ -304,14 +316,24 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
         }
     }
 
-    private fun readSystemInfo(coreClient: CoreClient): SystemInfo {
+    private suspend fun streamSystemInfo(coreClient: CoreClient, streamGeneration: Long) {
         val (sink, source) = coreClient.GetSystemInfo().executeBlocking()
-        return try {
+        try {
             sink.write(Empty())
-            // Complete the single request before waiting for the first item of
-            // the server stream. Keeping the sink open deadlocks Wire/Go gRPC.
+            // GetSystemInfo is a one-request server stream. Reuse it instead
+            // of constructing a new HTTP/2 stream for every displayed sample.
             sink.close()
-            source.read() ?: SystemInfo()
+
+            var previous = source.read() ?: return
+            while (currentCoroutineContext().isActive) {
+                val current = source.read() ?: return
+                withContext(Dispatchers.Main.immediate) {
+                    if (notificationUpdateGate.permitsUpdate(streamGeneration)) {
+                        updateStatus(previous, current)
+                    }
+                }
+                previous = current
+            }
         } finally {
             runCatching { sink.close() }
             runCatching { source.close() }

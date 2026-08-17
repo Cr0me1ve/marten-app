@@ -13,8 +13,8 @@ import 'package:marten/martencore/generated/v2/hcore/hcore_service.pbgrpc.dart';
 import 'package:marten/martencore/generated/v2/hello/hello.pb.dart';
 import 'package:marten/martencore/generated/v2/hello/hello_service.pbgrpc.dart';
 import 'package:marten/singbox/model/core_status.dart';
-
 import 'package:marten/utils/utils.dart';
+import 'package:marten_native_resume/marten_native_resume.dart';
 import 'package:rxdart/rxdart.dart';
 
 Duration backgroundAttachStoppedGrace({required bool explicitManualStart, bool? platformStartedByUser}) =>
@@ -33,6 +33,9 @@ bool shouldProbeExistingBackgroundCoreForManualStart({
     platformStatus is CoreStarted ||
     (platformStatus == null && backgroundChannelKnownAvailable);
 
+bool shouldJoinAuthoritativeBackgroundStart({required bool isAndroid, required CoreStatus? platformStatus}) =>
+    isAndroid && platformStatus is CoreStarting;
+
 typedef _BackgroundCoreEndpoint = ({int port, CoreStatus status});
 
 class CoreInterfaceMobile extends CoreInterface with InfraLogger {
@@ -40,11 +43,21 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
   static const methodChannel = MethodChannel("$channelPrefix/method");
   static const statusChannel = EventChannel("$channelPrefix/service.status", JSONMethodCodec());
   static const alertsChannel = EventChannel("$channelPrefix/service.alerts", JSONMethodCodec());
-  static const _platformStopCallTimeout = Duration(seconds: 14);
+  // Android's authoritative stop contract includes up to 20 seconds for the
+  // native core plus 5 seconds for service/VPN ownership release. Do not let
+  // the outer method-channel deadline expire while that bounded cleanup is
+  // still legitimately in progress.
+  static const _platformStopCallTimeout = Duration(seconds: 30);
   static const _platformStopReconcileTimeout = Duration(seconds: 6);
   static const _platformSetupCallTimeout = Duration(seconds: 8);
   static const _platformStartCallTimeout = Duration(seconds: 8);
-  static const _platformStartedSyncTimeout = Duration(seconds: 2);
+  // A failed real VPN GET can consume the bounded connect + read timeouts.
+  // Healthy acknowledgements still return immediately; this only prevents
+  // Dart from abandoning the native result while its proof is in flight.
+  // Native TURNcoat admission retries a real VPN-network GET for up to 75s;
+  // one already-started blocking socket attempt may finish just after that
+  // deadline. Keep Dart attached until native returns its terminal result.
+  static const _platformStartedSyncTimeout = Duration(seconds: 115);
   static const _platformSessionStateTimeout = Duration(seconds: 1);
   static const _foregroundHelloTimeout = Duration(seconds: 3);
   static const _healthCheckTimeout = Duration(milliseconds: 700);
@@ -416,6 +429,9 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
   @override
   Future<BackgroundCoreSetupResult> setupBackground(String path, String name) async {
     final platformStatus = await readPlatformServiceStatus();
+    if (shouldJoinAuthoritativeBackgroundStart(isAndroid: Platform.isAndroid, platformStatus: platformStatus)) {
+      return _joinAuthoritativeBackgroundStart();
+    }
     final shouldProbeExisting = shouldProbeExistingBackgroundCoreForManualStart(
       isAndroid: Platform.isAndroid,
       platformStatus: platformStatus,
@@ -495,6 +511,55 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
     await stop();
     return const BackgroundCoreSetupResult.failed(
       CoreStatus.stopped(alert: CoreAlert.startService, message: "starting background core timed out"),
+    );
+  }
+
+  Future<BackgroundCoreSetupResult> _joinAuthoritativeBackgroundStart() async {
+    final joinGeneration = ++_backgroundLifecycleGeneration;
+    final deadline = DateTime.now().add(_platformStartedSyncTimeout);
+    loggy.info("Android service is already Starting; joining its authoritative native generation");
+
+    while (DateTime.now().isBefore(deadline)) {
+      if (backgroundStartCancelled(
+        startGeneration: joinGeneration,
+        lifecycleGeneration: _backgroundLifecycleGeneration,
+      )) {
+        loggy.info("authoritative Android start join cancelled by stop request");
+        _isBgClientAvailable = false;
+        return const BackgroundCoreSetupResult.failed(CoreStatus.stopped());
+      }
+
+      final nativeStatus = await readPlatformServiceStatus();
+      switch (nativeStatus) {
+        case CoreStarted():
+          // The gRPC shell can survive a native core replacement. Re-read its
+          // state only after BoxService has published Started for the current
+          // generation; a stale Started response while BoxService is Starting
+          // is never sufficient authority.
+          final endpoint = await _findAttachableBackgroundCore(_channelCredentials);
+          if (endpoint?.status is CoreStarted) {
+            _portBack = endpoint!.port;
+            bgClient = CoreClient(_coreChannel(_portBack, _channelCredentials));
+            _isBgClientAvailable = true;
+            loggy.info("joined authoritative Android core generation on 127.0.0.1:$_portBack");
+            return const BackgroundCoreSetupResult.attached(CoreStatus.started());
+          }
+        case CoreStopping():
+          _isBgClientAvailable = false;
+          return const BackgroundCoreSetupResult.failed(CoreStatus.stopping());
+        case CoreStopped():
+          _isBgClientAvailable = false;
+          return BackgroundCoreSetupResult.failed(nativeStatus);
+        case CoreStarting() || null:
+      }
+
+      await Future.delayed(_backgroundServicePollInterval);
+    }
+
+    _isBgClientAvailable = false;
+    loggy.warning("authoritative Android start did not reach Started before timeout");
+    return const BackgroundCoreSetupResult.failed(
+      CoreStatus.stopped(alert: CoreAlert.startService, message: "native background core recovery timed out"),
     );
   }
 
@@ -630,6 +695,28 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
       return await methodChannel.invokeMethod<bool>("markStarted").timeout(_platformStartedSyncTimeout) ?? false;
     } catch (e) {
       loggy.warning("platform started sync failed: $e");
+      return false;
+    }
+  }
+
+  @override
+  Future<bool> storeNativeResumeConfig(String path, String name) async {
+    if (!Platform.isAndroid) return true;
+    try {
+      return await MartenNativeResume.store(path: path, name: name).timeout(_platformStartCallTimeout);
+    } catch (e) {
+      loggy.warning("failed to store native resume config: $e");
+      return false;
+    }
+  }
+
+  @override
+  Future<bool> clearNativeResumeConfig() async {
+    if (!Platform.isAndroid) return true;
+    try {
+      return await MartenNativeResume.clear().timeout(_platformStartCallTimeout);
+    } catch (e) {
+      loggy.warning("failed to clear native resume config: $e");
       return false;
     }
   }

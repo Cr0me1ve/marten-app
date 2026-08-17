@@ -9,12 +9,15 @@ import Foundation
 import MartenCore
 import Network
 import NetworkExtension
+import Security
 
 public class ExtensionPlatformInterface: NSObject, LibboxPlatformInterfaceProtocol {
     
     
     private var tunnel: ExtensionProvider
     private var networkSettings: NEPacketTunnelNetworkSettings?
+    private static let turncoatCredentialLock = NSLock()
+    private static let turncoatCredentialService = "app.marten.client.turncoat-credentials-v1"
 
     init(_ tunnel: ExtensionProvider) {
         self.tunnel = tunnel
@@ -501,5 +504,87 @@ public class ExtensionPlatformInterface: NSObject, LibboxPlatformInterfaceProtoc
         nil
     }
     public func autoDetectControl(_: Int32) throws {}
+
+    public func loadTurncoatCredential(_ storageKey: String?) throws -> String {
+        guard let storageKey, Self.validTurncoatStorageKey(storageKey) else {
+            throw NSError(domain: "MartenTurncoatCredentialStore", code: 1)
+        }
+        Self.turncoatCredentialLock.lock()
+        defer { Self.turncoatCredentialLock.unlock() }
+        return try Self.loadTurncoatCredentialLocked(storageKey)
+    }
+
+    public func compareAndSwapTurncoatCredential(
+        _ storageKey: String?,
+        expected: String?,
+        replacement: String?
+    ) throws -> Bool {
+        guard let storageKey, let expected, let replacement,
+              Self.validTurncoatStorageKey(storageKey) else {
+            throw NSError(domain: "MartenTurncoatCredentialStore", code: 1)
+        }
+        Self.turncoatCredentialLock.lock()
+        defer { Self.turncoatCredentialLock.unlock() }
+        if try Self.loadTurncoatCredentialLocked(storageKey) != expected {
+            return false
+        }
+        let query = Self.turncoatCredentialQuery(storageKey)
+        if replacement.isEmpty {
+            let status = SecItemDelete(query as CFDictionary)
+            return status == errSecSuccess || status == errSecItemNotFound
+        }
+        let data = Data(replacement.utf8)
+        let updateStatus = SecItemUpdate(
+            query as CFDictionary,
+            [kSecValueData as String: data] as CFDictionary
+        )
+        if updateStatus == errSecSuccess {
+            return true
+        }
+        guard updateStatus == errSecItemNotFound else {
+            throw NSError(domain: NSOSStatusErrorDomain, code: Int(updateStatus))
+        }
+        var add = query
+        add[kSecValueData as String] = data
+        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        let addStatus = SecItemAdd(add as CFDictionary, nil)
+        if addStatus != errSecSuccess {
+            throw NSError(domain: NSOSStatusErrorDomain, code: Int(addStatus))
+        }
+        return true
+    }
+
+    private static func validTurncoatStorageKey(_ value: String) -> Bool {
+        value.count == 64 && value.allSatisfy { $0.isHexDigit && !$0.isUppercase }
+    }
+
+    private static func turncoatCredentialQuery(_ storageKey: String) -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: turncoatCredentialService,
+            kSecAttrAccount as String: storageKey,
+        ]
+    }
+
+    private static func loadTurncoatCredentialLocked(_ storageKey: String) throws -> String {
+        var query = turncoatCredentialQuery(storageKey)
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        if status == errSecItemNotFound {
+            return ""
+        }
+        guard status == errSecSuccess, let data = result as? Data,
+              let value = String(data: data, encoding: .utf8) else {
+            // Invalid/unreadable entries are removed and treated as a miss.
+            SecItemDelete(turncoatCredentialQuery(storageKey) as CFDictionary)
+            if status != errSecSuccess {
+                throw NSError(domain: NSOSStatusErrorDomain, code: Int(status))
+            }
+            return ""
+        }
+        return value
+    }
 
 }

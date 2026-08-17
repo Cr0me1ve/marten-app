@@ -50,6 +50,9 @@
     <mime-type>x-scheme-handler/clash</mime-type>
     <mime-type>x-scheme-handler/clashmeta</mime-type>
     <mime-type>x-scheme-handler/sing-box</mime-type>
+    <mime-type>x-scheme-handler/flclashx</mime-type>
+    <mime-type>x-scheme-handler/koala-clash</mime-type>
+    <mime-type>x-scheme-handler/prizrak-box</mime-type>
   </mime-types>
 
   <url type="homepage">https://github.com/Cr0me1ve/marten-app</url>

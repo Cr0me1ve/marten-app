@@ -49,18 +49,23 @@ bool shouldApplyNativeRecoverySnapshot({
 bool shouldAttachBackgroundCoreDuringSetup({required bool isAndroid, required CoreStatus? platformStatus}) =>
     !isAndroid || platformStatus is! CoreStopped;
 
+@visibleForTesting
+String coreLogListenerKey({required bool isAndroid, required String role}) =>
+    isAndroid ? "androidCoreLogListener" : "${role}LogListener";
+
 class MartenCoreService with InfraLogger {
   MartenCoreService(this.ref);
   final Ref ref;
   static const _foregroundSetupTimeout = Duration(seconds: 14);
   static const _coreStartTimeout = Duration(seconds: 35);
-  static const _platformStopTimeout = Duration(seconds: 22);
+  static const _platformStopTimeout = Duration(seconds: 35);
   static const _outboundInfoSnapshotTimeout = Duration(seconds: 2);
   static const _coreStatusSnapshotTimeout = Duration(milliseconds: 900);
   static const _restartSettleTimeout = Duration(seconds: 8);
   static const _restartSettlePollInterval = Duration(milliseconds: 200);
   static const _startSettleTimeout = Duration(seconds: 10);
   static const _startSettlePollInterval = Duration(milliseconds: 200);
+  static const _nativeRecoveryLogBridgePollInterval = Duration(milliseconds: 400);
 
   // CoreMartenCoreService() {}
   final core = getCoreInterface();
@@ -83,6 +88,8 @@ class MartenCoreService with InfraLogger {
   Future<Either<String, Unit>>? _stopFuture;
   Future<void>? _platformTriggeredInitFuture;
   int _statusRevision = 0;
+  int _nativeRecoveryLogBridgeGeneration = 0;
+  bool _disposed = false;
 
   void _setCurrentState(CoreStatus next, {bool emit = true}) {
     _statusRevision++;
@@ -106,6 +113,10 @@ class MartenCoreService with InfraLogger {
   }
 
   Future<bool> notifyBackgroundStarted() => core.notifyBackgroundStarted();
+
+  Future<bool> storeNativeResumeConfig(String path, String name) => core.storeNativeResumeConfig(path, name);
+
+  Future<bool> clearNativeResumeConfig() => core.clearNativeResumeConfig();
 
   Future<bool?> readPlatformStartedByUser() => core.readPlatformStartedByUser();
 
@@ -502,6 +513,7 @@ class MartenCoreService with InfraLogger {
       // UI spins forever even though the core and VPN are already gone.
       if (_nativePlatformRecoveryInProgress) {
         _nativePlatformRecoveryInProgress = false;
+        _stopNativeRecoveryLogBridge();
         loggy.info("explicit core stop canceled Android native recovery");
       }
       final runningStop = _stopFuture;
@@ -1023,12 +1035,14 @@ class MartenCoreService with InfraLogger {
     }
     if (startsNativePlatformRecovery(currentState, event)) {
       _nativePlatformRecoveryInProgress = true;
+      _startNativeRecoveryLogBridge();
       loggy.info("Android native core recovery started; keeping Flutter status in connecting");
     }
 
     final recoveryInProgress = _nativePlatformRecoveryInProgress;
     if (event is CoreStopped && event.alert != null) {
       _nativePlatformRecoveryInProgress = false;
+      _stopNativeRecoveryLogBridge();
     }
     final next = coreStatusAfterPlatformEvent(currentState, event, nativeRecoveryInProgress: recoveryInProgress);
     if (!recoveryInProgress && next is CoreStarted && currentState is! CoreStarted) {
@@ -1040,6 +1054,7 @@ class MartenCoreService with InfraLogger {
     final recoveryCompleted = recoveryInProgress && event is CoreStarted;
     if (recoveryCompleted) {
       _nativePlatformRecoveryInProgress = false;
+      _stopNativeRecoveryLogBridge();
       unawaited(_reattachAfterNativePlatformRecovery(eventRevision));
     }
     if (currentState == next) return;
@@ -1058,6 +1073,45 @@ class MartenCoreService with InfraLogger {
         }
       }),
     );
+  }
+
+  void _startNativeRecoveryLogBridge() {
+    final generation = ++_nativeRecoveryLogBridgeGeneration;
+    unawaited(_maintainNativeRecoveryLogBridge(generation));
+  }
+
+  void _stopNativeRecoveryLogBridge() {
+    _nativeRecoveryLogBridgeGeneration++;
+  }
+
+  Future<void> _maintainNativeRecoveryLogBridge(int generation) async {
+    var attachCount = 0;
+    final logListenerKey = coreLogListenerKey(isAndroid: PlatformUtils.isAndroid, role: "bg");
+    while (!_disposed && _nativePlatformRecoveryInProgress && generation == _nativeRecoveryLogBridgeGeneration) {
+      // Mobile.setup replaces the background gRPC server before Android can
+      // verify the new route. Waiting for route-verified Started to reattach is
+      // a deadlock when that route itself needs CAPTCHA: the Go delivery hub has
+      // the unresolved URL, but Flutter cannot ask the persistent WebView to
+      // solve it. Keep the existing listener untouched while it is alive, then
+      // reconnect as soon as the registry observes its shutdown. The hub replays
+      // any unresolved CAPTCHA to this replacement listener.
+      if (subscriptions[logListenerKey] == null) {
+        try {
+          await startListeningLogs("bg", core.bgClient);
+          if (_nativePlatformRecoveryInProgress &&
+              generation == _nativeRecoveryLogBridgeGeneration &&
+              subscriptions[logListenerKey] != null) {
+            attachCount += 1;
+            loggy.info("Android native recovery attached CAPTCHA log bridge attempt=$attachCount");
+          }
+        } catch (error) {
+          if (_nativePlatformRecoveryInProgress && generation == _nativeRecoveryLogBridgeGeneration) {
+            loggy.debug("Android native recovery CAPTCHA log bridge not ready: $error");
+          }
+        }
+      }
+      await Future.delayed(_nativeRecoveryLogBridgePollInterval);
+    }
   }
 
   Future<void> _reattachAfterNativePlatformRecovery(int recoveryRevision) async {
@@ -1102,11 +1156,22 @@ class MartenCoreService with InfraLogger {
   }
 
   Future<void> startListeningLogs(String key, CoreClient cc) async {
-    final listenKey = "${key}LogListener";
+    if (_disposed) return;
+    final listenKey = coreLogListenerKey(isAndroid: PlatformUtils.isAndroid, role: key);
+    if (PlatformUtils.isAndroid && key == "fg" && subscriptions[listenKey] != null) {
+      // Android foreground/background gRPC servers expose the same process-wide
+      // Go log hub. Once the service-owned background stream exists, a second
+      // foreground observer only duplicates delivery and survives engine churn.
+      return;
+    }
     // await stopListenSingle(listenKey);
     await listenSingle<LogMessage>(listenKey, () {
       return cc.logListener(Empty(), options: grpcOptions).map((event) {
-        if (!_coreLogDeduplicator.shouldAccept(event)) return event;
+        // CAPTCHA markers are control-plane messages. The native core may
+        // intentionally replay an unresolved request when a gRPC listener
+        // reconnects, so an old fingerprint must never suppress it here.
+        final isCaptchaControlEvent = event.message.contains('MARTEN_TURNCOAT_CAPTCHA');
+        if (!isCaptchaControlEvent && !_coreLogDeduplicator.shouldAccept(event)) return event;
         // Handle incoming event
         runtimeLogBuffer.add(event);
         final safeEvent = LogMessage(
@@ -1169,6 +1234,7 @@ class MartenCoreService with InfraLogger {
     Function(dynamic error)? onError,
     bool logErrors = true,
   }) {
+    if (_disposed) return Future<StreamSubscription<T>?>.value();
     return _subscriptionRegistry.listen<T>(
       key,
       stream,
@@ -1221,7 +1287,14 @@ class MartenCoreService with InfraLogger {
     }
     if (!core.isSingleChannel()) {
       await stopListenSingle("fg");
-      await stopListenSingle("bg");
+      // Android keeps its service-owned background LogListener alive while the
+      // activity is paused. TURNcoat CAPTCHA requirements are replayable on the
+      // native side, but stopping this stream here prevented a live challenge
+      // from reaching the already-mounted background WebView until the user
+      // manually foregrounded Marten.
+      if (!PlatformUtils.isAndroid) {
+        await stopListenSingle("bg");
+      }
       try {
         await core.fgClient.pause(PauseRequest(mode: SetupMode.GRPC_NORMAL_INSECURE));
       } catch (_) {
@@ -1232,6 +1305,19 @@ class MartenCoreService with InfraLogger {
       } catch (_) {
         // The alternate foreground channel may already be gone too.
       }
+    }
+  }
+
+  Future<void> dispose() async {
+    if (_disposed) return;
+    _disposed = true;
+    _nativePlatformRecoveryInProgress = false;
+    _stopNativeRecoveryLogBridge();
+    await _subscriptionRegistry.stop("");
+    final writer = _coreLogWriter;
+    _coreLogWriter = null;
+    if (writer != null) {
+      await writer.close();
     }
   }
 }

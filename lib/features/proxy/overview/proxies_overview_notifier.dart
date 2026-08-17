@@ -98,8 +98,11 @@ class ProxiesOverviewNotifier extends _$ProxiesOverviewNotifier with AppLogger {
       await ref.read(hapticServiceProvider.notifier).lightImpact();
       final localTargets = await _connectedRoutePingTargets();
       if (localTargets.isNotEmpty) {
-        await _pingConnectedRoute(localTargets);
-        return;
+        final profileId = ref.read(activeProfileProvider).valueOrNull?.id;
+        if (profileId != null) {
+          await _pingConnectedRoute(profileId, localTargets);
+          return;
+        }
       }
       await ref.read(proxyRepositoryProvider).urlTest(groupTag).getOrElse((err) {
         loggy.error("error testing group", err);
@@ -117,16 +120,16 @@ class ProxiesOverviewNotifier extends _$ProxiesOverviewNotifier with AppLogger {
     return connectedRoutePingOutbounds(outbounds, [group.selected.tag]);
   }
 
-  Future<void> _pingConnectedRoute(List<LocalOutbound> targets) async {
-    final localPing = ref.read(localPingProvider.notifier)..markPending(targets);
+  Future<void> _pingConnectedRoute(String profileId, List<LocalOutbound> targets) async {
+    final localPing = ref.read(localPingProvider.notifier)..markPending(profileId, targets);
     final result = await ref.read(connectionRepositoryProvider).measureConnectedRouteDelay().run();
     await result.match(
       (failure) {
         loggy.warning('core connected-route ping failed; trying endpoint fallback', failure);
-        return localPing.pingAll(targets, mode: LocalPingMode.connectedRoute);
+        return localPing.pingAll(profileId, targets, mode: LocalPingMode.connectedRoute);
       },
       (delay) {
-        localPing.record(targets.first.tag, delay);
+        localPing.record(profileId, targets.first.tag, delay);
         return Future<void>.value();
       },
     );

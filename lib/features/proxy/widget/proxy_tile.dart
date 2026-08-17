@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:marten/core/router/dialog/dialog_notifier.dart';
 import 'package:marten/features/home/data/local_outbounds_provider.dart';
+import 'package:marten/features/profile/notifier/active_profile_notifier.dart';
 import 'package:marten/features/proxy/active/ip_widget.dart';
 import 'package:marten/gen/fonts.gen.dart';
 import 'package:marten/martencore/generated/v2/hcore/hcore.pb.dart';
@@ -18,7 +19,10 @@ class ProxyTile extends HookConsumerWidget with PresLogger {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final theme = Theme.of(context);
-    final localPing = ref.watch(localPingProvider.select((pings) => pings[proxy.tag]));
+    final profileId = ref.watch(activeProfileProvider.select((profile) => profile.valueOrNull?.id));
+    final localPing = profileId == null
+        ? null
+        : ref.watch(localPingProvider.select((pings) => pings[profileId]?[proxy.tag]));
     final delay = displayDelayWithLocalPing(coreDelay: proxy.urlTestDelay, localPing: localPing);
 
     return ListTile(

@@ -53,5 +53,8 @@ supported_mime_type:
   - x-scheme-handler/clash
   - x-scheme-handler/clashmeta
   - x-scheme-handler/sing-box
+  - x-scheme-handler/flclashx
+  - x-scheme-handler/koala-clash
+  - x-scheme-handler/prizrak-box
 
 metainfo: linux/packaging/app.marten.client.appdata.xml

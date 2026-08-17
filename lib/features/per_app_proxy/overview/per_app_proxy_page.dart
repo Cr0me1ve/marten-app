@@ -52,8 +52,10 @@ class PerAppProxyPage extends HookConsumerWidget with PresLogger {
     final searchQuery = useState("");
     final sortListener = useState(false);
 
-    final asyncApps = useFuture(useMemoized(() => getApps(false)));
-    final asyncAppsHideSys = useFuture(useMemoized(() => getApps(true)));
+    final allAppsFuture = useMemoized(() => getApps(false));
+    final hiddenAppsFuture = useState<Future<Set<AppPackageInfo>>?>(null);
+    final asyncApps = useFuture(allAppsFuture);
+    final asyncAppsHideSys = useFuture(hiddenAppsFuture.value);
 
     final asyncFilteredApps = hideSystemApps.value ? asyncAppsHideSys : asyncApps;
 
@@ -276,7 +278,12 @@ class PerAppProxyPage extends HookConsumerWidget with PresLogger {
                         ChoiceChip(
                           label: Text(t.pages.settings.routing.perAppProxy.hideSysApps),
                           selected: hideSystemApps.value,
-                          onSelected: (value) => hideSystemApps.value = value,
+                          onSelected: (value) {
+                            if (value && hiddenAppsFuture.value == null) {
+                              hiddenAppsFuture.value = getApps(true);
+                            }
+                            hideSystemApps.value = value;
+                          },
                         ),
                         const Gap(8),
                         ActionChip(

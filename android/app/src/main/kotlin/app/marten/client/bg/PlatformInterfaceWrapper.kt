@@ -8,6 +8,7 @@ import android.os.Process
 import android.util.Log
 import androidx.annotation.RequiresApi
 import app.marten.client.Application
+import app.marten.client.security.TurncoatCredentialStore
 import app.marten.core.libbox.InterfaceUpdateListener
 import app.marten.core.libbox.Libbox
 import app.marten.core.libbox.NetworkInterfaceIterator
@@ -44,6 +45,20 @@ interface PlatformInterfaceWrapper : PlatformInterface {
     override fun openTun(options: TunOptions): Int {
         error("invalid argument")
     }
+
+    override fun loadTurncoatCredential(storageKey: String): String =
+        TurncoatCredentialStore.load(Application.application, storageKey)
+
+    override fun compareAndSwapTurncoatCredential(
+        storageKey: String,
+        expected: String,
+        replacement: String,
+    ): Boolean = TurncoatCredentialStore.compareAndSwap(
+        Application.application,
+        storageKey,
+        expected,
+        replacement,
+    )
 
     override fun useProcFS(): Boolean =  Build.VERSION.SDK_INT < Build.VERSION_CODES.Q
 

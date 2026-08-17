@@ -72,7 +72,7 @@ object Settings {
         set(value) = preferences.edit().putString(SettingsKey.CONFIG_OPTIONS, value).apply()
 
     var debugMode: Boolean
-        get() = preferences.getBoolean(SettingsKey.DEBUG_MODE, false)
+        get() = preferences.getBoolean(SettingsKey.DEBUG_MODE, true)
         set(value) = preferences.edit().putBoolean(SettingsKey.DEBUG_MODE, value).apply()
 
     var disableMemoryLimit: Boolean

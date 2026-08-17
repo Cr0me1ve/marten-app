@@ -158,17 +158,15 @@ class ProfileTile extends HookConsumerWidget {
                           if (profile case RemoteProfileEntity(:final expiresAt)) ...[
                             const Gap(2),
                             Text(
-                              t.components.subscriptionInfo.updatedAt(date: profile.lastUpdate.format()),
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
+                              t.components.subscriptionInfo.updatedAt(
+                                date: profile.lastUpdate.formatSubscriptionUpdate(),
+                              ),
                               style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.onSurfaceVariant),
                             ),
                             if (expiresAt != null) ...[
                               const Gap(2),
                               Text(
                                 '${t.components.subscriptionInfo.expireDate}: ${expiresAt.toLocal().format()}',
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
                                 style: theme.textTheme.bodySmall?.copyWith(
                                   color: expiresAt.isBefore(DateTime.now())
                                       ? theme.colorScheme.error

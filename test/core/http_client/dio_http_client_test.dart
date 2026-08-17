@@ -13,6 +13,7 @@ void main() {
     test('drops credentials after a cross-origin redirect', () {
       const headers = {
         'X-Device-ID': 'device-secret',
+        'X-HWID': 'android-device-hwid',
         'x-client-secret': 'client-secret',
         'Authorization': 'Bearer private',
         'Cookie': 'session=private',
@@ -23,6 +24,8 @@ void main() {
 
       expect(sanitized, {'Accept-Language': 'ru'});
       expect(headers, containsPair('X-Device-ID', 'device-secret'));
+      expect(headers, containsPair('X-HWID', 'android-device-hwid'));
+      expect(sanitized.containsKey('X-HWID'), isFalse);
     });
 
     test('rejects insecure or non-HTTP redirect targets', () {

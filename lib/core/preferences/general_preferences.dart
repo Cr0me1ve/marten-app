@@ -1,8 +1,6 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:marten/core/app_info/app_info_provider.dart';
 import 'package:marten/core/logger/logger_controller.dart';
-import 'package:marten/core/model/environment.dart';
 import 'package:marten/core/model/region.dart';
 import 'package:marten/core/preferences/actions_at_closing.dart';
 
@@ -118,7 +116,7 @@ class DebugModeNotifier extends _$DebugModeNotifier {
   late final _pref = PreferencesEntry(
     preferences: ref.watch(sharedPreferencesProvider).requireValue,
     key: "debug_mode",
-    defaultValue: ref.read(environmentProvider) == Environment.dev,
+    defaultValue: true,
   );
 
   @override

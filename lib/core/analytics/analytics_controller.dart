@@ -14,6 +14,13 @@ part 'analytics_controller.g.dart';
 // privacy-safe Firebase Crashlytics reports; Firebase Analytics is not used.
 const String enableAnalyticsPrefKey = 'enable_analytics';
 
+bool readCrashReportingEnabledPreference(SharedPreferences preferences) {
+  // Missing means the user has never opted out. This deliberately applies to
+  // both clean installs and upgrades from the former disabled-by-default
+  // behavior. An explicit false remains authoritative.
+  return preferences.getBool(enableAnalyticsPrefKey) ?? true;
+}
+
 @Riverpod(keepAlive: true)
 class AnalyticsController extends _$AnalyticsController with AppLogger {
   @override
@@ -22,7 +29,7 @@ class AnalyticsController extends _$AnalyticsController with AppLogger {
       crashReporter.setContextCollectionEnabled(false);
       return false;
     }
-    final enabled = _preferences.getBool(enableAnalyticsPrefKey) ?? false;
+    final enabled = readCrashReportingEnabledPreference(_preferences);
     crashReporter.setContextCollectionEnabled(enabled);
     return enabled;
   }
@@ -40,9 +47,7 @@ class AnalyticsController extends _$AnalyticsController with AppLogger {
     if (state case AsyncData(value: final enabled)) {
       loggy.debug('enabling privacy-safe crash reporting');
       state = const AsyncLoading();
-      if (!enabled) {
-        await _preferences.setBool(enableAnalyticsPrefKey, true);
-      }
+      await _preferences.setBool(enableAnalyticsPrefKey, true);
       crashReporter.setContextCollectionEnabled(true);
 
       try {

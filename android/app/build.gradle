@@ -9,7 +9,8 @@ plugins {
     id "com.squareup.wire" version "5.3.1"
 }
 
-if (file("google-services.json").exists()) {
+def hasFirebaseConfig = file("google-services.json").exists()
+if (hasFirebaseConfig) {
     apply plugin: "com.google.gms.google-services"
     apply plugin: "com.google.firebase.crashlytics"
 }
@@ -37,6 +38,51 @@ if (localPropertiesFile.exists()) {
 }
 
 boolean hasKeyStore = false
+
+def martenCoreAar = file('libs/marten-core.aar')
+def martenCoreCrashlyticsSymbolsDir = file("$buildDir/intermediates/marten_core_crashlytics_symbols/release")
+def extractMartenCoreCrashlyticsSymbols = tasks.register('extractMartenCoreCrashlyticsSymbols', Sync) {
+    inputs.file(martenCoreAar)
+    from(zipTree(martenCoreAar)) {
+        include 'jni/arm64-v8a/libmarten-core.so'
+    }
+    into(martenCoreCrashlyticsSymbolsDir)
+}
+def validateMartenCoreCrashlyticsSymbols = tasks.register('validateMartenCoreCrashlyticsSymbols') {
+    dependsOn(extractMartenCoreCrashlyticsSymbols)
+    def nativeLibrary = file("$martenCoreCrashlyticsSymbolsDir/jni/arm64-v8a/libmarten-core.so")
+    inputs.file(nativeLibrary)
+    doLast {
+        if (!nativeLibrary.isFile()) {
+            throw new GradleException("Missing extracted Crashlytics symbols: $nativeLibrary")
+        }
+        def readelf = fileTree(android.ndkDirectory) {
+            include 'toolchains/llvm/prebuilt/*/bin/llvm-readelf*'
+        }.files.find { it.canExecute() }
+        if (readelf == null) {
+            throw new GradleException("llvm-readelf is missing from Android NDK ${android.ndkDirectory}")
+        }
+        def inspect = { String argument ->
+            def process = new ProcessBuilder(readelf.absolutePath, argument, nativeLibrary.absolutePath)
+                .redirectErrorStream(true)
+                .start()
+            def output = process.inputStream.getText('UTF-8')
+            if (process.waitFor() != 0) {
+                throw new GradleException("llvm-readelf $argument failed for $nativeLibrary:\n$output")
+            }
+            output
+        }
+        def sections = inspect('-S')
+        if (!sections.contains('.debug_info') || !sections.contains('.symtab')) {
+            throw new GradleException(
+                'libmarten-core.so is stripped; rebuild the AAR with DWARF and the ELF symbol table before uploading Crashlytics symbols',
+            )
+        }
+        if (!inspect('-n').contains('NT_GNU_BUILD_ID')) {
+            throw new GradleException('libmarten-core.so has no GNU Build ID required by Crashlytics')
+        }
+    }
+}
 
 def keystoreProperties = new Properties()
 def keystorePropertiesFile = rootProject.file('key.properties')
@@ -115,6 +161,16 @@ android {
             ndk {
                 debugSymbolLevel 'SYMBOL_TABLE'
             }
+            if (hasFirebaseConfig) {
+                firebaseCrashlytics {
+                    // libmarten-core.so is supplied by the prebuilt AAR rather than
+                    // externalNativeBuild, so Crashlytics cannot discover its
+                    // symbols from a CMake/ndk-build model. The extraction task
+                    // exposes the exact unstripped library packaged by this build.
+                    nativeSymbolUploadEnabled true
+                    unstrippedNativeLibsDir file("$buildDir/intermediates/marten_core_crashlytics_symbols/release")
+                }
+            }
         }
     }
 
@@ -123,6 +179,22 @@ android {
         aidl true
     }
 
+}
+
+if (hasFirebaseConfig) {
+    tasks.matching {
+        it.name == 'generateCrashlyticsSymbolFileRelease' ||
+            it.name == 'uploadCrashlyticsSymbolFileRelease'
+    }.configureEach {
+        dependsOn(validateMartenCoreCrashlyticsSymbols)
+    }
+
+    tasks.matching {
+        it.name == 'assembleRelease' || it.name == 'bundleRelease'
+    }.configureEach {
+        // A configured release must upload the exact symbols for its native core.
+        dependsOn('uploadCrashlyticsSymbolFileRelease')
+    }
 }
 
 android.applicationVariants.all { variant ->
@@ -137,6 +209,11 @@ flutter {
 
 dependencies {
     implementation fileTree(dir: 'libs', include: ['*.jar', '*.aar'])
+
+    // Expose the same Crashlytics Android SDK used by FlutterFire to native
+    // startup/service diagnostics without introducing Firebase Analytics.
+    implementation platform("com.google.firebase:firebase-bom:${project(':firebase_core').properties['FirebaseSDKVersion']}")
+    implementation 'com.google.firebase:firebase-crashlytics-ndk'
 
     implementation 'com.google.code.gson:gson:2.11.0'
     implementation 'androidx.core:core-ktx:1.16.0'

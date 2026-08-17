@@ -7,7 +7,7 @@ import org.junit.Test
 
 class IcmpResilienceSourceGuardTest {
     @Test
-    fun `route acknowledgement is volatile fail-closed and reaches the lifecycle guard`() {
+    fun `route acknowledgement is fail-closed and delegates through bounded current-generation VPN data-plane proof`() {
         val source = sourceFile("BoxService.kt")
         assertTrue(
             "active BoxService publication must be visible across MethodHandler and service threads",
@@ -18,10 +18,53 @@ class IcmpResilienceSourceGuardTest {
         assertTrue(acknowledgement.contains("val instance = activeInstance"))
         assertTrue(acknowledgement.contains("if (instance == null)"))
         assertTrue(acknowledgement.contains("return false"))
-        assertTrue(acknowledgement.contains("instance.markCoreRuntimeStarted(routeVerified = true)"))
+        assertTrue(acknowledgement.contains("return instance.acknowledgeVerifiedRouteFromFlutter()"))
+        assertFalse(
+            "companion acknowledgement must not directly promote Started without native proof",
+            acknowledgement.contains("markCoreRuntimeStarted("),
+        )
+
+        val flutterAcknowledgement = functionBody(source, "acknowledgeVerifiedRouteFromFlutter")
+        assertTrue(flutterAcknowledgement.contains("shouldContinueStart(generation)"))
+        assertTrue(flutterAcknowledgement.contains("!hasReusableVpnDataPlaneProof(generation)"))
+        val nativeRetry = flutterAcknowledgement.indexOf("val verified = verifyNativeStartupRoute(")
+        val sameGeneration = flutterAcknowledgement.indexOf("generation = generation", nativeRetry)
+        val terminalFailure = flutterAcknowledgement.indexOf("stopServiceOnFailure = true", nativeRetry)
+        val failClosed = flutterAcknowledgement.indexOf("if (!verified) return false", nativeRetry)
+        val markStarted = flutterAcknowledgement.indexOf("return markCoreRuntimeStarted(routeVerified = true, generation = generation)")
+        assertTrue("Flutter acknowledgement must delegate to bounded native VPN proof", nativeRetry >= 0)
+        assertTrue("native proof must stay in the acknowledged lifecycle generation", sameGeneration > nativeRetry)
+        assertTrue("failed acknowledgement proof must use terminal cleanup", terminalFailure > sameGeneration)
+        assertTrue("failed acknowledgement proof must return before Started", failClosed > terminalFailure && markStarted > failClosed)
+
+        val nativeProof = functionBody(source, "verifyNativeStartupRoute")
+        assertTrue("native proof must retry rather than trust one route snapshot", nativeProof.contains("while (SystemClock.elapsedRealtime() < deadline)"))
+        assertTrue(
+            "native proof must require the Android VPN data-plane GET",
+            nativeProof.contains("checkSelectedRoute(") && nativeProof.contains("requireVpnDataPlane = true"),
+        )
+        assertTrue("native proof expiry must remain fail-closed", nativeProof.contains("stopAndAlert(Alert.StartService"))
 
         val started = functionBody(source, "markCoreRuntimeStarted")
         assertTrue(started.contains("shouldContinueStart(generation)"))
+        val proofGate = "if (!hasReusableVpnDataPlaneProof(generation))"
+        val firstProofGate = started.indexOf(proofGate)
+        val tunHealth = started.indexOf("val tunHealth = awaitTunRuntimeHealthForStarted()")
+        val secondProofGate = started.indexOf(proofGate, firstProofGate + proofGate.length)
+        val startedPublication = started.indexOf("status.value = Status.Started")
+        val failedPublication = started.indexOf("if (!marked)")
+        val immediateWatchdog = started.indexOf(
+            "requestRouteWatchdogCheck(\"VPN data-plane proof changed before Started\", delayMs = 0L)",
+            failedPublication,
+        )
+
+        assertTrue("Started requires the first current-proof gate", firstProofGate >= 0)
+        assertTrue("TUN health must settle after the first proof gate", tunHealth > firstProofGate)
+        assertTrue("Started requires a second proof gate after TUN health settles", secondProofGate > tunHealth)
+        assertTrue("the publication proof gate must run before Started", startedPublication > secondProofGate)
+        assertTrue("failed publication must remain Starting", started.substring(secondProofGate, startedPublication).contains("status.value = Status.Starting"))
+        assertTrue("failed publication must enter the immediate route watchdog", failedPublication > startedPublication)
+        assertTrue("proof loss before publication must request an immediate watchdog check", immediateWatchdog > failedPublication)
         val continuationGuard = functionBody(source, "shouldContinueStart")
         assertTrue(continuationGuard.contains("ServiceLifecycleOwnership.isCurrent(serviceOwnerToken)"))
     }
@@ -75,27 +118,70 @@ class IcmpResilienceSourceGuardTest {
     }
 
     @Test
+    fun `VPN service constructs BoxService only after Android attaches its base context`() {
+        val source = sourceFile("VPNService.kt")
+        val onCreate = functionBody(source, "onCreate")
+        val onDestroy = functionBody(source, "onDestroy")
+
+        assertTrue(Regex("private\\s+lateinit\\s+var\\s+service\\s*:\\s*BoxService").containsMatchIn(source))
+        assertFalse(
+            "BoxService must not be created from a VPNService property initializer",
+            Regex("private\\s+(?:[A-Za-z_][A-Za-z0-9_]*\\s+)*service(?:\\s*:\\s*BoxService)?\\s*=\\s*BoxService\\s*\\(")
+                .containsMatchIn(source),
+        )
+
+        val superCreate = onCreate.indexOf("super.onCreate()")
+        val serviceCreate = onCreate.indexOf("service = BoxService(this, this)")
+        assertTrue("VPNService must call the Android lifecycle before resolving BoxService dependencies", superCreate >= 0)
+        assertTrue("BoxService construction must follow super.onCreate", serviceCreate > superCreate)
+
+        val destroyGuard = onDestroy.indexOf("if (::service.isInitialized)")
+        val serviceDestroy = onDestroy.indexOf("service.onDestroy()")
+        val superDestroy = onDestroy.indexOf("super.onDestroy()")
+        assertTrue("destroy must tolerate a service that never reached onCreate", destroyGuard >= 0)
+        assertTrue("BoxService destroy must remain inside the initialization guard", serviceDestroy > destroyGuard)
+        assertTrue("VPNService must retain super.onDestroy in its finally path", Regex("}\\s*finally\\s*\\{").containsMatchIn(onDestroy))
+        assertTrue("VPNService must always complete its Android destroy lifecycle", superDestroy > serviceDestroy)
+    }
+
+    @Test
+    fun `proxy service constructs BoxService only after Android attaches its base context`() {
+        val source = sourceFile("ProxyService.kt")
+        val onCreate = functionBody(source, "onCreate")
+        val onDestroy = functionBody(source, "onDestroy")
+
+        assertTrue(Regex("private\\s+lateinit\\s+var\\s+service\\s*:\\s*BoxService").containsMatchIn(source))
+        assertFalse(
+            "BoxService must not be created from a ProxyService property initializer",
+            Regex("private\\s+(?:[A-Za-z_][A-Za-z0-9_]*\\s+)*service(?:\\s*:\\s*BoxService)?\\s*=\\s*BoxService\\s*\\(")
+                .containsMatchIn(source),
+        )
+
+        val superCreate = onCreate.indexOf("super.onCreate()")
+        val serviceCreate = onCreate.indexOf("service = BoxService(this, this)")
+        assertTrue("ProxyService must call the Android lifecycle before resolving BoxService dependencies", superCreate >= 0)
+        assertTrue("BoxService construction must follow super.onCreate", serviceCreate > superCreate)
+
+        val destroyGuard = onDestroy.indexOf("if (::service.isInitialized)")
+        val serviceDestroy = onDestroy.indexOf("service.onDestroy()")
+        val superDestroy = onDestroy.indexOf("super.onDestroy()")
+        assertTrue("destroy must tolerate a service that never reached onCreate", destroyGuard >= 0)
+        assertTrue("BoxService destroy must remain inside the initialization guard", serviceDestroy > destroyGuard)
+        assertTrue("ProxyService must retain super.onDestroy in its finally path", Regex("}\\s*finally\\s*\\{").containsMatchIn(onDestroy))
+        assertTrue("ProxyService must always complete its Android destroy lifecycle", superDestroy > serviceDestroy)
+    }
+
+    @Test
     fun `open tun passes and returns the same establisher descriptor with no dup or detach`() {
         val source = sourceFile("VPNService.kt")
         val openTun = functionBody(source, "openTun")
 
-        val establishMatch = Regex("val (\\w+) = builder\\.establish\\(\\)\\s*\\?:").find(openTun)
-        assertTrue("openTun must capture establisher descriptor from builder.establish()", establishMatch != null)
-        val establisher = establishMatch?.groupValues?.get(1)
-        assertTrue("unable to resolve establisher variable name", establisher != null)
-        val establisherName = establisher ?: ""
-        val replace = openTun.indexOf("service.replaceTunFileDescriptor($establisherName)")
-        val establish = openTun.indexOf("val $establisherName = builder.establish()")
-        val escapedEstablisher = Regex.escape(establisherName)
-        val directReturn = Regex("""return\s+$escapedEstablisher\.fd\b""").find(openTun)
-        val nativeFdAlias = Regex("""val\s+(\w+)\s*=\s*$escapedEstablisher\.fd\b""").find(openTun)
-        val aliasReturn = nativeFdAlias?.let { alias ->
-            Regex("""return\s+${Regex.escape(alias.groupValues[1])}\b""")
-                .find(openTun, alias.range.last + 1)
-        }
-        val returnDescriptor = directReturn?.range?.first ?: aliasReturn?.range?.first ?: -1
-        val establisherClose = openTun.indexOf("$establisherName.close()", establish)
-        val establisherRelease = openTun.indexOf("$establisherName.detachFd()", establish)
+        val establish = openTun.indexOf("val pfd = builder.establish()")
+        val replace = openTun.indexOf("service.replaceTunFileDescriptor(pfd)")
+        val nativeFd = openTun.indexOf("val nativeFd = pfd.fd")
+        val returnDescriptor = openTun.indexOf("return nativeFd")
+        val establisherClose = openTun.indexOf("pfd.close()", establish)
+        val establisherRelease = openTun.indexOf("pfd.detachFd()", establish)
 
         assertTrue(establish >= 0)
         assertTrue("openTun must keep descriptor ownership in ServiceLifecycle owner", replace >= 0)
@@ -233,7 +319,59 @@ class IcmpResilienceSourceGuardTest {
     }
 
     @Test
-    fun `ownership watchdog starts before native setup and counts loss only after own VPN was established`() {
+    fun `onStartCommand captures explicit user intent into VPN start marker`() {
+        val onStart = functionBody(sourceFile("BoxService.kt"), "onStartCommand")
+        val explicitRequest = onStart.indexOf("val explicitUserStartRequested =")
+        val bypassMarker = onStart.indexOf("!restartedBySystem")
+        val explicitExtra = onStart.indexOf("intent?.getBooleanExtra(Action.EXTRA_USER_INITIATED, false) == true")
+        val explicitCapture = onStart.indexOf("explicitUserStartRequested && Settings.serviceMode == ServiceMode.VPN")
+        val rejectedStart = onStart.indexOf("shouldRejectNewVpnStart(")
+        val admissionOpen = onStart.indexOf("synchronized(fileDescriptorLock)")
+        val markerStore = onStart.indexOf("explicitUserVpnStartPending =")
+
+        assertTrue(explicitRequest >= 0)
+        assertTrue(bypassMarker > explicitRequest)
+        assertTrue(explicitExtra > explicitRequest)
+        assertTrue("onStartCommand should pass user intent into rejection gate", onStart.contains("explicitUserStart = explicitUserStartRequested"))
+        assertTrue(
+            "onStartCommand should capture marker through service-mode-gated assignment",
+            explicitCapture > explicitRequest,
+        )
+        val stoppedBranch = onStart.indexOf("if (status.value != Status.Stopped) {")
+        assertTrue(stoppedBranch >= 0)
+        assertTrue("capture should only happen after explicit rejected-start check", explicitCapture > rejectedStart)
+        assertTrue("capture should only happen on accepted-start branch", explicitCapture > stoppedBranch)
+        assertTrue(admissionOpen > rejectedStart)
+        assertTrue("marker assignment should happen before descriptor admission reset", markerStore < admissionOpen)
+    }
+
+    @Test
+    fun `explicit user-start marker resets on stop-path failure and descriptor replacement paths`() {
+        val replace = functionBody(sourceFile("BoxService.kt"), "replaceTunFileDescriptor")
+        val replaceReset = replace.indexOf("explicitUserVpnStartPending = false")
+        val onTunCreationFailed = functionBody(sourceFile("BoxService.kt"), "onTunCreationFailed")
+        val creationFailedReset = onTunCreationFailed.indexOf("explicitUserVpnStartPending = false")
+        val stopService = functionBody(sourceFile("BoxService.kt"), "stopService")
+        val stopReset = stopService.indexOf("explicitUserVpnStartPending = false")
+        val stopAndAlert = functionBody(sourceFile("BoxService.kt"), "stopAndAlert")
+        val stopAndAlertReset = stopAndAlert.indexOf("explicitUserVpnStartPending = false")
+        val destroy = functionBody(sourceFile("BoxService.kt"), "onDestroy")
+        val destroyReset = destroy.indexOf("explicitUserVpnStartPending = false")
+        val onRevoke = functionBody(sourceFile("BoxService.kt"), "onRevoke")
+        val revokeStopsService = onRevoke.indexOf("stopService(vpnRevoked = true)")
+
+        assertTrue("replacement path should clear explicit marker", replaceReset >= 0)
+        assertTrue("TUN creation failure should clear explicit marker", creationFailedReset >= 0)
+        assertTrue("service stop entry should clear explicit marker", stopReset >= 0)
+        assertTrue("stop entry reset must happen before further cleanup scheduling", stopReset < stopService.indexOf("cancelProcessRecovery()"))
+        assertTrue("service alert path should clear explicit marker", stopAndAlertReset >= 0)
+        assertTrue("service destroy must clear explicit marker", destroyReset >= 0)
+        assertTrue("revoke should clear marker through the shared stop path", revokeStopsService >= 0)
+        assertFalse("onRevoke should not clear marker directly", onRevoke.contains("explicitUserVpnStartPending = false"))
+    }
+
+    @Test
+    fun `ownership watchdog starts before native setup and retains ownership-loss checks without explicit takeover bypass`() {
         val source = sourceFile("BoxService.kt")
         val startService = functionBody(source, "startService")
         val resetOwnership = startService.indexOf("vpnOwnershipWasEstablished = false")
@@ -248,7 +386,7 @@ class IcmpResilienceSourceGuardTest {
         assertTrue(watchdog.contains("var consecutiveOwnVpnMisses = 0"))
         assertTrue(watchdog.contains("if (ownership.active)"))
         assertTrue(watchdog.contains("vpnOwnershipWasEstablished = true"))
-        assertTrue(watchdog.contains("explicitVpnTakeoverPending = false"))
+        assertFalse(watchdog.contains("explicitVpnTakeoverPending"))
         assertTrue(watchdog.contains("if (!ownership.known || !vpnOwnershipWasEstablished)"))
         assertTrue(watchdog.contains("consecutiveOwnVpnMisses = 0"))
         assertTrue(watchdog.contains("consecutiveOwnVpnMisses += 1"))
@@ -258,14 +396,45 @@ class IcmpResilienceSourceGuardTest {
     }
 
     @Test
-    fun `Quick Settings starts a user-initiated VPN takeover while boot restore does not`() {
+    fun `TUN precondition forwards explicit user-start marker as platform replacement allow and has no explicit bypass`() {
+        val boxSource = sourceFile("BoxService.kt")
+        val precondition = functionBody(boxSource, "requireTunCreationPrecondition")
+        val onStart = functionBody(boxSource, "onStartCommand")
+
+        assertTrue(
+            "TUN precondition should derive platform-replacement allow from explicit marker",
+            precondition.contains("val allowPlatformVpnReplacement = explicitUserVpnStartPending"),
+        )
+        assertTrue(
+            "TUN precondition should pass marker into ownership rejection",
+            precondition.contains("explicitUserStart = allowPlatformVpnReplacement"),
+        )
+        assertTrue(
+            "TUN precondition should forward marker into runtime-owned quiescence gate",
+            precondition.contains("allowPlatformVpnReplacement = allowPlatformVpnReplacement"),
+        )
+        assertTrue(onStart.contains("explicitUserStart = explicitUserStartRequested"))
+        assertFalse(onStart.contains("explicitUserStart = true"))
+        assertFalse(precondition.contains("explicitUserStart = true"))
+    }
+
+    @Test
+    fun `TileService and boot restore use shared BoxService connect contract without explicit takeover bypass`() {
         val tile = sourceFile("TileService.kt")
         val toggle = functionBody(tile, "toggleService")
-        assertTrue(toggle.contains("BoxService.connect(userInitiated = true)"))
+        val requestUserConnect = functionBody(tile, "requestUserConnect")
+        assertFalse(toggle.contains("userInitiated ="))
+        assertFalse(toggle.contains("EXTRA_USER_INITIATED"))
+        assertFalse(toggle.contains("explicit takeover"))
+        assertTrue(toggle.contains("requestUserConnect()"))
+        assertTrue(requestUserConnect.contains("VpnPermissionActivity"))
 
         val boot = sourceFile("BootReceiver.kt")
         val receive = functionBody(boot, "onReceive")
-        assertTrue(receive.contains("BoxService.connect(userInitiated = false)"))
+        assertFalse(receive.contains("userInitiated ="))
+        assertFalse(receive.contains("EXTRA_USER_INITIATED"))
+        assertFalse(receive.contains("explicit takeover"))
+        assertTrue(receive.contains("BoxService.connect()"))
     }
 
     @Test
@@ -292,16 +461,18 @@ class IcmpResilienceSourceGuardTest {
     }
 
     @Test
-    fun `core cleanup closes descriptor propagates close result and waits for TUN release`() {
+    fun `core cleanup closes descriptor retires platform VPN and waits for TUN release`() {
         val source = sourceFile("BoxService.kt")
         val cleanup = functionBody(source, "closeMobileCoreAndAwaitTunQuiescence")
         val descriptorClose = cleanup.indexOf("closeTunFileDescriptor()")
         val coreClose = cleanup.indexOf("MobileCoreCloser.closeBlocking(reason)")
+        val platformRetirement = cleanup.indexOf("val platformVpnRetired = if (")
         val tunWait = cleanup.indexOf("awaitTunRuntimeQuiescence(reason, serviceStopping)")
-        val result = cleanup.indexOf("CoreCleanupResult(closeCompleted, tunQuiescent)")
+        val result = cleanup.indexOf("CoreCleanupResult(closeCompleted && platformVpnRetired, tunQuiescent)")
         assertTrue(descriptorClose >= 0)
         assertTrue(coreClose > descriptorClose)
-        assertTrue(tunWait > coreClose)
+        assertTrue("platform VPN retirement must follow a completed native close", platformRetirement > coreClose)
+        assertTrue(tunWait > platformRetirement)
         assertTrue(result > tunWait)
         val closeFailed = functionBody(source, "closeFailedRecoveryRuntime")
         assertTrue(closeFailed.contains("val cleanupResult = closeMobileCoreAndAwaitTunQuiescence(reason)"))
@@ -362,14 +533,18 @@ class IcmpResilienceSourceGuardTest {
     @Test
     fun `completed native stop retires Samsung framework VPN ownership with a local closed replacement TUN`() {
         val vpnService = sourceFile("VPNService.kt")
-        val retire = functionBody(vpnService, "retirePlatformVpnSessionAfterCoreStop")
-        val builder = retire.indexOf("Builder()")
-        val session = retire.indexOf("setSession(\"marten-stop\")", builder)
+        val retireStart = vpnService.indexOf("internal fun retirePlatformVpnSessionAfterCoreStop(")
+        val retireEnd = vpnService.indexOf("override fun autoDetectInterfaceControl", retireStart)
+        val retire = if (retireStart >= 0 && retireEnd > retireStart) {
+            vpnService.substring(retireStart, retireEnd)
+        } else {
+            vpnService
+        }
+        val session = retire.indexOf("setSession(\"marten-stop\")")
         val establish = retire.indexOf("establish()", session)
         val close = retire.indexOf(".close()", establish)
 
-        assertTrue(builder >= 0)
-        assertTrue(session > builder)
+        assertTrue(session >= 0)
         assertTrue(establish > session)
         assertTrue("local replacement TUN must be closed immediately", close > establish)
         assertFalse("teardown TUN must never be handed to the core owner", retire.contains("replaceTunFileDescriptor"))
@@ -377,10 +552,30 @@ class IcmpResilienceSourceGuardTest {
 
         val stop = functionBody(sourceFile("BoxService.kt"), "stopService")
         val completed = stop.indexOf("coreClosed.completed")
-        val retireCall = stop.indexOf("retirePlatformVpnSessionAfterCoreStop()", completed)
+        val shouldRetireCall = stop.indexOf("if (shouldRetirePlatformVpnAfterCoreStop(", completed)
+        val retireCall = stop.indexOf("retirePlatformVpnSessionAfterCoreStop {", completed)
+        val cleanupGuard = stop.indexOf("requiresCoreCleanupEscalation(", shouldRetireCall)
+        val retirementGateStart = if (retireCall >= 0) retireCall else shouldRetireCall
+        val retirementGateEnd = if (cleanupGuard >= 0) cleanupGuard else stop.length
+        val ownershipRevokedGate = stop.indexOf("!vpnOwnershipRevoked &&", retirementGateStart)
+        val externalGate = stop.indexOf(
+            "!isExternalVpnActive(service, \"platform VPN retirement final gate\")",
+            retirementGateStart,
+        )
         val stopped = stop.indexOf("status.value = Status.Stopped", completed)
         assertTrue(completed >= 0)
+        assertTrue("retirement decision should guard legacy core stop completion path", shouldRetireCall > completed)
         assertTrue("framework teardown follows completed core and retained-TUN cleanup", retireCall > completed)
+        assertTrue(
+            "retirement should run only while ownership is intact and no external VPN is active",
+            ownershipRevokedGate in (retireCall + 1 until retirementGateEnd),
+        )
+        assertTrue(
+            "retirement should pass the same external VPN gate before executing replacement TUN",
+            externalGate in (ownershipRevokedGate + 1 until retirementGateEnd),
+        )
+        assertTrue("lambda gates must execute before cleanup replacement decision", cleanupGuard > ownershipRevokedGate)
+        assertTrue("lambda gates must execute before cleanup replacement decision", cleanupGuard > externalGate)
         assertTrue("manual disconnect still reaches Stopped after framework teardown", stopped > retireCall)
     }
 
@@ -732,18 +927,35 @@ class IcmpResilienceSourceGuardTest {
     }
 
     @Test
-    fun `external recovery sites delegate to request admission rather than launching directly`() {
+    fun `initial startup failures are terminal while runtime recovery sites use request admission`() {
         val source = sourceFile("BoxService.kt")
-        val externalRecoverySites = listOf(
+        val initialStartupSites = listOf(
             "startService",
+            "startStoredCoreFromNativeEntryPoint",
+        )
+        initialStartupSites.forEach { name ->
+            val body = functionBody(source, name)
+            assertTrue(
+                "$name must pass a failed startup data-plane probe into terminal Stop/Close",
+                body.contains("stopServiceOnRouteFailure = true"),
+            )
+            assertFalse(
+                "$name startup failure must not enter retry recovery",
+                body.contains("requestCoreRecovery("),
+            )
+            assertFalse(
+                "$name must not launch recovery directly",
+                body.contains("launchCoreRecovery("),
+            )
+        }
+
+        val runtimeRecoverySites = listOf(
             "startCoreRuntimeMonitor",
             "markCoreRuntimeStarted",
             "startCoreWatchdog",
             "recoverRoute",
-            "startStoredCoreFromNativeEntryPoint",
         )
-
-        externalRecoverySites.forEach { name ->
+        runtimeRecoverySites.forEach { name ->
             val body = functionBody(source, name)
             assertTrue("$name must request recovery through the admission gate", body.contains("requestCoreRecovery("))
             assertFalse("$name must not bypass the recovery admission gate", body.contains("launchCoreRecovery("))

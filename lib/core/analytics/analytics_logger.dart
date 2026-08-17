@@ -144,9 +144,9 @@ class CrashlyticsLoggyIntegration extends LoggyPrinter with WidgetsBindingObserv
     if (!_enabled || backend == null) return;
 
     final context = contextSnapshot;
-    final shouldReport = _shouldLog(record.level, minEventLevel) && canReportLogRecord(record.error);
+    final error = record.error;
+    final shouldReport = _shouldLog(record.level, minEventLevel) && error != null && canReportLogRecord(error);
     final fatal = _isUnhandledFatal(record);
-    final error = record.error ?? SanitizedCrashException('LogError', SensitiveDataRedactor.redact(record.message));
     final safeReason = _truncate('loggy ${record.level.name} ${SensitiveDataRedactor.redact(record.loggerName)}', 256);
 
     _enqueue(() async {
@@ -171,6 +171,9 @@ class CrashlyticsLoggyIntegration extends LoggyPrinter with WidgetsBindingObserv
 
   bool _isUnhandledFatal(LogRecord record) {
     if (record.loggerName != 'app') return false;
+    if (record.message.startsWith('Flutter Layout Error:') || record.message.contains('RenderFlex overflowed by')) {
+      return false;
+    }
     return record.message.startsWith('Flutter Error:') || record.message.startsWith('PlatformDispatcherError:');
   }
 
@@ -201,13 +204,14 @@ class CrashlyticsLoggyIntegration extends LoggyPrinter with WidgetsBindingObserv
     for (var index = 0; index < lines.length; index++) {
       final slot = (firstSlot + index) % contextRecordLimit;
       await backend.setCustomKey(_contextSlotKey(slot), lines[index]);
+      await backend.log(lines[index]);
     }
   }
 
-  Future<void> _writeNativeContextUpdate(
-    CrashReportingBackend backend,
-    ({int slot, String line}) update,
-  ) => backend.setCustomKey(_contextSlotKey(update.slot), update.line);
+  Future<void> _writeNativeContextUpdate(CrashReportingBackend backend, ({int slot, String line}) update) async {
+    await backend.setCustomKey(_contextSlotKey(update.slot), update.line);
+    await backend.log(update.line);
+  }
 
   String _contextSlotKey(int slot) => 'context_${slot.toString().padLeft(2, '0')}';
 

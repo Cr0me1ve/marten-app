@@ -46,9 +46,6 @@ object DefaultNetworkListener {
 
         class ConfirmLost(val network: Network, val token: Int) : NetworkMessage()
 
-        class Refresh(val excludedNetwork: Network?) : NetworkMessage() {
-            val response = CompletableDeferred<Network?>()
-        }
     }
 
     @OptIn(DelicateCoroutinesApi::class, ObsoleteCoroutinesApi::class)
@@ -158,16 +155,6 @@ object DefaultNetworkListener {
                             }
                         }
 
-                    is NetworkMessage.Refresh -> {
-                        lostToken++
-                        network = findUsableNetwork(message.excludedNetwork)
-                        if (network != null) {
-                            pendingRequests.forEach { it.response.complete(network) }
-                            pendingRequests.clear()
-                            listeners.values.forEach { it(network) }
-                        }
-                        message.response.complete(network)
-                    }
                 }
             }
         }
@@ -188,12 +175,6 @@ object DefaultNetworkListener {
             response.await()
         }
     }
-
-    suspend fun refresh(excludedNetwork: Network?): Network? =
-        NetworkMessage.Refresh(excludedNetwork).run {
-            networkActor.send(this)
-            response.await()
-        }
 
     suspend fun stop(key: Any) = networkActor.send(NetworkMessage.Stop(key))
 
@@ -291,7 +272,7 @@ object DefaultNetworkListener {
     }
 
     @Suppress("DEPRECATION")
-    private fun findUsableNetwork(excludedNetwork: Network? = null): Network? {
+    private fun findUsableNetwork(): Network? {
         fun Network.isUsable(): Boolean {
             val capabilities = Application.connectivity.getNetworkCapabilities(this) ?: return false
             if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return false
@@ -301,10 +282,9 @@ object DefaultNetworkListener {
         }
 
         return Application.connectivity.activeNetwork
-            ?.takeUnless { it == excludedNetwork }
             ?.takeIf { it.isUsable() }
             ?: Application.connectivity.allNetworks.firstOrNull {
-                it != excludedNetwork && it.isUsable()
+                it.isUsable()
             }
     }
 

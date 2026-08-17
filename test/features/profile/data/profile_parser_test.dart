@@ -14,6 +14,111 @@ import 'package:marten/features/profile/model/profile_entity.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 
+class _ProfileParserContext {
+  _ProfileParserContext({required this.parser, required this.ref});
+
+  final ProfileParser parser;
+  final Ref<Object?> ref;
+}
+
+class _RecordingRef implements Ref<Object?> {
+  _RecordingRef(this._container);
+
+  final ProviderContainer _container;
+
+  @override
+  ProviderContainer get container => _container;
+
+  @override
+  T refresh<T>(Refreshable<T> provider) {
+    return _container.refresh(provider);
+  }
+
+  @override
+  void invalidate(ProviderOrFamily provider) {
+    _container.invalidate(provider);
+  }
+
+  @override
+  void notifyListeners() {
+    throw UnsupportedError('notifyListeners is not implemented in this test helper');
+  }
+
+  @override
+  void listenSelf(
+    void Function(Object? previous, Object? next) listener, {
+    void Function(Object, StackTrace)? onError,
+  }) {
+    throw UnsupportedError('listenSelf is not implemented in this test helper');
+  }
+
+  @override
+  void invalidateSelf() {
+    throw UnsupportedError('invalidateSelf is not implemented in this test helper');
+  }
+
+  @override
+  void onAddListener(void Function() cb) {
+    throw UnsupportedError('onAddListener is not implemented in this test helper');
+  }
+
+  @override
+  void onRemoveListener(void Function() cb) {
+    throw UnsupportedError('onRemoveListener is not implemented in this test helper');
+  }
+
+  @override
+  void onResume(void Function() cb) {
+    throw UnsupportedError('onResume is not implemented in this test helper');
+  }
+
+  @override
+  void onCancel(void Function() cb) {
+    throw UnsupportedError('onCancel is not implemented in this test helper');
+  }
+
+  @override
+  void onDispose(void Function() cb) {
+    throw UnsupportedError('onDispose is not implemented in this test helper');
+  }
+
+  @override
+  T read<T>(ProviderListenable<T> provider) {
+    return _container.read(provider);
+  }
+
+  @override
+  bool exists(ProviderBase<Object?> provider) {
+    return _container.exists(provider);
+  }
+
+  @override
+  T watch<T>(ProviderListenable<T> provider) {
+    return _container.read(provider);
+  }
+
+  @override
+  KeepAliveLink keepAlive() {
+    throw UnsupportedError('keepAlive is not implemented in this test helper');
+  }
+
+  @override
+  ProviderSubscription<T> listen<T>(
+    ProviderListenable<T> provider,
+    void Function(T? previous, T next) listener, {
+    void Function(Object error, StackTrace stackTrace)? onError,
+    bool fireImmediately = false,
+  }) {
+    return _container.listen<T>(provider, listener, onError: onError, fireImmediately: fireImmediately);
+  }
+}
+
+List<String> _linesWithoutTerminalNewline(String text) {
+  final lines = text.split('\n');
+  if (lines.isNotEmpty && lines.last.isEmpty) lines.removeLast();
+  return lines;
+}
+
 class _DownloadCall {
   _DownloadCall({required this.url, required this.method, required this.extraHeaders});
 
@@ -102,6 +207,29 @@ void main() {
     addTearDown(container.dispose);
     await container.read(sharedPreferencesProvider.future);
     return container.read(profileParserProvider);
+  }
+
+  Future<_ProfileParserContext> newParserWithRef(_TrackingDioHttpClient httpClient) async {
+    SharedPreferences.setMockInitialValues({});
+    final sharedPreferences = await SharedPreferences.getInstance();
+    final container = ProviderContainer(
+      overrides: [
+        sharedPreferencesProvider.overrideWith((_) => Future.value(sharedPreferences)),
+        deviceIdentityProvider.overrideWith(
+          (ref) => Future.value(
+            const DeviceIdentity(deviceId: 'device-id-for-tests', clientSecret: 'client-secret-for-tests'),
+          ),
+        ),
+        httpClientProvider.overrideWithValue(httpClient),
+      ],
+    );
+    addTearDown(container.dispose);
+    await container.read(sharedPreferencesProvider.future);
+    final ref = _RecordingRef(container);
+    return _ProfileParserContext(
+      parser: ProfileParser(ref: ref, httpClient: container.read(httpClientProvider)),
+      ref: ref,
+    );
   }
 
   const validBaseUrl = "https://example.com/configurations/user1/filename.yaml";
@@ -404,7 +532,7 @@ void main() {
     {"type": "future-vpn", "tag": "future"},
     {"type": "vless", "tag": "via-future", "detour": "future"},
     {"type": "wireguard", "tag": "via-via-future", "detour": "via-future"},
-    {"type": "selector", "tag": "choose", "outbounds": ["wg", "future", "via-future"]},
+    {"type": "selector", "tag": "choose", "outbounds": ["wg", "future", "via-future"], "default": "future"},
     {"type": "urltest", "tag": "test", "outbounds": ["icmp", "future", "via-via-future"]}
   ],
   "servers": [
@@ -425,6 +553,7 @@ void main() {
       expect((byTag['wg']!['type']), 'wireguard');
       expect((byTag['icmp']!['type']), 'icmp');
       expect(byTag['choose']!['outbounds'], ['wg']);
+      expect(byTag['choose'], isNot(contains('default')));
       expect(byTag['test']!['outbounds'], ['icmp']);
       expect(
         (normalized['servers'] as List<dynamic>).map((server) => (server as Map<String, dynamic>)['tag']),
@@ -567,7 +696,85 @@ void main() {
       expect(profile.isRight(), true);
       profile.match((l) {}, (r) {
         final rp = r as RemoteProfileEntity;
-        expect(rp.options, equals(const ProfileOptions(updateInterval: Duration(hours: 1))));
+        expect(rp.options, equals(ProfileOptions(updateInterval: ProfileParser.defaultUpdateInterval)));
+      });
+    });
+
+    test("Should preserve profile-title, URL, and metadata on remote parse without user override", () {
+      final tempFile = File('${Directory.systemTemp.path}/marten-profile-title-metadata.json');
+      const rawContent = '''
+{
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "Berlin § 0",
+      "server": "edge.example.net",
+      "server_port": 443
+    }
+  ],
+  "split_tunnel": {
+    "bypass_apps": ["com.example.app"]
+  },
+  "subscription": {
+    "expires_at": "2026-08-14T18:45:00Z"
+  }
+}
+''';
+      tempFile.writeAsStringSync(rawContent);
+      addTearDown(() {
+        if (tempFile.existsSync()) {
+          tempFile.deleteSync();
+        }
+      });
+
+      final headers = <String, List<String>>{
+        "profile-title": ["base64:0JzQvtC5IFZQTg=="],
+        "subscription-userinfo": ["upload=100;download=200;total=300;expire=1704054600.55"],
+        "profile-web-page-url": [validBaseUrl],
+        "support-url": [validSupportUrl],
+        "remote-dns-address": ["udp://8.8.8.8"],
+        "direct-dns-address": ["udp://9.9.9.9"],
+      };
+      final fixedHeaders = headers.map((key, value) {
+        if (value.length == 1) return MapEntry(key, value.first);
+        return MapEntry(key, value);
+      });
+      final allHeaders = ProfileParser.populateHeaders(content: rawContent, remoteHeaders: fixedHeaders);
+      expect(allHeaders.isRight(), true);
+
+      allHeaders.match((l) => fail('populateHeaders failed: $l'), (populated) {
+        final profile = ProfileParser.parse(
+          tempFilePath: tempFile.path,
+          profile: ProfileEntity.remote(
+            id: const Uuid().v4(),
+            active: true,
+            name: '',
+            url: validBaseUrl,
+            lastUpdate: DateTime.now(),
+            populatedHeaders: populated,
+          ),
+        );
+
+        expect(profile.isRight(), isTrue);
+        profile.match((l) => fail('parse failed: $l'), (r) {
+          final rp = r as RemoteProfileEntity;
+          expect(rp.name, equals("Мой VPN"));
+          expect(rp.url, equals(validBaseUrl));
+          expect(rp.options, equals(ProfileOptions(updateInterval: ProfileParser.defaultUpdateInterval)));
+          expect(rp.expiresAt, isNotNull);
+          expect(rp.subInfo?.upload, 100);
+          expect(rp.subInfo?.download, 200);
+          expect(rp.subInfo?.total, 300);
+          expect(
+            rp.subInfo?.expire,
+            equals(DateTime.fromMillisecondsSinceEpoch(1704054600 * 1000, isUtc: true).toLocal()),
+          );
+          expect(rp.subInfo?.webPageUrl, equals(validBaseUrl));
+          expect(rp.subInfo?.supportUrl, equals(validSupportUrl));
+          expect(rp.profileOverride, contains('"remote-dns-address":"udp://8.8.8.8"'));
+          expect(rp.profileOverride, contains('"direct-dns-address":"udp://9.9.9.9"'));
+          expect(rp.profileOverride, contains('"exclude-package":["com.example.app"]'));
+        });
       });
     });
 
@@ -749,6 +956,55 @@ void main() {
       }
     });
 
+    test('should fail remote update when all responses are unsupported client markers', () async {
+      const candidateUrl = 'https://edge.example.com/sub/token-1';
+      final unsupportedContent = base64Encode(
+        utf8.encode(
+          'vless://11111111-1111-2222-3333-444455556666@edge.example.com:443#${Uri.encodeComponent("Приложение не поддерживается")}',
+        ),
+      );
+      final httpClient = _ScriptedDioHttpClient(outcomes: [null, null, null, null], body: unsupportedContent);
+      final parser = await newParser(httpClient);
+      final directory = await Directory.systemTemp.createTemp('marten-profile-parser-update-unsupported-');
+      addTearDown(() => directory.delete(recursive: true));
+      final profile = RemoteProfileEntity(
+        id: const Uuid().v4(),
+        active: true,
+        name: 'working',
+        url: candidateUrl,
+        lastUpdate: DateTime.now(),
+      );
+
+      final result = await parser
+          .updateRemote(rp: profile, tempFilePath: '${directory.path}/remote-profile.json')
+          .run();
+
+      expect(httpClient.calls, hasLength(4));
+      expect(httpClient.calls.map((call) => call.method), orderedEquals(<String>['POST', 'GET', 'GET', 'GET']));
+      expect(
+        httpClient.calls.map((call) => call.url),
+        orderedEquals(['$candidateUrl/refresh', candidateUrl, candidateUrl, candidateUrl]),
+      );
+      expect(result.isLeft(), isTrue, reason: 'all responses are unsupported and should fail closed');
+      result.match(
+        (failure) {
+          expect(
+            failure.map(
+              unexpected: (_) => false,
+              notFound: (_) => false,
+              invalidUrl: (_) => false,
+              invalidConfig: (_) => true,
+              cancelByUser: (_) => false,
+              deviceMismatch: (_) => false,
+            ),
+            isTrue,
+          );
+          expect(failure.toString(), contains('subscription server returned no supported client representation'));
+        },
+        (_) => fail('unsupported compatibility responses should not be treated as successful profile'),
+      );
+    });
+
     test("Should rotate subscription URLs across remembered LB endpoints", () {
       final profile = RemoteProfileEntity(
         id: const Uuid().v4(),
@@ -789,6 +1045,335 @@ void main() {
     });
   });
 
+  group("unsupported subscription detection", () {
+    test("returns true for Base64 VLESS content with percent-encoded Russian unsupported marker", () {
+      final content = 'vless://example.com/#${Uri.encodeComponent("Приложение не поддерживается")}';
+      final encoded = base64Encode(utf8.encode(content));
+
+      expect(ProfileParser.isUnsupportedClientSubscription(encoded), isTrue);
+    });
+
+    test("returns false for a Base64 JSON subscription with eight VLESS outbounds", () {
+      final outboundEntries = List.generate(
+        8,
+        (index) =>
+            '''
+    {"type":"vless","tag":"Berlin ${index}","server":"203.0.113.${index + 10}","server_port":443}
+''',
+      ).join(',');
+      final subscriptionContent = base64Encode(utf8.encode('{"outbounds":[$outboundEntries]}'));
+
+      expect(ProfileParser.isUnsupportedClientSubscription(subscriptionContent), isFalse);
+    });
+
+    test("returns true for plain English unsupported marker", () {
+      expect(ProfileParser.isUnsupportedClientSubscription("This client application is not supported"), isTrue);
+    });
+
+    test("does not throw and does not mark unsupported for JSON with malformed percent escape", () {
+      final content = '''
+{
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "Berlin § 0",
+      "server": "203.0.113.10",
+      "server_port": 443
+    }
+  ],
+  "remarks": "bad%zz marker"
+}
+''';
+
+      late bool isUnsupported;
+      expect(() {
+        isUnsupported = ProfileParser.isUnsupportedClientSubscription(content);
+      }, returnsNormally);
+      expect(isUnsupported, isFalse);
+    });
+
+    test("does not throw and does not mark unsupported for text with lone percent", () {
+      const content = '{"type":"vless","remarks":"xray%","server":"203.0.113.10","server_port":443}';
+
+      late bool isUnsupported;
+      expect(() {
+        isUnsupported = ProfileParser.isUnsupportedClientSubscription(content);
+      }, returnsNormally);
+      expect(isUnsupported, isFalse);
+    });
+  });
+
+  group("restoreMartenSubscriptionMetadata", () {
+    test('keeps only supported selectable outbounds in source order and removes dependent references', () {
+      const sourceContent = '''
+{
+  "outbounds": [
+    {"type":"vless","tag":"first","server":"first.example.test","server_port":443},
+    {"type":"future-protocol","tag":"future"},
+    {"type":"vless","tag":"depends-on-future","detour":"future","server":"dependent.example.test","server_port":443},
+    {"type":"selector","tag":"future-group","outbounds":["future"]},
+    {"type":"hysteria2","tag":"second","server":"second.example.test","server_port":443,"password":"test"},
+    "malformed outbound"
+  ],
+  "servers":[{"tag":"future"},{"tag":"first"},{"tag":"future-group"}],
+  "route":{"final":"future","rules":[{"outbound":"future"},{"outbound":"first"}]},
+  "dns":{"servers":[{"tag":"future-dns","address":"https://dns.example.test/dns-query","detour":"future"}]}
+}
+''';
+
+      final normalized =
+          jsonDecode(ProfileParser.normalizeMartenSubscriptionContent(sourceContent)) as Map<String, dynamic>;
+      final outbounds = List<Map<String, dynamic>>.from(normalized['outbounds'] as List);
+
+      expect(outbounds.map((outbound) => outbound['tag']), orderedEquals(['first', 'second']));
+      expect(ProfileParser.hasSelectableOutbound(jsonEncode(normalized)), isTrue);
+      expect(
+        normalized['servers'],
+        equals([
+          {'tag': 'first'},
+        ]),
+      );
+      expect((normalized['route'] as Map<String, dynamic>)['final'], isNull);
+      expect(
+        (normalized['route'] as Map<String, dynamic>)['rules'],
+        equals([
+          {'outbound': 'first'},
+        ]),
+      );
+      expect((normalized['dns'] as Map<String, dynamic>)['servers'], isEmpty);
+    });
+
+    test('fails closed when compatibility filtering leaves no selectable outbound', () {
+      const sourceContent = '''
+{
+  "outbounds": [
+    {"type":"future-protocol","tag":"future"},
+    {"type":"turncoat","tag":"helper §hide§","server":"relay.example.test","server_port":56000},
+    {"type":"selector","tag":"future-group","outbounds":["future"]}
+  ]
+}
+''';
+
+      final normalized = ProfileParser.normalizeMartenSubscriptionContent(sourceContent);
+
+      expect(ProfileParser.hasSelectableOutbound(normalized), isFalse);
+      expect(ProfileParser.validateBackgroundCandidate(sourceContent).isLeft(), isTrue);
+    });
+
+    test('moves turncoat extension metadata out of native content and restores it by exact helper tag', () {
+      const helperTag = 'Amsterdam §hide§ turncoat';
+      const sourceContent = '''
+{
+  "outbounds": [
+    {
+      "type":"turncoat",
+      "tag":"Amsterdam §hide§ turncoat",
+      "server":"relay.example.test",
+      "server_port":56000,
+      "credential_cache":{"enabled":true,"nested_future":{"ignored":true}}
+    },
+    {"type":"vless","tag":"Amsterdam","detour":"Amsterdam §hide§ turncoat","server":"edge.example.test","server_port":443}
+  ],
+  "subscription": {
+    "outbound_options": {
+      "Amsterdam §hide§ turncoat": {
+        "credential_cache":{"enabled":true,"persist_across_restarts":true,"unknown_key":"ignored"},
+        "future_extension":{"nested":{"ignored":true}}
+      },
+      "unknown-helper": {"unknown_extension":{"nested":true}}
+    }
+  }
+}
+''';
+      const parsedContent = '''
+{
+  "outbounds": [
+    {"type":"turncoat","tag":"Amsterdam §hide§ turncoat","server":"relay.example.test","server_port":56000},
+    {"type":"vless","tag":"Amsterdam","detour":"Amsterdam §hide§ turncoat","server":"edge.example.test","server_port":443}
+  ]
+}
+''';
+
+      final nativeInput =
+          jsonDecode(ProfileParser.stripMartenSubscriptionMetadata(sourceContent)) as Map<String, dynamic>;
+      final nativeHelper = List<Map<String, dynamic>>.from(nativeInput['outbounds'] as List).first;
+      final restored =
+          jsonDecode(
+                ProfileParser.restoreMartenSubscriptionMetadata(
+                  parsedContent: parsedContent,
+                  sourceContent: sourceContent,
+                ),
+              )
+              as Map<String, dynamic>;
+
+      expect(nativeHelper.containsKey('credential_cache'), isTrue);
+      expect(nativeHelper.containsKey('future_extension'), isFalse);
+      expect(nativeInput['subscription'], isNull);
+      expect(restored['subscription'], isA<Map<String, dynamic>>());
+      final outboundOptions =
+          (restored['subscription'] as Map<String, dynamic>)['outbound_options'] as Map<String, dynamic>;
+      expect(outboundOptions.keys, contains(helperTag));
+      expect(outboundOptions[helperTag], isA<Map<String, dynamic>>());
+      final restoredHelper = List<Map<String, dynamic>>.from(restored['outbounds'] as List).first;
+      expect(restoredHelper.containsKey('credential_cache'), isFalse);
+    });
+
+    test('prunes restored server and outbound-option metadata for a malformed outbound dropped by native parsing', () {
+      const sourceContent = '''
+{
+  "outbounds": [
+    {"type":"vless","tag":"survivor","server":"survivor.example.test","server_port":443,"uuid":"00000000-0000-0000-0000-000000000001"},
+    {"type":"vless","tag":"malformed","server":"malformed.example.test","server_port":443}
+  ],
+  "servers": [
+    {"tag":"survivor","server":"survivor.example.test"},
+    {"tag":"malformed","server":"malformed.example.test"}
+  ],
+  "subscription": {
+    "outbound_options": {
+      "survivor":{"future_extension":{"preserve":true}},
+      "malformed":{"future_extension":{"drop":true}}
+    }
+  }
+}
+''';
+      const parsedContent = '''
+{
+  "outbounds": [
+    {"type":"vless","tag":"survivor","server":"survivor.example.test","server_port":443,"uuid":"00000000-0000-0000-0000-000000000001"}
+  ]
+}
+''';
+
+      final restored =
+          jsonDecode(
+                ProfileParser.restoreMartenSubscriptionMetadata(
+                  parsedContent: parsedContent,
+                  sourceContent: sourceContent,
+                ),
+              )
+              as Map<String, dynamic>;
+      final servers = List<Map<String, dynamic>>.from(restored['servers'] as List);
+      final outboundOptions =
+          (restored['subscription'] as Map<String, dynamic>)['outbound_options'] as Map<String, dynamic>;
+
+      expect(servers.map((server) => server['tag']), orderedEquals(['survivor']));
+      expect(outboundOptions.keys, orderedEquals(['survivor']));
+    });
+
+    test("restores app metadata keys while keeping canonical parsed outbounds", () {
+      const parsedContent = '''
+{
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "Berlin § 0",
+      "server": "edge.example.net",
+      "server_port": 443,
+      "tls": {
+        "enabled": true
+      }
+    }
+  ],
+  "route": {"final": "direct"}
+}
+''';
+
+      const sourceContent = '''
+{
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "Berlin § 0",
+      "server": "edge.example.net",
+      "server_port": 443
+    }
+  ],
+  "servers": [
+    {
+      "tag": "Berlin § 0",
+      "address": "edge.example.net"
+    }
+  ],
+  "split_tunnel": {
+    "bypass_apps": ["com.example.app"]
+  },
+  "subscription": {
+    "endpoints": ["https://endpoint-a.example.net", "https://endpoint-b.example.net"]
+  }
+}
+''';
+
+      final restored = ProfileParser.restoreMartenSubscriptionMetadata(
+        parsedContent: parsedContent,
+        sourceContent: sourceContent,
+      );
+
+      final decoded = jsonDecode(restored) as Map<String, dynamic>;
+      final decodedSource = jsonDecode(sourceContent) as Map<String, dynamic>;
+      final restoredOutbounds = List<Map<String, dynamic>>.from(decoded['outbounds'] as List);
+      final sourceServers = List<Map<String, dynamic>>.from(decodedSource['servers'] as List);
+      final sourceSplitTunnel = decodedSource['split_tunnel'] as Map<String, dynamic>;
+      final sourceSubscription = decodedSource['subscription'] as Map<String, dynamic>;
+      final restoredRoute = decoded['route'] as Map<String, dynamic>?;
+
+      expect(restoredOutbounds, hasLength(1));
+      expect(restoredOutbounds.single, isA<Map<String, dynamic>>());
+      expect(restoredOutbounds.single['tag'], equals('Berlin § 0'));
+      expect(decoded['servers'] as List<dynamic>, equals(sourceServers));
+      expect(decoded['split_tunnel'] as Map<String, dynamic>, equals(sourceSplitTunnel));
+      expect(decoded['subscription'] as Map<String, dynamic>, equals(sourceSubscription));
+      expect(restoredRoute, isNotNull);
+    });
+
+    test("base64 or share-form source does not damage canonical output", () {
+      const parsedContent = '''
+{
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "Paris § 0",
+      "server": "edge.example.net",
+      "server_port": 443
+    }
+  ]
+}
+''';
+
+      const sourceContent = "c3ViZXNfZXhhbXBsZS9zaGFyZWQ=";
+      final restored = ProfileParser.restoreMartenSubscriptionMetadata(
+        parsedContent: parsedContent,
+        sourceContent: sourceContent,
+      );
+
+      expect(restored, equals(parsedContent));
+    });
+
+    test("returns parsed content unchanged for non-canonical parsed input", () {
+      const parsedContent = '{"outbounds":[{"type":"vless","tag":"Bad"';
+      const sourceContent = '''
+{
+  "outbounds": [{"type":"vless","tag":"Berlin § 0"}],
+  "subscription": {"name": "Server name"},
+  "servers": [{"tag":"Berlin § 0"}],
+  "split_tunnel": {"bypass_apps": ["com.example.app"]}
+}
+''';
+
+      final restored = ProfileParser.restoreMartenSubscriptionMetadata(
+        parsedContent: parsedContent,
+        sourceContent: sourceContent,
+      );
+
+      expect(restored, equals(parsedContent));
+      expect(
+        () =>
+            ProfileParser.restoreMartenSubscriptionMetadata(parsedContent: parsedContent, sourceContent: sourceContent),
+        returnsNormally,
+      );
+    });
+  });
+
   group('remote include cleanup', () {
     late Directory directory;
 
@@ -824,9 +1409,84 @@ void main() {
 
       expect(await includeFile.exists(), isFalse);
     });
+
+    test('preserves non-URL lines and indentation when expanding remote includes', () async {
+      final content =
+          '''proxies:
+  - name: Format-Test
+    type: vless
+    server: 203.0.113.10
+    port: "443"
+    uuid: 00000000-1111-2222-3333-444455556666
+    tls: true
+    servername: example.test
+    network: tcp
+    - nested: item
+'''
+              .trimRight();
+
+      final includeFile = File('${directory.path}/profile.tmp.yaml');
+      await includeFile.writeAsString('$content\nhttps://edge.example.com/subscription/format-test');
+
+      final httpClient = _TrackingDioHttpClient(
+        body: 'vless://00000000-1111-2222-3333-444455556666@example.test:443#Format-Test',
+      );
+      final context = await newParserWithRef(httpClient);
+
+      await context.parser.expandRemoteLinesInParallel(
+        tempFilePath: includeFile.path,
+        httpClient: httpClient,
+        cancelToken: CancelToken(),
+        ref: context.ref,
+      );
+
+      final expanded = await includeFile.readAsString();
+      final expected = [
+        ...content.split('\n'),
+        'vless://00000000-1111-2222-3333-444455556666@example.test:443#Format-Test',
+      ];
+
+      expect(
+        _linesWithoutTerminalNewline(expanded),
+        equals(expected),
+        reason: 'non-url lines should preserve indentation and include expansion should keep only trimmed payload',
+      );
+    });
   });
 
   group('background candidate validation', () {
+    test('accepts selectable outbounds from parsed JSON subscriptions', () {
+      const content = '''
+{
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "Germany § 0",
+      "server": "edge.example.net",
+      "server_port": 443,
+      "tls": {
+        "enabled": true
+      }
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
+}
+''';
+
+      expect(ProfileParser.validateBackgroundCandidate(content).isRight(), isTrue);
+      expect(ProfileParser.hasSelectableOutbound(content), isTrue);
+    });
+
+    test('accepts a base64-wrapped vless URI candidate', () {
+      const vless = 'vless://user@example-vless.test:443?security=tls#Germany § 0';
+      final base64 = base64Encode(utf8.encode(vless));
+
+      expect(ProfileParser.validateBackgroundCandidate(base64).isRight(), isTrue);
+    });
+
     test('accepts a structural JSON config and preserves unknown transport fields', () {
       const content = '''
 {
@@ -858,6 +1518,62 @@ void main() {
       for (final candidate in ['', '<html>temporary edge error</html>', '{"outbounds":[']) {
         expect(ProfileParser.validateBackgroundCandidate(candidate).isLeft(), isTrue, reason: candidate);
       }
+    });
+
+    test('rejects subscription configs without selectable outbounds', () {
+      const noSelectable = '''
+{
+  "outbounds": [
+    {"type": "direct", "tag": "direct"},
+    {"type": "selector", "tag": "selector", "outbounds": ["direct"]},
+    {"type": "urltest", "tag": "urltest", "outbounds": ["direct"]},
+    {"type": "vless", "tag": "Germany §hide§ 0", "server": "edge.example.net", "server_port": 443}
+  ]
+}
+''';
+
+      expect(ProfileParser.validateBackgroundCandidate(noSelectable).isLeft(), isTrue);
+      expect(ProfileParser.hasSelectableOutbound(noSelectable), isFalse);
+    });
+  });
+
+  group('selectable outbound guard', () {
+    test('accepts a real VLESS outbound as selectable', () {
+      const content = '''
+{
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "Berlin § 0",
+      "server": "edge.example.net",
+      "server_port": 443
+    },
+    {"type": "dns", "tag": "dns"},
+    {"type": "direct", "tag": "direct"}
+  ]
+}
+''';
+
+      expect(ProfileParser.hasSelectableOutbound(content), isTrue);
+    });
+
+    test('rejects infrastructure, hidden, and empty outbound lists', () {
+      expect(ProfileParser.hasSelectableOutbound('{"outbounds":[]}'), isFalse);
+      expect(ProfileParser.hasSelectableOutbound('{"outbounds":[{"type": "direct", "tag": "direct"}]}'), isFalse);
+      expect(
+        ProfileParser.hasSelectableOutbound('''
+{
+  "outbounds": [
+    {"type": "selector", "tag": "selector", "outbounds": ["direct"]},
+    {"type": "urltest", "tag": "urltest", "outbounds": ["direct"]},
+    {"type": "block", "tag": "block"},
+    {"type": "dns", "tag": "dns"},
+    {"type": "vless", "tag": "Frankfurt §hide§ 1", "server": "edge.example.net", "server_port": 443}
+  ]
+}
+'''),
+        isFalse,
+      );
     });
   });
 }

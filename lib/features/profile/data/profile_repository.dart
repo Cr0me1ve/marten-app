@@ -297,8 +297,16 @@ class ProfileRepositoryImpl with ExceptionHandler, InfraLogger implements Profil
                 final validateResult = await _singbox.validateConfigByPath(path, sanitizedTemp.path, debug).run();
                 final validateError = validateResult.match<String?>((err) => err, (_) => null);
                 if (validateError != null) throw ProfileFailure.invalidConfig(validateError);
+                final parsedContent = await File(path).readAsString();
+                if (!ProfileParser.hasSelectableOutbound(parsedContent)) {
+                  throw const ProfileFailure.invalidConfig('profile has no supported outbounds');
+                }
 
-                await ProfileCrypto.encryptContentToFile(File(path), rawContent, _deviceIdentity.clientSecret);
+                final canonicalContent = ProfileParser.restoreMartenSubscriptionMetadata(
+                  parsedContent: parsedContent,
+                  sourceContent: rawContent,
+                );
+                await ProfileCrypto.encryptContentToFile(File(path), canonicalContent, _deviceIdentity.clientSecret);
                 return unit;
               } finally {
                 if (await sanitizedTemp.exists()) await sanitizedTemp.delete();

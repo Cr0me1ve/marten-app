@@ -9,15 +9,16 @@ import 'package:marten/core/haptic/haptic_service.dart';
 import 'package:marten/core/localization/translations.dart';
 import 'package:marten/core/preferences/general_preferences.dart';
 import 'package:marten/core/router/dialog/dialog_notifier.dart';
+import 'package:marten/core/utils/preferences_utils.dart';
 import 'package:marten/features/captcha/data/captcha_notifier.dart';
 import 'package:marten/features/connection/data/connection_data_providers.dart';
 import 'package:marten/features/connection/data/connection_repository.dart';
 import 'package:marten/features/connection/data/turncoat_liveness_notifier.dart';
 import 'package:marten/features/connection/model/connection_failure.dart';
 import 'package:marten/features/connection/model/connection_status.dart';
+import 'package:marten/features/home/data/local_outbounds_provider.dart';
 import 'package:marten/features/profile/model/profile_entity.dart';
 import 'package:marten/features/profile/notifier/active_profile_notifier.dart';
-import 'package:marten/martencore/init_signal.dart';
 import 'package:marten/singbox/model/core_status.dart';
 import 'package:marten/utils/utils.dart';
 import 'package:riverpod_annotation/riverpod_annotation.dart';
@@ -45,8 +46,7 @@ ManualConnectionCommand manualConnectionCommandForStatus(ConnectionStatus status
 
 bool canExecuteManualConnectionCommand(ManualConnectionCommand command, ConnectionStatus status) => switch (command) {
   ManualConnectionCommand.connect => status is Disconnected,
-  ManualConnectionCommand.disconnect => status is Connected,
-  ManualConnectionCommand.abort => status is Connecting,
+  ManualConnectionCommand.disconnect || ManualConnectionCommand.abort => status is Connected || status is Connecting,
 };
 
 @Riverpod(keepAlive: true)
@@ -122,6 +122,9 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
       _handleAutoReconnectTransition(previousStatus, nextStatus);
       _handleRouteWatchdogTransition(nextStatus);
       _handleStartupRouteVerification(nextStatus);
+      if (nextStatus is Disconnected && previousStatus is! Disconnected) {
+        unawaited(_syncNativeResumeConfigWhenIdle());
+      }
       if (shouldResetTransientConnectionFeatures(
         previousStatus,
         nextStatus,
@@ -146,19 +149,24 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
       }
     });
 
-    ref.listen(activeProfileProvider.select((value) => value.asData?.value), (previous, next) async {
-      if (previous == null) return;
-      final shouldReconnect = next == null || previous.id != next.id;
-      if (shouldReconnect) {
-        await reconnect(next);
-      }
+    ref.listen(activeProfileProvider.select((value) => value.asData?.value), (previous, next) {
+      // Capture provider-backed dependencies before the first async gap. Core
+      // replacement used to rebuild this notifier through a restart signal;
+      // reading ref from that outdated build triggered the fatal reported by
+      // Firebase. The status stream is persistent, so this notifier no longer
+      // watches that self-invalidating signal, and in-flight work still keeps
+      // an immutable dependency snapshot.
+      final connectionRepo = _connectionRepo;
+      unawaited(_handleActiveProfileChange(previous, next, connectionRepo));
+    });
+    ref.listen(selectedProxyByProfileProvider, (previous, next) {
+      if (previous == next) return;
+      unawaited(_syncNativeResumeConfigWhenIdle());
     });
     ref.listen(turncoatLivenessNotifierProvider.select((value) => value.timedOut), (previous, next) {
       if (previous == true || next != true) return;
       unawaited(_handleTurncoatConnectTimeout());
     });
-    ref.watch(coreRestartSignalProvider);
-
     yield* _connectionRepo.watchConnectionStatus().map(_visibleConnectionStatus).doOnData((event) {
       if (event case Disconnected(connectionFailure: final _?) when PlatformUtils.isDesktop) {
         ref.read(Preferences.startedByUser.notifier).update(false);
@@ -225,10 +233,27 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
         await _connect();
       case ManualConnectionCommand.disconnect:
         _sendManualHaptic(haptic.mediumImpact());
-        await _disconnectFromManualCommand();
+        await _stopFromManualCommand(currentStatus);
       case ManualConnectionCommand.abort:
         _sendManualHaptic(haptic.mediumImpact());
-        await abortConnection();
+        await _stopFromManualCommand(currentStatus);
+    }
+  }
+
+  Future<void> _stopFromManualCommand(ConnectionStatus? currentStatus) async {
+    switch (currentStatus) {
+      case Connecting():
+        _abortConnectionImmediately();
+      case Connected() when _singleStart.isRunning:
+        // A lifecycle stream must never expose Connected before the startup
+        // operation finishes, but a stop gesture still wins if one does.
+        _abortConnectionImmediately();
+      case Connected():
+        await _disconnectFromManualCommand();
+      case Disconnecting() || Disconnected() || null:
+        // A stop already completed or is already owned by another tap. Never
+        // reinterpret this captured stop intent as a new Connect.
+        return;
     }
   }
 
@@ -257,11 +282,9 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
         },
       );
     } finally {
-      final visibleStatus = state.valueOrNull;
       if (shouldPublishManualDisconnectReleased(
         operationCompleted: completed,
         disconnectSucceeded: disconnectSucceeded,
-        visibleStatus: visibleStatus,
       )) {
         await _settleManualDisconnectInput();
         loggy.info("manual disconnect fully released; reconnect is available");
@@ -284,36 +307,60 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
     state = const AsyncData(Disconnected());
   }
 
-  Future<void> reconnect(ProfileEntity? profile) async {
+  Future<void> _handleActiveProfileChange(
+    ProfileEntity? previous,
+    ProfileEntity? next,
+    ConnectionRepository connectionRepo,
+  ) async {
+    if (previous != null && previous != next) {
+      await reconnect(next, repository: connectionRepo, waitForCurrent: true, supersedeQueued: true);
+    }
+    await _syncNativeResumeConfigWhenIdle(repository: connectionRepo, activeProfileFuture: Future.value(next));
+  }
+
+  Future<void> reconnect(
+    ProfileEntity? profile, {
+    ConnectionRepository? repository,
+    bool waitForCurrent = false,
+    bool supersedeQueued = false,
+  }) async {
     if (state case AsyncData(:final value) when value == const Connected()) {
+      final connectionRepo = repository ?? _connectionRepo;
+      final startedByUserNotifier = ref.read(Preferences.startedByUser.notifier);
+      final disableMemoryLimit = ref.read(Preferences.disableMemoryLimit);
+      final dialogNotifier = ref.read(dialogNotifierProvider.notifier);
+      final translationsFuture = ref.read(translationsProvider.future);
       if (profile == null) {
         loggy.info("no active profile, disconnecting");
         await _singleStart.run(
           () async {
             _markManualDisconnect();
-            await ref.read(Preferences.startedByUser.notifier).update(false);
-            await _disconnect();
+            await startedByUserNotifier.update(false);
+            await _disconnect(repository: connectionRepo);
           },
           onIgnored: () {
             loggy.debug("profile disconnect called while another connect/disconnect is still running, ignoring");
           },
+          waitForCurrent: waitForCurrent,
+          supersedeQueued: supersedeQueued,
+          onSuperseded: () => loggy.debug("superseded queued profile disconnect"),
         );
         return;
       }
       loggy.info("active profile changed, reconnecting");
       await _singleStart.run(
         () async {
-          final platformStatus = await _connectionRepo.readPlatformServiceStatus();
+          final platformStatus = await connectionRepo.readPlatformServiceStatus();
           if (shouldDeferFlutterReconnect(
             isAndroid: Platform.isAndroid,
-            nativeRecoveryInProgress: _connectionRepo.nativePlatformRecoveryInProgress,
+            nativeRecoveryInProgress: connectionRepo.nativePlatformRecoveryInProgress,
             platformStatus: platformStatus,
           )) {
             loggy.info("deferring Flutter reconnect until Android native recovery completes");
             _scheduleReconnectAfterNativeRecovery();
             return;
           }
-          final restartLease = await _connectionRepo.tryBeginFlutterRestart();
+          final restartLease = await connectionRepo.tryBeginFlutterRestart();
           if (restartLease == null) {
             loggy.info("Android native lifecycle is busy; deferring Flutter reconnect");
             _scheduleReconnectAfterNativeRecovery();
@@ -325,28 +372,30 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
           _nativeRecoveryReconnectTimer?.cancel();
           _nativeRecoveryReconnectTimer = null;
           try {
-            await ref.read(Preferences.startedByUser.notifier).update(true);
-            final result = await _connectionRepo.reconnect(profile, ref.read(Preferences.disableMemoryLimit)).run();
+            await startedByUserNotifier.update(true);
+            final result = await connectionRepo.reconnect(profile, disableMemoryLimit).run();
             await result.match((err) async {
               loggy.warning("error reconnecting", err);
-              await ref.read(Preferences.startedByUser.notifier).update(false);
-              final cleanup = await _connectionRepo.disconnect().run();
+              await startedByUserNotifier.update(false);
+              final cleanup = await connectionRepo.disconnect().run();
               cleanup.match(
                 (cleanupError) => loggy.warning("error cleaning up failed reconnect", cleanupError),
                 (_) {},
               );
               state = AsyncError(err, StackTrace.current);
-              await ref
-                  .read(dialogNotifierProvider.notifier)
-                  .showCustomAlertFromErr(err.present(ref.read(translationsProvider).requireValue));
+              final translations = await translationsFuture;
+              await dialogNotifier.showCustomAlertFromErr(err.present(translations));
             }, (_) => Future<void>.value());
           } finally {
-            await _connectionRepo.endFlutterRestart(restartLease);
+            await connectionRepo.endFlutterRestart(restartLease);
           }
         },
         onIgnored: () {
           loggy.debug("reconnect called while another connect/disconnect is still running, ignoring");
         },
+        waitForCurrent: waitForCurrent,
+        supersedeQueued: supersedeQueued,
+        onSuperseded: () => loggy.debug("superseded queued profile reconnect"),
       );
     }
   }
@@ -355,13 +404,16 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
     if (!Platform.isAndroid || _nativeRecoveryReconnectTimer?.isActive == true) return;
     _nativeRecoveryReconnectTimer = Timer(const Duration(seconds: 1), () async {
       _nativeRecoveryReconnectTimer = null;
-      if (_manualDisconnectRequested || !ref.read(Preferences.startedByUser)) return;
+      final startedByUser = ref.read(Preferences.startedByUser);
+      final connectionRepo = _connectionRepo;
+      final activeProfileFuture = ref.read(activeProfileProvider.future);
+      if (_manualDisconnectRequested || !startedByUser) return;
 
-      final platformStatus = await _connectionRepo.readPlatformServiceStatus();
+      final platformStatus = await connectionRepo.readPlatformServiceStatus();
       final visibleStatus = state.valueOrNull;
       if (shouldDeferFlutterReconnect(
             isAndroid: true,
-            nativeRecoveryInProgress: _connectionRepo.nativePlatformRecoveryInProgress,
+            nativeRecoveryInProgress: connectionRepo.nativePlatformRecoveryInProgress,
             platformStatus: platformStatus,
           ) ||
           visibleStatus is Connecting ||
@@ -371,25 +423,53 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
         return;
       }
 
-      final activeProfile = await ref.read(activeProfileProvider.future);
-      await reconnect(activeProfile);
+      final activeProfile = await activeProfileFuture;
+      await reconnect(activeProfile, repository: connectionRepo);
     });
   }
 
   Future<void> abortConnection() async {
-    if (state case AsyncData(:final value)) {
-      switch (value) {
-        case Connected() || Connecting():
-          loggy.debug("aborting connection");
-          _abortConnectionImmediately();
-        default:
-      }
-    }
+    final currentStatus = state.valueOrNull;
+    if (currentStatus is! Connected && currentStatus is! Connecting) return;
+    loggy.debug("aborting connection");
+    await _stopFromManualCommand(currentStatus);
   }
 
   final _singleStart = SingleCall();
+  final _nativeResumeConfigSync = SingleCall();
+
+  Future<void> _syncNativeResumeConfigWhenIdle({
+    ConnectionRepository? repository,
+    Future<ProfileEntity?>? activeProfileFuture,
+  }) async {
+    if (!Platform.isAndroid) return;
+    final connectionRepo = repository ?? _connectionRepo;
+    final profileFuture = activeProfileFuture ?? ref.read(activeProfileProvider.future);
+    await _nativeResumeConfigSync.run(
+      () async {
+        if (_singleStart.isRunning || state.valueOrNull is! Disconnected) return;
+        final activeProfile = await profileFuture;
+        if (_singleStart.isRunning || state.valueOrNull is! Disconnected) return;
+        final result = await connectionRepo.syncNativeResumeConfig(activeProfile).run();
+        result.match((err) => loggy.warning('failed to synchronize native resume config', err), (_) {});
+      },
+      waitForCurrent: true,
+      supersedeQueued: true,
+      onIgnored: () {},
+      onSuperseded: () {
+        loggy.debug('superseded queued native resume config synchronization');
+      },
+    );
+  }
 
   Future<bool> _connect({bool silent = false}) {
+    final connectionRepo = _connectionRepo;
+    final activeProfileFuture = ref.read(activeProfileProvider.future);
+    final startedByUserNotifier = ref.read(Preferences.startedByUser.notifier);
+    final disableMemoryLimit = ref.read(Preferences.disableMemoryLimit);
+    final analyticsController = ref.read(analyticsControllerProvider.notifier);
+    final dialogNotifier = ref.read(dialogNotifierProvider.notifier);
+    final translationsFuture = ref.read(translationsProvider.future);
     int? requestToken;
     return _singleStart.run(
       () async {
@@ -403,13 +483,29 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
         }
 
         try {
-          await ref.read(Preferences.startedByUser.notifier).update(true);
-          final attempted = await _connectThrottled(silent: silent, requestToken: requestToken);
+          await startedByUserNotifier.update(true);
+          final attempted = await _connectThrottled(
+            connectionRepo: connectionRepo,
+            activeProfileFuture: activeProfileFuture,
+            startedByUserNotifier: startedByUserNotifier,
+            disableMemoryLimit: disableMemoryLimit,
+            analyticsController: analyticsController,
+            dialogNotifier: dialogNotifier,
+            translationsFuture: translationsFuture,
+            silent: silent,
+            requestToken: requestToken,
+          );
           if (!attempted && requestToken == _abortToken) {
             state = const AsyncData(Disconnected());
           }
         } finally {
-          if (requestToken == _abortToken) _manualConnectPending = false;
+          if (requestToken == _abortToken) {
+            _manualConnectPending = false;
+            if (state.valueOrNull is Connecting && !connectionRepo.isCoreStartedSnapshot) {
+              loggy.warning("connect operation ended without a running core; publishing terminal disconnected state");
+              state = const AsyncData(Disconnected());
+            }
+          }
         }
       },
       onIgnored: () {
@@ -418,16 +514,25 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
     );
   }
 
-  Future<bool> _connectThrottled({bool silent = false, int? requestToken}) async {
-    final activeProfile = await ref.read(activeProfileProvider.future);
+  Future<bool> _connectThrottled({
+    required ConnectionRepository connectionRepo,
+    required Future<ProfileEntity?> activeProfileFuture,
+    required PreferencesNotifier<bool, bool> startedByUserNotifier,
+    required bool disableMemoryLimit,
+    required AnalyticsController analyticsController,
+    required DialogNotifier dialogNotifier,
+    required Future<Translations> translationsFuture,
+    bool silent = false,
+    int? requestToken,
+  }) async {
+    final activeProfile = await activeProfileFuture;
     if (activeProfile == null) {
       loggy.info("no active profile, not connecting");
-      await ref.read(Preferences.startedByUser.notifier).update(false);
+      await startedByUserNotifier.update(false);
       return false;
     }
-    await _connectionRepo.connect(activeProfile, ref.read(Preferences.disableMemoryLimit)).mapLeft((
-      ConnectionFailure err,
-    ) async {
+    final result = await connectionRepo.connect(activeProfile, disableMemoryLimit).run();
+    await result.match((ConnectionFailure err) async {
       if (requestToken != null && requestToken != _abortToken) {
         loggy.info("ignoring connection failure from a superseded manual connect", err);
         return;
@@ -444,54 +549,47 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
       }
       loggy.warning("error connecting", err);
       if (err.toString().contains("panic")) {
-        await ref
-            .read(analyticsControllerProvider.notifier)
-            .recordNonFatal(
-              StateError('native core panic reported during connect'),
-              StackTrace.current,
-              reason: 'native_core_panic_connect',
-            );
+        await analyticsController.recordNonFatal(
+          StateError('native core panic reported during connect'),
+          StackTrace.current,
+          reason: 'native_core_panic_connect',
+        );
       }
-      final platformStatus = await _connectionRepo.readPlatformServiceStatus();
-      final platformStartedByUser = await _connectionRepo.readPlatformStartedByUser();
-      if (shouldDelegateFailedConnectionToAndroidRecovery(
-        isAndroid: Platform.isAndroid,
-        failure: err,
-        platformStatus: platformStatus,
-        platformStartedByUser: platformStartedByUser,
-        nativeRecoveryInProgress: _connectionRepo.nativePlatformRecoveryInProgress,
-      )) {
-        loggy.warning("selected server is unavailable; Android native recovery will keep retrying", err);
-        state = const AsyncData(Connecting());
-        return;
-      }
+      // Repository startup failures are reported only after the core and TUN
+      // stop/close path completes. Publish a terminal value before opening the
+      // dialog so a dismissed or failed dialog can never retain Connecting.
+      await startedByUserNotifier.update(false);
       if (silent) {
         loggy.warning("auto reconnect attempt failed", err);
         _lastSilentAutoReconnectFailure = err;
         state = AsyncData(_visibleStatusDuringAutoReconnect(Disconnected(err)));
         return;
       }
-      await ref.read(Preferences.startedByUser.notifier).update(false);
-      //Go err is not normal object to see the go errors are string and need to be dumped
-      await ref
-          .read(dialogNotifierProvider.notifier)
-          .showCustomAlertFromErr(err.present(ref.read(translationsProvider).requireValue));
+      state = AsyncData(Disconnected(err));
+      // Go errors are string-backed; present their normalized failure only
+      // after the platform cleanup and terminal state publication above.
+      final translations = await translationsFuture;
+      await dialogNotifier.showCustomAlertFromErr(err.present(translations));
       loggy.warning(err);
-      state = AsyncError(err, StackTrace.current);
-    }).run();
+    }, (_) => Future<void>.value());
     return true;
   }
 
-  Future<bool> _disconnect({bool showError = true}) async {
-    final result = await _connectionRepo.disconnect().mapLeft((err) {
+  Future<bool> _disconnect({bool showError = true, ConnectionRepository? repository}) async {
+    final connectionRepo = repository ?? _connectionRepo;
+    final dialogNotifier = ref.read(dialogNotifierProvider.notifier);
+    final translationsFuture = ref.read(translationsProvider.future);
+    final result = await connectionRepo.disconnect().run();
+    result.match((err) {
       loggy.warning("error disconnecting", err);
-      if (showError) {
-        ref
-            .read(dialogNotifierProvider.notifier)
-            .showCustomAlertFromErr(err.present(ref.read(translationsProvider).requireValue));
-        state = AsyncError(err, StackTrace.current);
-      }
-    }).run();
+      if (!showError) return;
+      state = AsyncError(err, StackTrace.current);
+      unawaited(
+        translationsFuture.then((translations) {
+          return dialogNotifier.showCustomAlertFromErr(err.present(translations));
+        }),
+      );
+    }, (_) {});
     return result.isRight();
   }
 
@@ -619,6 +717,14 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
         await _disconnect(showError: false);
         state = const AsyncData(Disconnected());
         return;
+      }
+      if (Platform.isAndroid) {
+        // A retained native TURNcoat session can request CAPTCHA before the
+        // Flutter status stream has proved and adopted that session. Arm only
+        // after native ownership is confirmed so CaptchaNotifier replays that
+        // bounded deferred request while route verification is still pending.
+        ref.read(captchaNotifierProvider.notifier).arm(enabled: true);
+        loggy.info("armed captcha watcher for owned existing Android session");
       }
       loggy.info("verifying existing started route before showing connected");
       final result = await _connectionRepo.verifyConnectedRoute(holdStartupRouteReady: true).run();
@@ -994,22 +1100,6 @@ enum AutomaticConnectionRecoveryOwner { flutter, androidService }
 AutomaticConnectionRecoveryOwner automaticConnectionRecoveryOwnerForPlatform({required bool isAndroid}) =>
     isAndroid ? AutomaticConnectionRecoveryOwner.androidService : AutomaticConnectionRecoveryOwner.flutter;
 
-bool shouldDelegateFailedConnectionToAndroidRecovery({
-  required bool isAndroid,
-  required ConnectionFailure failure,
-  required CoreStatus? platformStatus,
-  required bool? platformStartedByUser,
-  required bool nativeRecoveryInProgress,
-}) {
-  final recoverableFailure = switch (failure) {
-    UnexpectedConnectionFailure(:final error) => looksLikeSelectedRouteConnectivityError(error),
-    _ => false,
-  };
-  if (!isAndroid || !recoverableFailure || platformStartedByUser != true) return false;
-  if (platformStatus is CoreStarting || platformStatus is CoreStarted) return true;
-  return nativeRecoveryInProgress && platformStatus == null;
-}
-
 bool shouldDeferFlutterReconnect({
   required bool isAndroid,
   required bool nativeRecoveryInProgress,
@@ -1136,15 +1226,11 @@ ConnectionStatus visibleStatusDuringManualButtonDisconnect(
   return event;
 }
 
-bool shouldPublishManualDisconnectReleased({
-  required bool operationCompleted,
-  required bool disconnectSucceeded,
-  required ConnectionStatus? visibleStatus,
-}) => operationCompleted && disconnectSucceeded && (visibleStatus is Disconnecting || visibleStatus is Disconnected);
+bool shouldPublishManualDisconnectReleased({required bool operationCompleted, required bool disconnectSucceeded}) =>
+    operationCompleted && disconnectSucceeded;
 
 @Riverpod(keepAlive: true)
 Future<bool> serviceRunning(Ref ref) async {
-  // ref.watch(coreRestartSignalProvider);
   return await ref
       .watch(connectionNotifierProvider.selectAsync((data) => data.isConnected))
       .onError((error, stackTrace) => false);
