@@ -4,6 +4,8 @@ Marten is a cross-platform, bring-your-own-configuration network client built wi
 
 The app source is published at [Cr0me1ve/marten-app](https://github.com/Cr0me1ve/marten-app).
 
+[![Android](https://github.com/Cr0me1ve/marten-app/actions/workflows/android.yml/badge.svg)](https://github.com/Cr0me1ve/marten-app/actions/workflows/android.yml)
+
 The app supports common proxy and tunnel configuration formats, including WireGuard, AmneziaWG, VLESS/Xray, Hysteria2, and configurations that use a WebRTC TURN transport. Marten does not ship with connection profiles or operate network infrastructure; you provide the configuration you are authorized to use.
 
 Marten is developed alongside [marten-core](https://github.com/Cr0me1ve/marten-core) and [marten-sing-box](https://github.com/Cr0me1ve/marten-sing-box). Those repositories provide the native runtime and networking engine used by the app.
@@ -39,6 +41,8 @@ More detail for contributors is in [docs/development.md](docs/development.md). F
 ## Native runtime artifacts
 
 Native builds, including `flutter run`, need separately built artifacts from [marten-core](https://github.com/Cr0me1ve/marten-core) and its [marten-sing-box](https://github.com/Cr0me1ve/marten-sing-box) dependency. Native artifacts are intentionally not committed here, so a fresh clone is sufficient for Flutter and Dart work but not for running or packaging a native build. The platform preparation targets in [Makefile](Makefile) show where those artifacts are expected during a release build.
+
+The public Android workflow downloads a stripped, SHA256-pinned `marten-core.aar` from this repository's dependency release, verifies its embedded revisions, runs the Flutter and Android test suites, and builds an arm64 APK on a GitHub-hosted runner. A `vX.Y.Z` tag publishes the verified APK, checksum, signing-certificate report, and provenance metadata to [GitHub Releases](https://github.com/Cr0me1ve/marten-app/releases). Repository pushes and tags use the stable signing identity stored in GitHub Secrets, and the workflow rejects an unexpected certificate digest. The native core itself is built separately; the public app workflow only packages the pinned artifact.
 
 ## Optional Firebase setup
 

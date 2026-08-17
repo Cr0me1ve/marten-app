@@ -1,0 +1,244 @@
+name: Android
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Optional vX.Y.Z tag to create or update after a successful build"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_VERSION: "3.38.5"
+  ANDROID_NDK_VERSION: "28.2.13676358"
+  CORE_RELEASE_TAG: "core-0.7.7"
+  CORE_AAR_SHA256: "c810d5be542c44d01b20db210d1d46ba2eef83b9a8354f4d4be686b3a243dc68"
+  CORE_AAR_SO_SHA256: "ca598461c5e40066a7eeeb4de3e9a0e2bcbab50253f276f260f1080b79735755"
+  CORE_APK_SO_SHA256: "7b65fadfbe0c921dad3d0498c9ac8479e233f8100be66e30bff56978528924c3"
+  CORE_REVISION: "5acffd5bca5ed7a5f4bbfd87aeee97327df6f850"
+  SING_BOX_REVISION: "7303baa90f7f55102b621fb34704736011b3e1a1"
+  TURNCOAT_REVISION: "29ba26b97c3c62a9aa7da7f8a4d5bd04a36e1622"
+  RELEASE_SIGNER_SHA256: "4acd16e170370e30653cd5be65643e745c6b8e9ee1e00f91a308bc86110b1f5d"
+
+jobs:
+  build:
+    name: Test and build Android arm64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Set up Go for embedded provenance inspection
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.5"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Install the pinned Android NDK
+        shell: bash
+        run: sdkmanager "ndk;${ANDROID_NDK_VERSION}"
+
+      - name: Download the pinned public core AAR
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p android/app/libs
+          gh release download "${CORE_RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern marten-core.aar \
+            --dir android/app/libs \
+            --clobber
+
+      - name: Verify the core AAR and linked revisions
+        shell: bash
+        run: |
+          echo "${CORE_AAR_SHA256}  android/app/libs/marten-core.aar" | sha256sum --check --strict
+          mkdir -p "${RUNNER_TEMP}/marten-core"
+          unzip -p android/app/libs/marten-core.aar jni/arm64-v8a/libmarten-core.so \
+            > "${RUNNER_TEMP}/marten-core/libmarten-core.so"
+          echo "${CORE_AAR_SO_SHA256}  ${RUNNER_TEMP}/marten-core/libmarten-core.so" | sha256sum --check --strict
+          go version -m "${RUNNER_TEMP}/marten-core/libmarten-core.so"
+          grep -aFq "${CORE_REVISION}" "${RUNNER_TEMP}/marten-core/libmarten-core.so"
+          grep -aFq "${SING_BOX_REVISION}" "${RUNNER_TEMP}/marten-core/libmarten-core.so"
+          grep -aFq "${TURNCOAT_REVISION}" "${RUNNER_TEMP}/marten-core/libmarten-core.so"
+
+      - name: Generate Flutter sources
+        shell: bash
+        run: |
+          flutter pub get
+          dart run build_runner build --delete-conflicting-outputs
+          dart run slang
+
+      - name: Configure stable Android signing
+        if: github.event_name != 'pull_request'
+        shell: bash
+        env:
+          MARTEN_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          MARTEN_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          MARTEN_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          MARTEN_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          test -n "${MARTEN_KEYSTORE_BASE64}"
+          test -n "${MARTEN_KEYSTORE_PASSWORD}"
+          test -n "${MARTEN_KEY_ALIAS}"
+          test -n "${MARTEN_KEY_PASSWORD}"
+          printf '%s' "${MARTEN_KEYSTORE_BASE64}" | base64 --decode > "${RUNNER_TEMP}/marten-release.jks"
+          {
+            echo "storePassword=${MARTEN_KEYSTORE_PASSWORD}"
+            echo "keyPassword=${MARTEN_KEY_PASSWORD}"
+            echo "keyAlias=${MARTEN_KEY_ALIAS}"
+            echo "storeFile=${RUNNER_TEMP}/marten-release.jks"
+          } > android/key.properties
+
+      - name: Run Flutter tests
+        run: flutter test
+
+      - name: Run Android unit tests
+        working-directory: android
+        run: ./gradlew :app:testDebugUnitTest
+
+      - name: Build release APK
+        shell: bash
+        run: flutter build apk --release --target-platform android-arm64 --split-per-abi
+
+      - name: Package and verify release
+        id: package
+        shell: bash
+        run: |
+          APP_VERSION="$(sed -n 's/^version: \([^+]*\).*/\1/p' pubspec.yaml)"
+          BUILD_NUMBER="$(sed -n 's/^version: [^+]*+\(.*\)/\1/p' pubspec.yaml)"
+          if [[ -z "${APP_VERSION}" || -z "${BUILD_NUMBER}" ]]; then
+            echo "Unable to read version from pubspec.yaml" >&2
+            exit 1
+          fi
+          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" != "v${APP_VERSION}" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match pubspec version v${APP_VERSION}" >&2
+            exit 1
+          fi
+
+          SOURCE_APK="build/app/outputs/flutter-apk/app-arm64-v8a-release.apk"
+          test -s "${SOURCE_APK}"
+          mkdir -p release
+          APK="release/marten-${APP_VERSION}.apk"
+          cp "${SOURCE_APK}" "${APK}"
+
+          unzip -p "${APK}" lib/arm64-v8a/libmarten-core.so \
+            > "${RUNNER_TEMP}/marten-core/apk-libmarten-core.so"
+          echo "${CORE_APK_SO_SHA256}  ${RUNNER_TEMP}/marten-core/apk-libmarten-core.so" | sha256sum --check --strict
+          go version -m "${RUNNER_TEMP}/marten-core/apk-libmarten-core.so"
+          grep -aFq "${CORE_REVISION}" "${RUNNER_TEMP}/marten-core/apk-libmarten-core.so"
+          grep -aFq "${SING_BOX_REVISION}" "${RUNNER_TEMP}/marten-core/apk-libmarten-core.so"
+          grep -aFq "${TURNCOAT_REVISION}" "${RUNNER_TEMP}/marten-core/apk-libmarten-core.so"
+
+          BUILD_TOOLS="$(find "${ANDROID_SDK_ROOT}/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+          "${BUILD_TOOLS}/zipalign" -c -P 16 -v 4 "${APK}"
+          "${BUILD_TOOLS}/apksigner" verify --verbose --print-certs "${APK}" \
+            > release/signing-certificate.txt
+          if [[ "${GITHUB_EVENT_NAME}" != "pull_request" ]]; then
+            grep -Fq "certificate SHA-256 digest: ${RELEASE_SIGNER_SHA256}" \
+              release/signing-certificate.txt
+          fi
+
+          (
+            cd release
+            sha256sum "marten-${APP_VERSION}.apk" > SHA256SUMS
+          )
+          {
+            echo "source_commit=${GITHUB_SHA}"
+            echo "version=${APP_VERSION}+${BUILD_NUMBER}"
+            echo "core_aar_sha256=${CORE_AAR_SHA256}"
+            echo "core_aar_embedded_sha256=${CORE_AAR_SO_SHA256}"
+            echo "apk_embedded_core_sha256=${CORE_APK_SO_SHA256}"
+            echo "marten_core_revision=${CORE_REVISION}"
+            echo "marten_sing_box_revision=${SING_BOX_REVISION}"
+            echo "turncoat_revision=${TURNCOAT_REVISION}"
+          } > release/release-metadata.txt
+          echo "version=${APP_VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload verified Android artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: marten-${{ steps.package.outputs.version }}-android-arm64
+          path: release/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified Android artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: marten-${{ needs.build.outputs.version }}-android-arm64
+          path: release
+
+      - name: Create or update release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.release_tag }}
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="${REQUESTED_TAG}"
+          fi
+          if [[ ! "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tag must match vX.Y.Z, got: ${TAG}" >&2
+            exit 1
+          fi
+          if [[ "${TAG}" != "v${{ needs.build.outputs.version }}" ]]; then
+            echo "Release tag ${TAG} does not match built version v${{ needs.build.outputs.version }}" >&2
+            exit 1
+          fi
+
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" release/* --repo "${GITHUB_REPOSITORY}" --clobber
+            gh release edit "${TAG}" --repo "${GITHUB_REPOSITORY}" \
+              --title "Marten ${{ needs.build.outputs.version }}" \
+              --draft=false --prerelease=false
+          else
+            gh release create "${TAG}" release/* --repo "${GITHUB_REPOSITORY}" \
+              --target "${GITHUB_SHA}" \
+              --title "Marten ${{ needs.build.outputs.version }}" \
+              --generate-notes
+          fi
