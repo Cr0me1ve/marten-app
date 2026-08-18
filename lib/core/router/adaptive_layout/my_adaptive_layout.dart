@@ -2,13 +2,13 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:go_router/go_router.dart';
+import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:marten/core/localization/translations.dart';
 import 'package:marten/core/model/constants.dart';
 import 'package:marten/core/router/adaptive_layout/shell_route_action.dart';
 import 'package:marten/core/router/go_router/helper/active_breakpoint_notifier.dart';
 import 'package:marten/core/router/go_router/routing_config_notifier.dart';
 import 'package:marten/features/stats/widget/side_bar_stats_overview.dart';
-import 'package:hooks_riverpod/hooks_riverpod.dart';
 
 class MyAdaptiveLayout extends HookConsumerWidget {
   const MyAdaptiveLayout({
@@ -25,10 +25,14 @@ class MyAdaptiveLayout extends HookConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final t = ref.watch(translationsProvider).requireValue;
+    final mediaSize = MediaQuery.sizeOf(context);
+    final hideNavigationRail = mediaSize.width > mediaSize.height && mediaSize.height < Breakpoint.eMobile;
     // focus switch management
     final primaryFocusHash = useState<int?>(null);
     final navScopeNode = useFocusScopeNode();
     useEffect(() {
+      if (hideNavigationRail) return null;
+
       bool handler(KeyEvent event) {
         final arrows = isMobileBreakpoint ? KeyboardConst.verticalArrows : KeyboardConst.horizontalArrows;
         if (!arrows.contains(event.logicalKey)) return false;
@@ -52,7 +56,7 @@ class MyAdaptiveLayout extends HookConsumerWidget {
       return () {
         HardwareKeyboard.instance.removeHandler(handler);
       };
-    }, [isMobileBreakpoint, showProfilesAction, navigationShell.currentIndex]);
+    }, [hideNavigationRail, isMobileBreakpoint, showProfilesAction, navigationShell.currentIndex]);
     return Material(
       child: PopScope(
         canPop: false,
@@ -65,7 +69,7 @@ class MyAdaptiveLayout extends HookConsumerWidget {
           SystemNavigator.pop();
         },
         child: Scaffold(
-          body: isMobileBreakpoint
+          body: isMobileBreakpoint || hideNavigationRail
               ? navigationShell
               : Row(
                   children: [

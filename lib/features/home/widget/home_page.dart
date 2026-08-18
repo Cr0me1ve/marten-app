@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:dartx/dartx.dart';
 import 'package:flutter/material.dart';
 import 'package:gap/gap.dart';
@@ -23,6 +25,7 @@ class HomePage extends HookConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final theme = Theme.of(context);
     final t = ref.watch(translationsProvider).requireValue;
+    final isLandscape = MediaQuery.orientationOf(context) == Orientation.landscape;
 
     ref.listen(connectionNotifierProvider, (previous, next) async {
       if (previous?.valueOrNull is Connected) return;
@@ -51,6 +54,9 @@ class HomePage extends HookConsumerWidget {
       backgroundColor: _backgroundColor,
       appBar: AppBar(
         backgroundColor: _backgroundColor,
+        surfaceTintColor: Colors.transparent,
+        elevation: 0,
+        scrolledUnderElevation: 0,
         title: Row(
           children: [
             Assets.images.logo.image(height: 24),
@@ -90,15 +96,66 @@ class HomePage extends HookConsumerWidget {
         top: false,
         child: Center(
           child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 600),
-            child: const Column(
-              children: [
-                Expanded(child: Center(child: ConnectionButton())),
-                SubscriptionPanel(),
-              ],
-            ),
+            constraints: BoxConstraints(maxWidth: isLandscape ? 840 : 600),
+            child: isLandscape ? const _LandscapeHomeContent() : const _PortraitHomeContent(),
           ),
         ),
+      ),
+    );
+  }
+}
+
+class _PortraitHomeContent extends StatelessWidget {
+  const _PortraitHomeContent();
+
+  @override
+  Widget build(BuildContext context) {
+    return const Column(
+      children: [
+        Expanded(child: _ResponsiveConnectionButton()),
+        SubscriptionPanel(),
+      ],
+    );
+  }
+}
+
+class _LandscapeHomeContent extends StatelessWidget {
+  const _LandscapeHomeContent();
+
+  @override
+  Widget build(BuildContext context) {
+    return const Padding(
+      padding: EdgeInsets.symmetric(horizontal: 12),
+      child: Row(
+        children: [
+          Expanded(flex: 5, child: _ResponsiveConnectionButton()),
+          SizedBox(width: 12),
+          Expanded(
+            flex: 6,
+            child: Align(alignment: Alignment.bottomCenter, child: SubscriptionPanel()),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ResponsiveConnectionButton extends StatelessWidget {
+  const _ResponsiveConnectionButton();
+
+  static const _maxSize = 220.0;
+  static const _verticalPadding = 8.0;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: _verticalPadding),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final availableSize = math.min(constraints.maxWidth, constraints.maxHeight);
+          final buttonSize = math.min(_maxSize, availableSize);
+          return Center(child: ConnectionButton(size: buttonSize));
+        },
       ),
     );
   }
