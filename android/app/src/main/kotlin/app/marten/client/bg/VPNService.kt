@@ -4,12 +4,15 @@ import android.util.Log
 import app.marten.client.Settings
 import android.content.Intent
 import android.content.pm.PackageManager.NameNotFoundException
+import android.net.ConnectivityManager
 import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.ProxyInfo
 import android.net.VpnService
 import android.os.Build
 import android.os.IBinder
 import android.os.ParcelFileDescriptor
+import android.os.SystemClock
 import app.marten.core.libbox.InterfaceUpdateListener
 import app.marten.core.libbox.Notification
 import app.marten.core.libbox.StringIterator
@@ -17,11 +20,16 @@ import app.marten.client.constant.PerAppProxyMode
 import app.marten.client.crashreporting.NativeCrashDiagnostics
 import app.marten.client.ktx.toIpPrefix
 import app.marten.core.libbox.TunOptions
+import kotlinx.coroutines.delay
 
 class VPNService : VpnService(), PlatformInterfaceWrapper {
 
     companion object {
         private const val TAG = "A/VPNService"
+        private const val PLATFORM_VPN_RETIREMENT_TIMEOUT_MS = 5_000L
+        private const val PLATFORM_VPN_RETIREMENT_POLL_MS = 50L
+        private const val PLATFORM_VPN_RETIREMENT_ADDRESS = "192.0.2.1"
+        private const val PLATFORM_VPN_RETIREMENT_PREFIX_LENGTH = 32
     }
 
     private lateinit var service: BoxService
@@ -82,17 +90,24 @@ class VPNService : VpnService(), PlatformInterfaceWrapper {
 
     /**
      * Replaces an OEM-retained, already inert VPN interface with a local
-     * no-route interface and closes it immediately.
+     * no-route interface, observes that exact framework network, and then
+     * closes it under one bounded release deadline.
      *
      * Android normally removes the VPN network when the descriptor returned by
      * Builder.establish() is closed. Some vendor builds can retain that first
      * framework interface after a native consumer used its fd, even though the
      * descriptor and core are both gone. Establishing a replacement makes the
-     * framework synchronously retire the old interface; because this descriptor
-     * never crosses into the native core, closing it is an unambiguous final
-     * lifecycle signal. No Activity or other UI is involved.
+     * framework retire the old interface. The replacement descriptor remains
+     * open until Android publishes its marker Network; only then is it closed
+     * and the exact Network is awaited to disappear. This prevents an
+     * establish/close callback reorder from resurfacing `marten-stop` after the
+     * next automatic generation has already passed its ownership gate. The
+     * descriptor never crosses into the native core. No Activity or UI is
+     * involved.
      */
-    internal fun retirePlatformVpnSessionAfterCoreStop(
+    internal suspend fun retirePlatformVpnSessionAfterCoreStop(
+        releaseDeadlineElapsedRealtimeMs: Long =
+            SystemClock.elapsedRealtime() + PLATFORM_VPN_RETIREMENT_TIMEOUT_MS,
         retirementAllowed: () -> Boolean = { true },
     ): Boolean {
         if (!retirementAllowed()) {
@@ -110,7 +125,10 @@ class VPNService : VpnService(), PlatformInterfaceWrapper {
             Builder()
                 .setSession("marten-stop")
                 .setMtu(1280)
-                .addAddress("192.0.2.1", 32)
+                .addAddress(
+                    PLATFORM_VPN_RETIREMENT_ADDRESS,
+                    PLATFORM_VPN_RETIREMENT_PREFIX_LENGTH,
+                )
                 .allowBypass()
                 .apply {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -122,13 +140,117 @@ class VPNService : VpnService(), PlatformInterfaceWrapper {
             Log.e(TAG, "failed to establish framework VPN retirement interface", it)
         }.getOrNull() ?: return false
 
-        return runCatching {
-            retirementDescriptor.close()
-            Log.i(TAG, "framework VPN retirement descriptor closed")
-            true
-        }.onFailure {
-            Log.e(TAG, "failed to close framework VPN retirement descriptor", it)
-        }.getOrDefault(false)
+        var descriptorClosed = false
+        try {
+            val retirementNetwork = awaitPlatformVpnRetirementNetwork(
+                releaseDeadlineElapsedRealtimeMs,
+                retirementAllowed,
+            )
+            if (retirementNetwork == null) {
+                if (!retirementAllowed()) {
+                    Log.i(TAG, "framework VPN retirement ownership was lost before marker publication")
+                    return true
+                }
+                Log.e(TAG, "Android did not publish the framework VPN retirement network before deadline")
+                return false
+            }
+
+            descriptorClosed = runCatching {
+                retirementDescriptor.close()
+                Log.i(TAG, "framework VPN retirement descriptor closed after marker publication")
+                true
+            }.onFailure {
+                Log.e(TAG, "failed to close framework VPN retirement descriptor", it)
+            }.getOrDefault(false)
+            if (!descriptorClosed) return false
+
+            return awaitPlatformVpnRetirementRelease(
+                retirementNetwork,
+                releaseDeadlineElapsedRealtimeMs,
+                retirementAllowed,
+            )
+        } finally {
+            if (!descriptorClosed) {
+                runCatching { retirementDescriptor.close() }.onFailure {
+                    Log.e(TAG, "failed to close unpublished framework VPN retirement descriptor", it)
+                }
+            }
+        }
+    }
+
+    private suspend fun awaitPlatformVpnRetirementNetwork(
+        releaseDeadlineElapsedRealtimeMs: Long,
+        retirementAllowed: () -> Boolean,
+    ): Network? {
+        val connectivity = getSystemService(ConnectivityManager::class.java) ?: return null
+        while (retirementAllowed()) {
+            val retirementNetwork = runCatching {
+                findPlatformVpnRetirementNetwork(connectivity)
+            }.onFailure {
+                Log.w(TAG, "failed to inspect framework VPN retirement publication", it)
+            }.getOrNull()
+            if (retirementNetwork != null) {
+                Log.i(TAG, "framework VPN retirement network published")
+                return retirementNetwork
+            }
+
+            val remainingMs = releaseDeadlineElapsedRealtimeMs - SystemClock.elapsedRealtime()
+            if (remainingMs <= 0L) return null
+            delay(minOf(PLATFORM_VPN_RETIREMENT_POLL_MS, remainingMs))
+        }
+        return null
+    }
+
+    private suspend fun awaitPlatformVpnRetirementRelease(
+        retirementNetwork: Network,
+        releaseDeadlineElapsedRealtimeMs: Long,
+        retirementAllowed: () -> Boolean,
+    ): Boolean {
+        val connectivity = getSystemService(ConnectivityManager::class.java) ?: return false
+        while (retirementAllowed()) {
+            val stillPublished = runCatching {
+                connectivity.allNetworks.any { it == retirementNetwork }
+            }.onFailure {
+                Log.w(TAG, "failed to inspect framework VPN retirement release", it)
+            }.getOrElse { return false }
+            if (!stillPublished) {
+                Log.i(TAG, "framework VPN retirement network released")
+                return true
+            }
+
+            val remainingMs = releaseDeadlineElapsedRealtimeMs - SystemClock.elapsedRealtime()
+            if (remainingMs <= 0L) {
+                Log.e(TAG, "Android retained the framework VPN retirement network past deadline")
+                return false
+            }
+            delay(minOf(PLATFORM_VPN_RETIREMENT_POLL_MS, remainingMs))
+        }
+
+        Log.i(TAG, "framework VPN retirement ownership was lost while awaiting release")
+        return true
+    }
+
+    private fun findPlatformVpnRetirementNetwork(connectivity: ConnectivityManager): Network? {
+        val ownUid = applicationInfo.uid
+        return connectivity.allNetworks.firstOrNull { network ->
+            val capabilities = connectivity.getNetworkCapabilities(network)
+                ?: return@firstOrNull false
+            val vpnTransport = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+            val ownerVerificationRequired = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+            val ownerIsMarten = ownerVerificationRequired && capabilities.ownerUid == ownUid
+            val hasRetirementAddress = connectivity.getLinkProperties(network)
+                ?.linkAddresses
+                ?.any { linkAddress ->
+                    linkAddress.prefixLength == PLATFORM_VPN_RETIREMENT_PREFIX_LENGTH &&
+                        linkAddress.address.hostAddress == PLATFORM_VPN_RETIREMENT_ADDRESS
+                } == true
+            isMartenRetirementNetworkCandidate(
+                vpnTransport = vpnTransport,
+                ownerVerificationRequired = ownerVerificationRequired,
+                ownerIsMarten = ownerIsMarten,
+                hasRetirementAddress = hasRetirementAddress,
+            )
+        }
     }
 
     override fun autoDetectInterfaceControl(fd: Int) {

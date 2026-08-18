@@ -2292,10 +2292,11 @@ class BoxService(
     private suspend fun awaitTunRuntimeQuiescence(
         reason: String,
         serviceStopping: Boolean,
+        releaseDeadlineElapsedRealtimeMs: Long =
+            SystemClock.elapsedRealtime() + TUN_RELEASE_TIMEOUT_MS,
     ): Boolean {
         if (Settings.serviceMode != ServiceMode.VPN) return true
 
-        val deadline = SystemClock.elapsedRealtime() + TUN_RELEASE_TIMEOUT_MS
         var health = readTunRuntimeHealth()
         while (
             !isOwnedTunReleaseCompleteForCleanup(
@@ -2305,7 +2306,7 @@ class BoxService(
                 globalCandidateCount = health.globalCandidateCount,
                 serviceStopping = serviceStopping,
             ) &&
-            SystemClock.elapsedRealtime() < deadline
+            SystemClock.elapsedRealtime() < releaseDeadlineElapsedRealtimeMs
         ) {
             delay(TUN_RELEASE_POLL_MS)
             health = readTunRuntimeHealth()
@@ -2342,12 +2343,16 @@ class BoxService(
         if (!closeCompleted) {
             Log.w(TAG, "Mobile.close did not fully finish during $reason")
         }
+        // Framework retirement and TUN quiescence are one release barrier;
+        // neither phase receives a fresh grace period after the other.
+        val releaseDeadlineElapsedRealtimeMs =
+            SystemClock.elapsedRealtime() + TUN_RELEASE_TIMEOUT_MS
         val platformVpnRetired = if (
             closeCompleted &&
             !serviceStopping &&
             service is VPNService
         ) {
-            service.retirePlatformVpnSessionAfterCoreStop {
+            service.retirePlatformVpnSessionAfterCoreStop(releaseDeadlineElapsedRealtimeMs) {
                 !vpnOwnershipRevoked &&
                     !isExternalVpnActive("core restart VPN retirement")
             }
@@ -2357,7 +2362,11 @@ class BoxService(
         if (!platformVpnRetired) {
             Log.w(TAG, "Android framework VPN retirement did not finish during $reason")
         }
-        val tunQuiescent = awaitTunRuntimeQuiescence(reason, serviceStopping)
+        val tunQuiescent = awaitTunRuntimeQuiescence(
+            reason,
+            serviceStopping,
+            releaseDeadlineElapsedRealtimeMs,
+        )
         return CoreCleanupResult(closeCompleted && platformVpnRetired, tunQuiescent)
     }
 

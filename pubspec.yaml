@@ -1,7 +1,7 @@
 name: marten
 description: Cross-platform multi-protocol network client.
 publish_to: "none"
-version: 0.7.7+707
+version: 0.7.8+708
 
 environment:
   sdk: ^3.10.4

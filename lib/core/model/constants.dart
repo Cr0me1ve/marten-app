@@ -8,7 +8,7 @@ abstract class Constants {
   static const githubReleasesApiUrl = "https://api.github.com/repos/Cr0me1ve/marten-app/releases";
   static const githubLatestReleaseUrl = "https://github.com/Cr0me1ve/marten-app/releases/latest";
   static const appCastUrl = "https://raw.githubusercontent.com/Cr0me1ve/marten-app/main/appcast.xml";
-  static const privacyPolicyUrl = "https://github.com/Cr0me1ve/marten-app#privacy";
+  static const privacyPolicyUrl = "https://app.marten.pw/privacy";
   static const termsAndConditionsUrl = "https://github.com/Cr0me1ve/marten-app/blob/main/LICENSE.md";
 }
 

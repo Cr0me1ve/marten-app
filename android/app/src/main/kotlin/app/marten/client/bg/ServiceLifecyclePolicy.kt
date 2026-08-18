@@ -67,6 +67,25 @@ internal fun shouldRetirePlatformVpnAfterCoreStop(
         !vpnOwnershipRevoked &&
         !externalVpnActive
 
+/**
+ * Identifies the no-route VPN network created solely to retire Marten's
+ * previous framework session.
+ *
+ * The documentation-only IPv4 marker makes the replacement distinguishable
+ * from the data TUN without depending on hidden `android.net.VpnTransportInfo`
+ * APIs. Android 12+ must also report Marten as the owner; older releases keep
+ * the conservative address-based fallback because ownerUid is unavailable.
+ */
+internal fun isMartenRetirementNetworkCandidate(
+    vpnTransport: Boolean,
+    ownerVerificationRequired: Boolean,
+    ownerIsMarten: Boolean,
+    hasRetirementAddress: Boolean,
+): Boolean =
+    vpnTransport &&
+        hasRetirementAddress &&
+        (!ownerVerificationRequired || ownerIsMarten)
+
 internal suspend fun requestAuthoritativePlatformStop(
     requestCoreStop: () -> Unit,
     awaitCoreStop: suspend () -> Boolean,

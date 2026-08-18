@@ -466,12 +466,31 @@ class IcmpResilienceSourceGuardTest {
         val cleanup = functionBody(source, "closeMobileCoreAndAwaitTunQuiescence")
         val descriptorClose = cleanup.indexOf("closeTunFileDescriptor()")
         val coreClose = cleanup.indexOf("MobileCoreCloser.closeBlocking(reason)")
+        val releaseDeadline = Regex(
+            "val\\s+releaseDeadlineElapsedRealtimeMs\\s*=\\s*SystemClock\\.elapsedRealtime\\s*\\(\\s*\\)\\s*\\+\\s*TUN_RELEASE_TIMEOUT_MS",
+        ).find(cleanup)?.range?.first ?: -1
         val platformRetirement = cleanup.indexOf("val platformVpnRetired = if (")
-        val tunWait = cleanup.indexOf("awaitTunRuntimeQuiescence(reason, serviceStopping)")
+        val platformRetirementCall = cleanup.indexOf(
+            "retirePlatformVpnSessionAfterCoreStop(",
+            platformRetirement,
+        )
+        val platformDeadlineArg = cleanup.indexOf(
+            "releaseDeadlineElapsedRealtimeMs",
+            platformRetirementCall + 1,
+        )
+        val tunWait = cleanup.indexOf("awaitTunRuntimeQuiescence(")
+        val tunDeadlineArg = cleanup.indexOf("releaseDeadlineElapsedRealtimeMs", tunWait + 1)
         val result = cleanup.indexOf("CoreCleanupResult(closeCompleted && platformVpnRetired, tunQuiescent)")
         assertTrue(descriptorClose >= 0)
         assertTrue(coreClose > descriptorClose)
         assertTrue("platform VPN retirement must follow a completed native close", platformRetirement > coreClose)
+        assertTrue("release deadline should be calculated for both framework and TUN release waits", releaseDeadline > coreClose)
+        assertTrue("platform retirement must use shared release deadline", platformRetirementCall > platformRetirement)
+        assertTrue(
+            "platform retirement and TUN release should share same computed deadline",
+            platformDeadlineArg in (platformRetirementCall + 1 until tunWait) &&
+                tunDeadlineArg > tunWait,
+        )
         assertTrue(tunWait > platformRetirement)
         assertTrue(result > tunWait)
         val closeFailed = functionBody(source, "closeFailedRecoveryRuntime")
@@ -492,26 +511,47 @@ class IcmpResilienceSourceGuardTest {
         )
 
         val awaitTun = functionBody(source, "awaitTunRuntimeQuiescence")
-        val deadline = awaitTun.indexOf("val deadline = SystemClock.elapsedRealtime() + TUN_RELEASE_TIMEOUT_MS")
-        val elapsedGuard = awaitTun.indexOf("SystemClock.elapsedRealtime() < deadline")
+        val elapsedGuard = awaitTun.indexOf(
+            "SystemClock.elapsedRealtime() < releaseDeadlineElapsedRealtimeMs",
+        )
+        val releaseArg = awaitTun.indexOf("releaseDeadlineElapsedRealtimeMs")
         val delayPoll = awaitTun.indexOf("delay(TUN_RELEASE_POLL_MS)")
         val returnResult = awaitTun.indexOf("return quiescent")
-        assertTrue("awaitTunRuntimeQuiescence must use the bounded timeout constant", deadline >= 0)
-        assertTrue("awaitTunRuntimeQuiescence must exit only after deadline", elapsedGuard > deadline)
-        assertTrue("awaitTunRuntimeQuiescence must actively poll while waiting", delayPoll > elapsedGuard)
-        assertTrue("awaitTunRuntimeQuiescence must return quiescence outcome", returnResult > delayPoll)
+        assertTrue(
+            "awaitTunRuntimeQuiescence must accept shared deadline argument",
+            releaseArg >= 0,
+        )
+        assertTrue("awaitTunRuntimeQuiescence must exit only after deadline", elapsedGuard >= 0)
+        assertTrue(
+            "awaitTunRuntimeQuiescence must actively poll while waiting",
+            delayPoll > elapsedGuard,
+        )
+        assertTrue(
+            "awaitTunRuntimeQuiescence must return quiescence outcome",
+            returnResult > delayPoll,
+        )
 
         val cleanup = functionBody(source, "closeMobileCoreAndAwaitTunQuiescence")
-        assertTrue("cleaning mobile core must close descriptor first", cleanup.contains("closeTunFileDescriptor()"))
+        assertTrue(
+            "cleaning mobile core must close descriptor first",
+            cleanup.contains("closeTunFileDescriptor()"),
+        )
         assertTrue(
             "mobile core close must run before tun quiescence wait",
             cleanup.indexOf("MobileCoreCloser.closeBlocking(reason)") > cleanup.indexOf("closeTunFileDescriptor()"),
         )
+        val tunDeadlineShared = Regex(
+            "awaitTunRuntimeQuiescence\\s*\\(\\s*reason\\s*,\\s*serviceStopping\\s*,\\s*releaseDeadlineElapsedRealtimeMs\\s*,?\\s*\\)",
+        ).find(cleanup)?.range?.first ?: -1
         assertTrue(
             "TUN quiescence must be awaited after close",
-            cleanup.indexOf("awaitTunRuntimeQuiescence(reason, serviceStopping)") > cleanup.indexOf(
-                "MobileCoreCloser.closeBlocking(reason)",
-            ),
+            tunDeadlineShared > cleanup.indexOf("MobileCoreCloser.closeBlocking(reason)"),
+        )
+        assertTrue(
+            "shared deadline argument should be threaded into TUN quiescence",
+            tunDeadlineShared > Regex(
+                "val\\s+releaseDeadlineElapsedRealtimeMs\\s*=\\s*SystemClock\\.elapsedRealtime\\s*\\(\\s*\\)\\s*\\+\\s*TUN_RELEASE_TIMEOUT_MS",
+            ).find(cleanup)?.range?.first.orEmptyIndex(),
         )
 
         val stopService = functionBody(source, "stopService")
@@ -531,29 +571,90 @@ class IcmpResilienceSourceGuardTest {
     }
 
     @Test
-    fun `completed native stop retires Samsung framework VPN ownership with a local closed replacement TUN`() {
+    fun `completed native stop retires the exact marker VPN only after Android publishes it`() {
         val vpnService = sourceFile("VPNService.kt")
-        val retireStart = vpnService.indexOf("internal fun retirePlatformVpnSessionAfterCoreStop(")
-        val retireEnd = vpnService.indexOf("override fun autoDetectInterfaceControl", retireStart)
-        val retire = if (retireStart >= 0 && retireEnd > retireStart) {
-            vpnService.substring(retireStart, retireEnd)
-        } else {
-            vpnService
-        }
-        val session = retire.indexOf("setSession(\"marten-stop\")")
-        val establish = retire.indexOf("establish()", session)
-        val close = retire.indexOf(".close()", establish)
+        val retire = functionBody(vpnService, "retirePlatformVpnSessionAfterCoreStop")
+        val session = Regex("setSession\\s*\\(\\s*\"marten-stop\"\\s*\\)")
+            .find(retire)?.range?.first ?: -1
+        val establish = Regex("\\.establish\\s*\\(").find(retire)?.range?.first ?: -1
+        val awaitPublication = retire.indexOf("awaitPlatformVpnRetirementNetwork(")
+        val close = Regex("retirementDescriptor\\s*\\.\\s*close\\s*\\(").find(retire)?.range?.first ?: -1
+        val awaitRelease = retire.indexOf("awaitPlatformVpnRetirementRelease(")
 
-        assertTrue(session >= 0)
-        assertTrue(establish > session)
-        assertTrue("local replacement TUN must be closed immediately", close > establish)
-        assertFalse("teardown TUN must never be handed to the core owner", retire.contains("replaceTunFileDescriptor"))
-        assertFalse("framework teardown must not restart or re-open the native core", retire.contains("Mobile."))
+        assertTrue("retirement must create the local marker session", session >= 0)
+        assertTrue("marker session must be established before it is observed", establish > session)
+        assertTrue(
+            "descriptor must stay open until the marker Network is discovered",
+            awaitPublication > establish,
+        )
+        assertTrue(
+            "descriptor must close only after marker Network discovery",
+            close > awaitPublication,
+        )
+        assertTrue("retirement must await release after closing the descriptor", awaitRelease > close)
+        assertFalse(
+            "teardown TUN must never be handed to the core owner",
+            retire.contains("replaceTunFileDescriptor"),
+        )
+        assertFalse(
+            "framework teardown must not restart or re-open the native core",
+            retire.contains("Mobile."),
+        )
+        assertFalse("retirement must not call activity-based VPN flows", retire.contains("prepare("))
+        assertFalse("retirement must not route through helper or generic marker channels", retire.contains("MobileCoreLifecycle"))
+
+        val awaitPublicationBody = functionBody(
+            vpnService,
+            "awaitPlatformVpnRetirementNetwork",
+        )
+        assertTrue(
+            "marker wait must search for the retirement Network",
+            awaitPublicationBody.contains("findPlatformVpnRetirementNetwork(connectivity)"),
+        )
+        assertTrue(
+            "marker wait must use the caller's release deadline",
+            awaitPublicationBody.contains("releaseDeadlineElapsedRealtimeMs"),
+        )
+        assertFalse(
+            "marker publication wait must not start a separate retirement timeout",
+            Regex("SystemClock\\.elapsedRealtime\\s*\\(\\s*\\)\\s*\\+\\s*PLATFORM_VPN_RETIREMENT_TIMEOUT_MS")
+                .containsMatchIn(awaitPublicationBody),
+        )
+
+        val awaitReleaseBody = functionBody(vpnService, "awaitPlatformVpnRetirementRelease")
+        assertTrue(
+            "release wait must observe the exact Network returned by marker discovery",
+            Regex("allNetworks\\s*\\.any\\s*\\{\\s*it\\s*==\\s*retirementNetwork\\s*}")
+                .containsMatchIn(awaitReleaseBody),
+        )
+        assertTrue(
+            "release wait must use the same caller-provided deadline",
+            awaitReleaseBody.contains("releaseDeadlineElapsedRealtimeMs"),
+        )
+        assertFalse(
+            "release wait must not start a second independent retirement timeout",
+            Regex("SystemClock\\.elapsedRealtime\\s*\\(\\s*\\)\\s*\\+\\s*PLATFORM_VPN_RETIREMENT_TIMEOUT_MS")
+                .containsMatchIn(awaitReleaseBody),
+        )
+
+        val markerFinder = functionBody(vpnService, "findPlatformVpnRetirementNetwork")
+        assertTrue(
+            "marker discovery must restrict candidates to VPN transport",
+            markerFinder.contains("TRANSPORT_VPN"),
+        )
+        assertTrue(
+            "marker discovery must inspect the configured marker address",
+            markerFinder.contains("PLATFORM_VPN_RETIREMENT_ADDRESS"),
+        )
+        assertTrue(
+            "marker discovery must delegate ownership and marker validation to the pure policy",
+            markerFinder.contains("isMartenRetirementNetworkCandidate("),
+        )
 
         val stop = functionBody(sourceFile("BoxService.kt"), "stopService")
         val completed = stop.indexOf("coreClosed.completed")
         val shouldRetireCall = stop.indexOf("if (shouldRetirePlatformVpnAfterCoreStop(", completed)
-        val retireCall = stop.indexOf("retirePlatformVpnSessionAfterCoreStop {", completed)
+        val retireCall = stop.indexOf("retirePlatformVpnSessionAfterCoreStop", completed)
         val cleanupGuard = stop.indexOf("requiresCoreCleanupEscalation(", shouldRetireCall)
         val retirementGateStart = if (retireCall >= 0) retireCall else shouldRetireCall
         val retirementGateEnd = if (cleanupGuard >= 0) cleanupGuard else stop.length
@@ -634,7 +735,9 @@ class IcmpResilienceSourceGuardTest {
         val source = sourceFile("BoxService.kt")
         assertTrue(
             "closeMobileCoreAndAwaitTunQuiescence must forward serviceStopping into awaitTunRuntimeQuiescence",
-            Regex("awaitTunRuntimeQuiescence\\(reason,\\s*serviceStopping\\)").containsMatchIn(
+            Regex(
+                "awaitTunRuntimeQuiescence\\s*\\(\\s*reason\\s*,\\s*serviceStopping\\s*,\\s*releaseDeadlineElapsedRealtimeMs\\s*,?\\s*\\)",
+            ).containsMatchIn(
                 functionBody(source, "closeMobileCoreAndAwaitTunQuiescence"),
             ),
         )
@@ -1058,7 +1161,7 @@ class IcmpResilienceSourceGuardTest {
     private fun functionBody(source: String, name: String): String {
         val declaration = source.indexOf("fun $name")
         check(declaration >= 0) { "function $name not found" }
-        val bodyStart = source.indexOf('{', declaration)
+        val bodyStart = functionBodyStart(source, declaration)
         check(bodyStart >= 0) { "function $name has no body" }
         var depth = 0
         var index = bodyStart
@@ -1096,6 +1199,44 @@ class IcmpResilienceSourceGuardTest {
         }
         error("function $name has an unterminated body")
     }
+
+    private fun functionBodyStart(source: String, declaration: Int): Int {
+        var parenthesisDepth = 0
+        var index = declaration
+        while (index < source.length) {
+            when (source[index]) {
+                '/' -> {
+                    if (source.startsWith("//", index)) {
+                        index = source.indexOf('\n', index + 2).let { if (it < 0) source.length else it }
+                        continue
+                    }
+                    if (source.startsWith("/*", index)) {
+                        index = skipBlockComment(source, index)
+                        continue
+                    }
+                }
+                '"' -> {
+                    index = if (source.startsWith("\"\"\"", index)) {
+                        skipTripleQuotedString(source, index)
+                    } else {
+                        skipQuotedLiteral(source, index, '"')
+                    }
+                    continue
+                }
+                '\'' -> {
+                    index = skipQuotedLiteral(source, index, '\'')
+                    continue
+                }
+                '(' -> parenthesisDepth++
+                ')' -> parenthesisDepth--
+                '{' -> if (parenthesisDepth == 0) return index
+            }
+            index++
+        }
+        error("function declaration has no body")
+    }
+
+    private fun Int?.orEmptyIndex(): Int = this ?: -1
 
     private fun skipQuotedLiteral(source: String, start: Int, quote: Char): Int {
         var index = start + 1

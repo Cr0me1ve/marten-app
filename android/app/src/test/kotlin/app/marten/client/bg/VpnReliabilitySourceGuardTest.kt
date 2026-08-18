@@ -438,11 +438,34 @@ class VpnReliabilitySourceGuardTest {
         val cleanup = functionBody(service, "closeMobileCoreAndAwaitTunQuiescence")
 
         val close = cleanup.indexOf("MobileCoreCloser.closeBlocking(reason)")
+        val sharedDeadline = Regex(
+            "val\\s+releaseDeadlineElapsedRealtimeMs\\s*=\\s*SystemClock\\.elapsedRealtime\\s*\\(\\s*\\)\\s*\\+\\s*TUN_RELEASE_TIMEOUT_MS",
+        ).find(cleanup)?.range?.first ?: -1
         val nonStoppingGate = cleanup.indexOf("!serviceStopping")
         val retirement = cleanup.indexOf("retirePlatformVpnSessionAfterCoreStop", nonStoppingGate)
-        val quiescence = cleanup.indexOf("awaitTunRuntimeQuiescence(reason, serviceStopping)")
+        val retirementDeadline = cleanup.indexOf("releaseDeadlineElapsedRealtimeMs", retirement + 1)
+        val quiescence = Regex(
+            "awaitTunRuntimeQuiescence\\s*\\(\\s*reason\\s*,\\s*serviceStopping\\s*,\\s*releaseDeadlineElapsedRealtimeMs\\s*,?\\s*\\)",
+        ).find(cleanup)?.range?.first ?: -1
         assertTrue("native close must finish before retirement", close >= 0 && nonStoppingGate > close)
-        assertTrue("recovery must retire framework VPN before waiting for strict quiescence", retirement > nonStoppingGate && quiescence > retirement)
+        assertTrue(
+            "recovery cleanup must create its shared release deadline after native close",
+            sharedDeadline > close,
+        )
+        assertTrue(
+            "framework retirement must receive the shared release deadline before strict quiescence",
+            retirement > sharedDeadline && retirementDeadline in (retirement + 1 until quiescence),
+        )
+        assertTrue(
+            "recovery must retire framework VPN before waiting for strict quiescence",
+            quiescence > retirement,
+        )
+        assertTrue(
+            "cleanup must not create a second release deadline",
+            Regex(
+                "SystemClock\\.elapsedRealtime\\s*\\(\\s*\\)\\s*\\+\\s*TUN_RELEASE_TIMEOUT_MS",
+            ).findAll(cleanup).count() == 1,
+        )
 
         val stop = functionBody(service, "stopService")
         assertTrue("terminal service stop retains its existing tolerant cleanup mode", stop.contains("\"service stop\""))
