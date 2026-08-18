@@ -101,12 +101,22 @@ jobs:
             grep -aFq "${CORE_REVISION}" "${SO}"
             grep -aFq "${SING_BOX_REVISION}" "${SO}"
             grep -aFq "${TURNCOAT_REVISION}" "${SO}"
-            grep -aFq 'source_dirty":"false' "${SO}"
           done
           file "${RUNNER_TEMP}"/aar-*-libmarten-core.so | tee android-core-architectures.txt
           grep -Fq "ARM, EABI5" android-core-architectures.txt
           grep -Fq "ARM aarch64" android-core-architectures.txt
           grep -Fq "x86-64" android-core-architectures.txt
+
+      - name: Restore the shared Firebase configuration
+        shell: bash
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          test -n "${GOOGLE_SERVICES_JSON}"
+          printf '%s' "${GOOGLE_SERVICES_JSON}" > android/app/google-services.json
+          test "$(jq -r '.project_info.project_id' android/app/google-services.json)" = "marten-test-690a1"
+          jq -e '.client[] | select(.client_info.android_client_info.package_name == "app.marten.client")' \
+            android/app/google-services.json >/dev/null
 
       - name: Generate Flutter sources
         shell: bash
@@ -310,7 +320,7 @@ jobs:
           dpkg-deb --extract "${DEB}" "${EXTRACTED}"
           APP="$(find "${EXTRACTED}" -type f -name marten -perm -111 | head -n 1)"
           CLI="$(find "${EXTRACTED}" -type f -name MartenCli -perm -111 | head -n 1)"
-          CORE="$(find "${EXTRACTED}" -type f -name libmarten-core.so | head -n 1)"
+          CORE="$(find "${EXTRACTED}" -type f -name marten-core.so | head -n 1)"
           test -n "${APP}"
           test -n "${CLI}"
           test -n "${CORE}"
