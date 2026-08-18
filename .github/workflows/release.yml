@@ -186,25 +186,31 @@ jobs:
           test "${ARM64_ABIS}" = "arm64-v8a"
           test "${UNIVERSAL_ABIS}" = "arm64-v8a,armeabi-v7a,x86_64"
 
-          declare -A EXPECTED=(
-            [armeabi-v7a]="${ANDROID_CORE_ARM_SHA256}"
-            [arm64-v8a]="${ANDROID_CORE_ARM64_SHA256}"
-            [x86_64]="${ANDROID_CORE_X64_SHA256}"
-          )
-          for ABI in arm64-v8a; do
-            SO="${RUNNER_TEMP}/arm64-apk-${ABI}-libmarten-core.so"
-            unzip -p "${ARM64_APK}" "lib/${ABI}/libmarten-core.so" > "${SO}"
-            echo "${EXPECTED[$ABI]}  ${SO}" | sha256sum --check --strict
-          done
+          ARM64_CORE="${RUNNER_TEMP}/arm64-apk-arm64-v8a-libmarten-core.so"
+          unzip -p "${ARM64_APK}" "lib/arm64-v8a/libmarten-core.so" > "${ARM64_CORE}"
+          ARM64_CORE_SHA256="$(sha256sum "${ARM64_CORE}" | cut -d' ' -f1)"
+          go version -m "${ARM64_CORE}"
+          grep -aFq "${CORE_REVISION}" "${ARM64_CORE}"
+          grep -aFq "${SING_BOX_REVISION}" "${ARM64_CORE}"
+          grep -aFq "${TURNCOAT_REVISION}" "${ARM64_CORE}"
+
           for ABI in armeabi-v7a arm64-v8a x86_64; do
             SO="${RUNNER_TEMP}/universal-apk-${ABI}-libmarten-core.so"
             unzip -p "${UNIVERSAL_APK}" "lib/${ABI}/libmarten-core.so" > "${SO}"
-            echo "${EXPECTED[$ABI]}  ${SO}" | sha256sum --check --strict
             go version -m "${SO}"
             grep -aFq "${CORE_REVISION}" "${SO}"
             grep -aFq "${SING_BOX_REVISION}" "${SO}"
             grep -aFq "${TURNCOAT_REVISION}" "${SO}"
           done
+          UNIVERSAL_ARM_CORE_SHA256="$(sha256sum "${RUNNER_TEMP}/universal-apk-armeabi-v7a-libmarten-core.so" | cut -d' ' -f1)"
+          UNIVERSAL_ARM64_CORE_SHA256="$(sha256sum "${RUNNER_TEMP}/universal-apk-arm64-v8a-libmarten-core.so" | cut -d' ' -f1)"
+          UNIVERSAL_X64_CORE_SHA256="$(sha256sum "${RUNNER_TEMP}/universal-apk-x86_64-libmarten-core.so" | cut -d' ' -f1)"
+          test "${ARM64_CORE_SHA256}" = "${UNIVERSAL_ARM64_CORE_SHA256}"
+          file "${ARM64_CORE}" "${RUNNER_TEMP}"/universal-apk-*-libmarten-core.so \
+            | tee android-apk-core-architectures.txt
+          grep -Fq "ARM, EABI5" android-apk-core-architectures.txt
+          grep -Fq "ARM aarch64" android-apk-core-architectures.txt
+          grep -Fq "x86-64" android-apk-core-architectures.txt
 
           BUILD_TOOLS="$(find "${ANDROID_SDK_ROOT}/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
           for APK in "${ARM64_APK}" "${UNIVERSAL_APK}"; do
@@ -230,6 +236,10 @@ jobs:
             echo "arm64_apk_abis=${ARM64_ABIS}"
             echo "universal_apk_abis=${UNIVERSAL_ABIS}"
             echo "core_aar_sha256=${ANDROID_CORE_AAR_SHA256}"
+            echo "arm64_apk_core_sha256=${ARM64_CORE_SHA256}"
+            echo "universal_arm_core_sha256=${UNIVERSAL_ARM_CORE_SHA256}"
+            echo "universal_arm64_core_sha256=${UNIVERSAL_ARM64_CORE_SHA256}"
+            echo "universal_x64_core_sha256=${UNIVERSAL_X64_CORE_SHA256}"
             echo "marten_core_revision=${CORE_REVISION}"
             echo "marten_public_core_revision=${PUBLIC_CORE_REVISION}"
             echo "marten_sing_box_revision=${SING_BOX_REVISION}"

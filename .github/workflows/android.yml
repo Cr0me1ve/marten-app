@@ -29,7 +29,6 @@ env:
   CORE_RELEASE_TAG: "core-0.7.9"
   CORE_AAR_SHA256: "c37191aa6bd7953bc73b617be4db38a0dcb1b3e917a0bcaae0de6215170bbe59"
   CORE_AAR_SO_SHA256: "85d909146f48b69906d5fe955bc9c7161d340cb36ac93d26ab7c6c02b2bb4071"
-  CORE_APK_SO_SHA256: "85d909146f48b69906d5fe955bc9c7161d340cb36ac93d26ab7c6c02b2bb4071"
   CORE_REVISION: "edbe0d498ac55e28f822a0b8dc9ac708c86dc8c8"
   SING_BOX_REVISION: "7303baa90f7f55102b621fb34704736011b3e1a1"
   TURNCOAT_REVISION: "29ba26b97c3c62a9aa7da7f8a4d5bd04a36e1622"
@@ -167,13 +166,14 @@ jobs:
           APK="release/marten-${APP_VERSION}.apk"
           cp "${SOURCE_APK}" "${APK}"
 
-          unzip -p "${APK}" lib/arm64-v8a/libmarten-core.so \
-            > "${RUNNER_TEMP}/marten-core/apk-libmarten-core.so"
-          echo "${CORE_APK_SO_SHA256}  ${RUNNER_TEMP}/marten-core/apk-libmarten-core.so" | sha256sum --check --strict
-          go version -m "${RUNNER_TEMP}/marten-core/apk-libmarten-core.so"
-          grep -aFq "${CORE_REVISION}" "${RUNNER_TEMP}/marten-core/apk-libmarten-core.so"
-          grep -aFq "${SING_BOX_REVISION}" "${RUNNER_TEMP}/marten-core/apk-libmarten-core.so"
-          grep -aFq "${TURNCOAT_REVISION}" "${RUNNER_TEMP}/marten-core/apk-libmarten-core.so"
+          APK_CORE="${RUNNER_TEMP}/marten-core/apk-libmarten-core.so"
+          unzip -p "${APK}" lib/arm64-v8a/libmarten-core.so > "${APK_CORE}"
+          APK_CORE_SHA256="$(sha256sum "${APK_CORE}" | cut -d' ' -f1)"
+          file "${APK_CORE}" | grep -Fq "ARM aarch64"
+          go version -m "${APK_CORE}"
+          grep -aFq "${CORE_REVISION}" "${APK_CORE}"
+          grep -aFq "${SING_BOX_REVISION}" "${APK_CORE}"
+          grep -aFq "${TURNCOAT_REVISION}" "${APK_CORE}"
 
           BUILD_TOOLS="$(find "${ANDROID_SDK_ROOT}/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
           "${BUILD_TOOLS}/zipalign" -c -P 16 -v 4 "${APK}"
@@ -193,7 +193,7 @@ jobs:
             echo "version=${APP_VERSION}+${BUILD_NUMBER}"
             echo "core_aar_sha256=${CORE_AAR_SHA256}"
             echo "core_aar_embedded_sha256=${CORE_AAR_SO_SHA256}"
-            echo "apk_embedded_core_sha256=${CORE_APK_SO_SHA256}"
+            echo "apk_embedded_core_sha256=${APK_CORE_SHA256}"
             echo "marten_core_revision=${CORE_REVISION}"
             echo "marten_sing_box_revision=${SING_BOX_REVISION}"
             echo "turncoat_revision=${TURNCOAT_REVISION}"
