@@ -134,8 +134,6 @@ android {
 
     packagingOptions {
         jniLibs {
-            //noinspection ChromeOsAbiSupport
-            excludes += ["lib/x86_64/**", "lib/x86/**", "lib/armeabi-v7a/**"]
             useLegacyPackaging = true
         }
     }

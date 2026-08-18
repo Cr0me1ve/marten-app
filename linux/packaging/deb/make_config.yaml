@@ -16,7 +16,7 @@ icon: assets/images/source/ic_launcher_border.png
 # 3. Update the desktop database to apply changes immediately
 postinstall_scripts:
   - echo "Setting up Marten..."
-  - sudo sed -i '/^\[Desktop Entry\]/a StartupWMClass=app.marten.client' "/usr/share/applications/marten.desktop"
+  - sed -i '/^\[Desktop Entry\]/a StartupWMClass=app.marten.client' "/usr/share/applications/marten.desktop"
   - echo "Search and remove marten.desktop from .local"
   - for user_dir in /home/*; do if [ -f "$user_dir/.local/share/applications/marten.desktop" ]; then rm -f "$user_dir/.local/share/applications/marten.desktop"; echo "Found and removed marten.desktop from $user_dir .local"; fi; done
   - update-desktop-database /usr/share/applications

@@ -1,0 +1,525 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag matching the pubspec version"
+        required: true
+        default: "v0.7.9"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+env:
+  FLUTTER_VERSION: "3.38.5"
+  FASTFORGE_VERSION: "0.6.8"
+  ANDROID_NDK_VERSION: "28.2.13676358"
+  ANDROID_CORE_RELEASE_TAG: "core-0.7.9"
+  ANDROID_CORE_AAR_SHA256: "c37191aa6bd7953bc73b617be4db38a0dcb1b3e917a0bcaae0de6215170bbe59"
+  ANDROID_CORE_ARM_SHA256: "cc95ba0f6c49b3b657e8312b023505b0cb7d73615c620a77c2d07aa7e7ee6c8b"
+  ANDROID_CORE_ARM64_SHA256: "85d909146f48b69906d5fe955bc9c7161d340cb36ac93d26ab7c6c02b2bb4071"
+  ANDROID_CORE_X64_SHA256: "ebec955d480cb406810d463f8bf5cb2672365251c4300064a4d6ff56c405c9a2"
+  DESKTOP_CORE_RELEASE_TAG: "core-desktop-0.7.8"
+  LINUX_CORE_ARCHIVE: "marten-core-linux-amd64-20260818.tar.gz"
+  LINUX_CORE_SHA256: "ae17263c06cd3d8e64a9d6b4be2c465a3b73881bd51077f99fadb7c052a757fc"
+  WINDOWS_CORE_ARCHIVE: "marten-core-windows-amd64-20260818.tar.gz"
+  WINDOWS_CORE_SHA256: "4de67e0e6b32c571b53092810693e59d9715efc1e4294ac26e6e80ebdba3b317"
+  CORE_REVISION: "edbe0d498ac55e28f822a0b8dc9ac708c86dc8c8"
+  PUBLIC_CORE_REVISION: "777a837f7f3fc2113588d06ed9fa898880227642"
+  SING_BOX_REVISION: "7303baa90f7f55102b621fb34704736011b3e1a1"
+  PUBLIC_SING_BOX_REVISION: "c18a7ec12ab1e204d75d9050ffd1e72f9d09de4d"
+  TURNCOAT_REVISION: "29ba26b97c3c62a9aa7da7f8a4d5bd04a36e1622"
+  RELEASE_SIGNER_SHA256: "4acd16e170370e30653cd5be65643e745c6b8e9ee1e00f91a308bc86110b1f5d"
+
+jobs:
+  android:
+    name: Android armv8 and universal APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Set up Go for embedded provenance inspection
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.5"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Install the pinned Android NDK
+        shell: bash
+        run: |
+          "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" "ndk;${ANDROID_NDK_VERSION}"
+
+      - name: Download the pinned multi-ABI core AAR
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p android/app/libs
+          gh release download "${ANDROID_CORE_RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern marten-core.aar \
+            --dir android/app/libs \
+            --clobber
+
+      - name: Verify the multi-ABI core AAR and provenance
+        shell: bash
+        run: |
+          echo "${ANDROID_CORE_AAR_SHA256}  android/app/libs/marten-core.aar" | sha256sum --check --strict
+          declare -A EXPECTED=(
+            [armeabi-v7a]="${ANDROID_CORE_ARM_SHA256}"
+            [arm64-v8a]="${ANDROID_CORE_ARM64_SHA256}"
+            [x86_64]="${ANDROID_CORE_X64_SHA256}"
+          )
+          for ABI in armeabi-v7a arm64-v8a x86_64; do
+            SO="${RUNNER_TEMP}/aar-${ABI}-libmarten-core.so"
+            unzip -p android/app/libs/marten-core.aar "jni/${ABI}/libmarten-core.so" > "${SO}"
+            echo "${EXPECTED[$ABI]}  ${SO}" | sha256sum --check --strict
+            go version -m "${SO}"
+            grep -aFq "${CORE_REVISION}" "${SO}"
+            grep -aFq "${SING_BOX_REVISION}" "${SO}"
+            grep -aFq "${TURNCOAT_REVISION}" "${SO}"
+            grep -aFq 'source_dirty":"false' "${SO}"
+          done
+          file "${RUNNER_TEMP}"/aar-*-libmarten-core.so | tee android-core-architectures.txt
+          grep -Fq "ARM, EABI5" android-core-architectures.txt
+          grep -Fq "ARM aarch64" android-core-architectures.txt
+          grep -Fq "x86-64" android-core-architectures.txt
+
+      - name: Generate Flutter sources
+        shell: bash
+        run: |
+          flutter pub get
+          dart run build_runner build --delete-conflicting-outputs
+          dart run slang
+
+      - name: Configure stable Android signing
+        shell: bash
+        env:
+          MARTEN_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          MARTEN_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          MARTEN_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          MARTEN_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          test -n "${MARTEN_KEYSTORE_BASE64}"
+          test -n "${MARTEN_KEYSTORE_PASSWORD}"
+          test -n "${MARTEN_KEY_ALIAS}"
+          test -n "${MARTEN_KEY_PASSWORD}"
+          printf '%s' "${MARTEN_KEYSTORE_BASE64}" | base64 --decode > "${RUNNER_TEMP}/marten-release.jks"
+          {
+            echo "storePassword=${MARTEN_KEYSTORE_PASSWORD}"
+            echo "keyPassword=${MARTEN_KEY_PASSWORD}"
+            echo "keyAlias=${MARTEN_KEY_ALIAS}"
+            echo "storeFile=${RUNNER_TEMP}/marten-release.jks"
+          } > android/key.properties
+
+      - name: Run Flutter and Android tests
+        shell: bash
+        run: |
+          flutter test
+          (cd android && ./gradlew :app:testDebugUnitTest)
+
+      - name: Build Android armv8 APK
+        shell: bash
+        run: flutter build apk --release --target-platform android-arm64 --split-per-abi
+
+      - name: Preserve Android armv8 APK
+        shell: bash
+        run: |
+          test -s build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+          cp build/app/outputs/flutter-apk/app-arm64-v8a-release.apk "${RUNNER_TEMP}/marten-arm64-v8a.apk"
+
+      - name: Build Android universal APK
+        shell: bash
+        run: flutter build apk --release --target-platform android-arm,android-arm64,android-x64
+
+      - name: Package and verify Android APKs
+        id: package
+        shell: bash
+        run: |
+          VERSION="$(sed -n 's/^version: \([^+]*\).*/\1/p' pubspec.yaml)"
+          BUILD_NUMBER="$(sed -n 's/^version: [^+]*+\(.*\)/\1/p' pubspec.yaml)"
+          test -n "${VERSION}"
+          test -n "${BUILD_NUMBER}"
+          test -s build/app/outputs/flutter-apk/app-release.apk
+
+          mkdir -p release
+          ARM64_APK="release/marten-${VERSION}-android-arm64-v8a.apk"
+          UNIVERSAL_APK="release/marten-${VERSION}-android-universal.apk"
+          cp "${RUNNER_TEMP}/marten-arm64-v8a.apk" "${ARM64_APK}"
+          cp build/app/outputs/flutter-apk/app-release.apk "${UNIVERSAL_APK}"
+
+          ARM64_ABIS="$(zipinfo -1 "${ARM64_APK}" | sed -n 's#^lib/\([^/]*\)/libflutter.so$#\1#p' | sort -u | paste -sd, -)"
+          UNIVERSAL_ABIS="$(zipinfo -1 "${UNIVERSAL_APK}" | sed -n 's#^lib/\([^/]*\)/libflutter.so$#\1#p' | sort -u | paste -sd, -)"
+          test "${ARM64_ABIS}" = "arm64-v8a"
+          test "${UNIVERSAL_ABIS}" = "arm64-v8a,armeabi-v7a,x86_64"
+
+          declare -A EXPECTED=(
+            [armeabi-v7a]="${ANDROID_CORE_ARM_SHA256}"
+            [arm64-v8a]="${ANDROID_CORE_ARM64_SHA256}"
+            [x86_64]="${ANDROID_CORE_X64_SHA256}"
+          )
+          for ABI in arm64-v8a; do
+            SO="${RUNNER_TEMP}/arm64-apk-${ABI}-libmarten-core.so"
+            unzip -p "${ARM64_APK}" "lib/${ABI}/libmarten-core.so" > "${SO}"
+            echo "${EXPECTED[$ABI]}  ${SO}" | sha256sum --check --strict
+          done
+          for ABI in armeabi-v7a arm64-v8a x86_64; do
+            SO="${RUNNER_TEMP}/universal-apk-${ABI}-libmarten-core.so"
+            unzip -p "${UNIVERSAL_APK}" "lib/${ABI}/libmarten-core.so" > "${SO}"
+            echo "${EXPECTED[$ABI]}  ${SO}" | sha256sum --check --strict
+            go version -m "${SO}"
+            grep -aFq "${CORE_REVISION}" "${SO}"
+            grep -aFq "${SING_BOX_REVISION}" "${SO}"
+            grep -aFq "${TURNCOAT_REVISION}" "${SO}"
+          done
+
+          BUILD_TOOLS="$(find "${ANDROID_SDK_ROOT}/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+          for APK in "${ARM64_APK}" "${UNIVERSAL_APK}"; do
+            "${BUILD_TOOLS}/zipalign" -c -P 16 -v 4 "${APK}"
+            "${BUILD_TOOLS}/aapt" dump badging "${APK}" | tee "${APK}.badging.txt"
+            grep -Fq "versionCode='${BUILD_NUMBER}'" "${APK}.badging.txt"
+            grep -Fq "versionName='${VERSION}'" "${APK}.badging.txt"
+            "${BUILD_TOOLS}/apksigner" verify --verbose --print-certs "${APK}" \
+              > "${APK}.signing.txt"
+            grep -Fq "certificate SHA-256 digest: ${RELEASE_SIGNER_SHA256}" "${APK}.signing.txt"
+          done
+
+          cp "${ARM64_APK}.signing.txt" release/android-signing-certificate.txt
+          (
+            cd release
+            sha256sum "marten-${VERSION}-android-arm64-v8a.apk" \
+              "marten-${VERSION}-android-universal.apk" > android-sha256.txt
+          )
+          {
+            echo "source_commit=${GITHUB_SHA}"
+            echo "version=${VERSION}+${BUILD_NUMBER}"
+            echo "flutter_version=${FLUTTER_VERSION}"
+            echo "arm64_apk_abis=${ARM64_ABIS}"
+            echo "universal_apk_abis=${UNIVERSAL_ABIS}"
+            echo "core_aar_sha256=${ANDROID_CORE_AAR_SHA256}"
+            echo "marten_core_revision=${CORE_REVISION}"
+            echo "marten_public_core_revision=${PUBLIC_CORE_REVISION}"
+            echo "marten_sing_box_revision=${SING_BOX_REVISION}"
+            echo "marten_public_sing_box_revision=${PUBLIC_SING_BOX_REVISION}"
+            echo "turncoat_revision=${TURNCOAT_REVISION}"
+          } > release/android-build-metadata.txt
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload verified Android artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: marten-${{ steps.package.outputs.version }}-android
+          path: release/*
+          if-no-files-found: error
+          retention-days: 14
+
+  linux:
+    name: Linux amd64 DEB
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Linux packaging dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang cmake ninja-build pkg-config libgtk-3-dev \
+            libayatana-appindicator3-dev libsqlite3-dev libcurl4-openssl-dev \
+            libsecret-1-dev patchelf fakeroot dpkg-dev file
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Download and verify pinned Linux core
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p marten-core/bin
+          gh release download "${DESKTOP_CORE_RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern "${LINUX_CORE_ARCHIVE}" \
+            --dir "${RUNNER_TEMP}" \
+            --clobber
+          echo "${LINUX_CORE_SHA256}  ${RUNNER_TEMP}/${LINUX_CORE_ARCHIVE}" | sha256sum --check --strict
+          tar -xzf "${RUNNER_TEMP}/${LINUX_CORE_ARCHIVE}" -C marten-core/bin
+
+      - name: Generate Flutter sources and install Fastforge
+        shell: bash
+        run: |
+          flutter pub get
+          dart run build_runner build --delete-conflicting-outputs
+          dart run slang
+          dart pub global activate fastforge "${FASTFORGE_VERSION}"
+          echo "${HOME}/.pub-cache/bin" >> "${GITHUB_PATH}"
+
+      - name: Build Linux DEB
+        shell: bash
+        run: |
+          fastforge package \
+            --platform linux \
+            --targets deb \
+            --skip-clean \
+            --build-target lib/main_prod.dart \
+            --build-dart-define=release=github
+
+      - name: Verify and package Linux DEB
+        shell: bash
+        run: |
+          VERSION="$(sed -n 's/^version: \([^+]*\).*/\1/p' pubspec.yaml)"
+          PACKAGE_VERSION="$(sed -n 's/^version: //p' pubspec.yaml)"
+          mapfile -t DEBS < <(find dist -type f -name '*.deb' -print)
+          test "${#DEBS[@]}" -eq 1
+          DEB="${DEBS[0]}"
+          test "$(dpkg-deb -f "${DEB}" Architecture)" = "amd64"
+          test "$(dpkg-deb -f "${DEB}" Version)" = "${PACKAGE_VERSION}"
+          dpkg-deb --info "${DEB}"
+          dpkg-deb --contents "${DEB}" | tee linux-deb-contents.txt
+
+          EXTRACTED="${RUNNER_TEMP}/marten-deb"
+          dpkg-deb --extract "${DEB}" "${EXTRACTED}"
+          APP="$(find "${EXTRACTED}" -type f -name marten -perm -111 | head -n 1)"
+          CLI="$(find "${EXTRACTED}" -type f -name MartenCli -perm -111 | head -n 1)"
+          CORE="$(find "${EXTRACTED}" -type f -name libmarten-core.so | head -n 1)"
+          test -n "${APP}"
+          test -n "${CLI}"
+          test -n "${CORE}"
+          file "${APP}" "${CLI}" "${CORE}" | tee linux-deb-architectures.txt
+          grep -Fq "x86-64" linux-deb-architectures.txt
+
+          mkdir -p release
+          OUTPUT="marten-${VERSION}-linux-amd64.deb"
+          cp "${DEB}" "release/${OUTPUT}"
+          (cd release && sha256sum "${OUTPUT}" > linux-sha256.txt)
+          {
+            echo "source_commit=${GITHUB_SHA}"
+            echo "version=${PACKAGE_VERSION}"
+            echo "flutter_version=${FLUTTER_VERSION}"
+            echo "target=linux-amd64"
+            echo "package_format=deb"
+            echo "core_archive_sha256=${LINUX_CORE_SHA256}"
+            echo "marten_public_core_revision=${PUBLIC_CORE_REVISION}"
+            echo "marten_public_sing_box_revision=${PUBLIC_SING_BOX_REVISION}"
+            echo "turncoat_revision=${TURNCOAT_REVISION}"
+          } > release/linux-build-metadata.txt
+
+      - name: Upload verified Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: marten-linux-amd64-${{ github.sha }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 14
+
+  windows:
+    name: Windows x64 EXE installer
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Install Windows packaging dependencies
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          dart pub global activate fastforge $env:FASTFORGE_VERSION
+          $pubBin = Join-Path $env:LOCALAPPDATA "Pub\Cache\bin"
+          $pubBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Download and verify pinned Windows core
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Force -Path "marten-core/bin" | Out-Null
+          gh release download $env:DESKTOP_CORE_RELEASE_TAG `
+            --repo $env:GITHUB_REPOSITORY `
+            --pattern $env:WINDOWS_CORE_ARCHIVE `
+            --dir $env:RUNNER_TEMP `
+            --clobber
+          $archive = Join-Path $env:RUNNER_TEMP $env:WINDOWS_CORE_ARCHIVE
+          $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          if ($actual -ne $env:WINDOWS_CORE_SHA256) {
+            throw "Windows core SHA256 mismatch: $actual"
+          }
+          tar -xzf $archive -C "marten-core/bin"
+
+      - name: Generate Flutter sources
+        shell: pwsh
+        run: |
+          flutter pub get
+          dart run build_runner build --delete-conflicting-outputs
+          dart run slang
+
+      - name: Build Windows EXE installer
+        shell: pwsh
+        run: |
+          fastforge package `
+            --platform windows `
+            --targets exe `
+            --skip-clean `
+            --build-target lib/main_prod.dart `
+            --build-dart-define=release=github
+
+      - name: Verify and package Windows EXE installer
+        shell: pwsh
+        run: |
+          function Assert-PeX64([string]$Path) {
+            $stream = [System.IO.File]::OpenRead($Path)
+            try {
+              $reader = [System.IO.BinaryReader]::new($stream)
+              $stream.Seek(0x3c, [System.IO.SeekOrigin]::Begin) | Out-Null
+              $peOffset = $reader.ReadInt32()
+              $stream.Seek($peOffset + 4, [System.IO.SeekOrigin]::Begin) | Out-Null
+              $machine = $reader.ReadUInt16()
+              if ($machine -ne 0x8664) {
+                throw "$Path is not PE x64 (machine=0x$($machine.ToString('x4')))"
+              }
+            } finally {
+              $stream.Dispose()
+            }
+          }
+
+          $version = ((Get-Content pubspec.yaml | Select-String '^version: ([^+]+)').Matches[0].Groups[1].Value)
+          $bundle = "build/windows/x64/runner/Release"
+          $app = Join-Path $bundle "Marten.exe"
+          $cli = Join-Path $bundle "MartenCli.exe"
+          $core = Join-Path $bundle "marten-core.dll"
+          Assert-PeX64 $app
+          Assert-PeX64 $cli
+          Assert-PeX64 $core
+
+          $installers = @(Get-ChildItem dist -Recurse -File -Filter *.exe | Sort-Object Length -Descending)
+          if ($installers.Count -lt 1) { throw "Fastforge did not produce an EXE installer" }
+          $installer = $installers[0]
+          $stream = [System.IO.File]::OpenRead($installer.FullName)
+          try {
+            if ($stream.ReadByte() -ne 0x4d -or $stream.ReadByte() -ne 0x5a) {
+              throw "Installer is not a Windows executable: $($installer.FullName)"
+            }
+          } finally {
+            $stream.Dispose()
+          }
+
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          $output = "marten-$version-windows-x64-setup.exe"
+          Copy-Item $installer.FullName (Join-Path release $output)
+          $hash = (Get-FileHash -Algorithm SHA256 (Join-Path release $output)).Hash.ToLowerInvariant()
+          "$hash  $output" | Set-Content (Join-Path release "windows-sha256.txt")
+          @(
+            "source_commit=$env:GITHUB_SHA",
+            "version=$version",
+            "flutter_version=$env:FLUTTER_VERSION",
+            "target=windows-x64",
+            "package_format=exe-installer",
+            "core_archive_sha256=$env:WINDOWS_CORE_SHA256",
+            "marten_public_core_revision=$env:PUBLIC_CORE_REVISION",
+            "marten_public_sing_box_revision=$env:PUBLIC_SING_BOX_REVISION",
+            "turncoat_revision=$env:TURNCOAT_REVISION"
+          ) | Set-Content (Join-Path release "windows-build-metadata.txt")
+
+      - name: Upload verified Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: marten-windows-x64-${{ github.sha }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish one common GitHub Release
+    needs: [android, linux, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download all verified platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: marten-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Validate and stage the common release
+        shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.release_tag }}
+          VERSION: ${{ needs.android.outputs.version }}
+        run: |
+          test "${REQUESTED_TAG}" = "v${VERSION}"
+          test -s "artifacts/marten-${VERSION}-windows-x64-setup.exe"
+          test -s "artifacts/marten-${VERSION}-linux-amd64.deb"
+          test -s "artifacts/marten-${VERSION}-android-arm64-v8a.apk"
+          test -s "artifacts/marten-${VERSION}-android-universal.apk"
+
+          mkdir -p release
+          cp "artifacts/marten-${VERSION}-windows-x64-setup.exe" release/
+          cp "artifacts/marten-${VERSION}-linux-amd64.deb" release/
+          cp "artifacts/marten-${VERSION}-android-arm64-v8a.apk" release/
+          cp "artifacts/marten-${VERSION}-android-universal.apk" release/
+          cp artifacts/android-signing-certificate.txt release/
+          cp artifacts/android-build-metadata.txt release/
+          cp artifacts/linux-build-metadata.txt release/
+          cp artifacts/windows-build-metadata.txt release/
+          (cd release && sha256sum \
+            "marten-${VERSION}-windows-x64-setup.exe" \
+            "marten-${VERSION}-linux-amd64.deb" \
+            "marten-${VERSION}-android-arm64-v8a.apk" \
+            "marten-${VERSION}-android-universal.apk" \
+            > SHA256SUMS)
+
+      - name: Publish the common release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+          VERSION: ${{ needs.android.outputs.version }}
+        run: |
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists; refusing to overwrite it" >&2
+            exit 1
+          fi
+          gh release create "${TAG}" release/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "${GITHUB_SHA}" \
+            --title "Marten ${VERSION}" \
+            --notes "One verified release for Windows x64 (EXE installer), Linux amd64 (DEB), Android arm64-v8a, and Android universal. All artifacts were built from source commit ${GITHUB_SHA}; checksums and platform provenance are included." \
+            --latest
