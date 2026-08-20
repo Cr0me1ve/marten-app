@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:grpc/grpc.dart';
 import 'package:marten/martencore/marten_core_service.dart';
 import 'package:marten/singbox/model/core_status.dart';
 
@@ -27,6 +28,33 @@ String _extractFunctionBlock(String source, String signature) {
 }
 
 void main() {
+  group('Android CAPTCHA recovery log bridge', () {
+    test('filters superseded Android background log generations without filtering foreground or desktop logs', () {
+      expect(acceptsBackgroundLogGeneration(isAndroid: true, listenerGeneration: 41, currentGeneration: 42), isFalse);
+      expect(acceptsBackgroundLogGeneration(isAndroid: true, listenerGeneration: 42, currentGeneration: 42), isTrue);
+      expect(acceptsBackgroundLogGeneration(isAndroid: true, listenerGeneration: null, currentGeneration: 42), isTrue);
+      expect(acceptsBackgroundLogGeneration(isAndroid: false, listenerGeneration: 41, currentGeneration: 42), isTrue);
+    });
+
+    test('does not deduplicate unresolved CAPTCHA control-plane replay across a listener replacement', () {
+      final source = File('lib/martencore/marten_core_service.dart').readAsStringSync();
+      final start = source.indexOf('Future<void> startListeningLogs(String key, CoreClient cc) async {');
+      final end = source.indexOf('\n  Future<void> stopListenSingle', start);
+      final listener = start < 0 || end < 0 ? '' : source.substring(start, end);
+
+      expect(listener, isNotEmpty);
+      final captchaMarker = listener.indexOf("event.message.contains('MARTEN_TURNCOAT_CAPTCHA')");
+      final deduplicator = listener.indexOf('!isCaptchaControlEvent && !_coreLogDeduplicator.shouldAccept(event)');
+      expect(captchaMarker, isNonNegative);
+      expect(deduplicator, greaterThan(captchaMarker));
+      expect(
+        listener,
+        isNot(contains('if (!_coreLogDeduplicator.shouldAccept(event)) return event;')),
+        reason: 'a recovered listener must receive a still-unresolved CAPTCHA replay',
+      );
+    });
+  });
+
   group('platform bootstrap helpers', () {
     test('startup markers and deferred work keep the first interaction path lean', () {
       final bootstrap = File('lib/bootstrap.dart').readAsStringSync();
@@ -150,16 +178,17 @@ void main() {
       expect(buildStart, isNonNegative);
       expect(buildEnd, isNonNegative);
       final build = notifier.substring(buildStart, buildEnd);
-      expect(build, contains('Platform.isAndroid && await _connectionRepo.initializeStoppedPlatformStatus()'));
-      expect(build, contains('if (!platformStopped)'));
+      expect(build, contains('Platform.isAndroid && await _connectionRepo.initializePassivePlatformStatus()'));
+      expect(build, contains('if (!platformBootstrapHandled)'));
     });
 
-    test('uses lightweight bootstrap only for an Android stopped platform service', () {
+    test('uses lightweight bootstrap for Android passive platform states only', () {
       final cases = [
         (isAndroid: true, platformStatus: const CoreStatus.stopped(), expected: true),
+        (isAndroid: true, platformStatus: const CoreStatus.starting(), expected: true),
+        (isAndroid: true, platformStatus: const CoreStatus.stopping(), expected: true),
         (isAndroid: false, platformStatus: const CoreStatus.stopped(), expected: false),
         (isAndroid: true, platformStatus: null, expected: false),
-        (isAndroid: true, platformStatus: const CoreStatus.starting(), expected: false),
         (isAndroid: true, platformStatus: const CoreStatus.started(), expected: false),
       ];
 
@@ -258,12 +287,13 @@ void main() {
       );
     });
 
-    test('initializes an uninitialized core only when the platform starts', () {
+    test('initializes an uninitialized foreground core only after the platform has started', () {
       final cases = [
-        (platformStatus: const CoreStatus.starting(), coreInitialized: false, expected: true),
-        (platformStatus: const CoreStatus.starting(), coreInitialized: true, expected: false),
+        (platformStatus: const CoreStatus.started(), coreInitialized: false, expected: true),
+        (platformStatus: const CoreStatus.started(), coreInitialized: true, expected: false),
         (platformStatus: const CoreStatus.stopped(), coreInitialized: false, expected: false),
-        (platformStatus: const CoreStatus.started(), coreInitialized: false, expected: false),
+        (platformStatus: const CoreStatus.starting(), coreInitialized: false, expected: false),
+        (platformStatus: const CoreStatus.stopping(), coreInitialized: false, expected: false),
       ];
 
       for (final testCase in cases) {
@@ -276,6 +306,27 @@ void main() {
   });
 
   group('platform service status merge', () {
+    test('passive Android bootstrap covers transitional states and terminal platform events end recovery bridge', () {
+      final source = File('lib/martencore/marten_core_service.dart').readAsStringSync();
+      final passive = _extractFunctionBlock(source, 'Future<bool> initializePassivePlatformStatus() async');
+      final apply = _extractFunctionBlock(source, 'void _applyPlatformServiceStatus(CoreStatus event)');
+
+      expect(
+        passive,
+        contains('shouldUseLightweightPlatformBootstrap(isAndroid: true, platformStatus: platformStatus)'),
+      );
+      expect(passive, contains('_applyPlatformServiceStatus(platformStatus!)'));
+      expect(passive, contains('await startListeningPlatformStatus()'));
+
+      final terminal = apply.indexOf('if (event is CoreStopping || event is CoreStopped)');
+      expect(terminal, isNonNegative);
+      final terminalBlock = apply.substring(terminal);
+      expect(terminalBlock, contains('_nativePlatformRecoveryInProgress = false'));
+      expect(terminalBlock, contains('_stopNativeRecoveryLogBridge()'));
+      expect(apply, contains('if (event case CoreStopped(alert: final alert?))'));
+      expect(apply, contains('Preferences.startedByUser.notifier).update(false)'));
+    });
+
     test('tracks a native recovery only when a running core enters platform starting', () {
       expect(startsNativePlatformRecovery(const CoreStatus.started(), const CoreStatus.starting()), isTrue);
       expect(startsNativePlatformRecovery(const CoreStatus.stopped(), const CoreStatus.starting()), isFalse);
@@ -565,6 +616,211 @@ void main() {
 
       expect(ready, isFalse);
       expect(reads, 1);
+    });
+  });
+
+  group('post-start local control-channel recovery', () {
+    const localTransportShutdown = GrpcError.unknown('HTTP/2 stream forcefully terminated');
+
+    test('refreshes immediately and replays SelectOutbound once for the current Started generation', () async {
+      final events = <String>[];
+      var replayCalls = 0;
+
+      final result = await recoverPostStartSelectOutboundTransport(
+        error: localTransportShutdown,
+        expectedGeneration: 41,
+        currentGeneration: () => 41,
+        isStarted: () => true,
+        refresh: (generation) async {
+          events.add('refresh:$generation');
+          return const CoreStatus.started();
+        },
+        replay: () async {
+          replayCalls++;
+          events.add('replay');
+          return true;
+        },
+      );
+
+      expect(result, PostStartSelectRecovery.recovered);
+      expect(events, ['refresh:41', 'replay']);
+      expect(replayCalls, 1);
+    });
+
+    test('fails closed without refreshing when the Start generation is already stale', () async {
+      var refreshCalls = 0;
+      var replayCalls = 0;
+
+      final result = await recoverPostStartSelectOutboundTransport(
+        error: localTransportShutdown,
+        expectedGeneration: 41,
+        currentGeneration: () => 42,
+        isStarted: () => true,
+        refresh: (_) async {
+          refreshCalls++;
+          return const CoreStatus.started();
+        },
+        replay: () async {
+          replayCalls++;
+          return true;
+        },
+      );
+
+      expect(result, PostStartSelectRecovery.failed);
+      expect(refreshCalls, 0);
+      expect(replayCalls, 0);
+    });
+
+    test('fails closed when lifecycle generation changes while refreshing the local control channel', () async {
+      final events = <String>[];
+      var generation = 41;
+
+      final result = await recoverPostStartSelectOutboundTransport(
+        error: localTransportShutdown,
+        expectedGeneration: 41,
+        currentGeneration: () => generation,
+        isStarted: () => true,
+        refresh: (_) async {
+          events.add('refresh');
+          generation = 42;
+          return const CoreStatus.started();
+        },
+        replay: () async {
+          events.add('replay');
+          return true;
+        },
+      );
+
+      expect(result, PostStartSelectRecovery.failed);
+      expect(events, ['refresh']);
+    });
+
+    test('fails closed when the generation and Started state become stale inside the one replay', () async {
+      var generation = 41;
+      var started = true;
+      var replayCalls = 0;
+
+      final result = await recoverPostStartSelectOutboundTransport(
+        error: localTransportShutdown,
+        expectedGeneration: 41,
+        currentGeneration: () => generation,
+        isStarted: () => started,
+        refresh: (_) async => const CoreStatus.started(),
+        replay: () async {
+          replayCalls++;
+          generation = 42;
+          started = false;
+          return true;
+        },
+      );
+
+      expect(result, PostStartSelectRecovery.failed);
+      expect(replayCalls, 1);
+    });
+
+    test('does not recover non-local transport failures', () async {
+      var refreshCalls = 0;
+      var replayCalls = 0;
+
+      final result = await recoverPostStartSelectOutboundTransport(
+        error: StateError('remote server rejected SelectOutbound'),
+        expectedGeneration: 41,
+        currentGeneration: () => 41,
+        isStarted: () => true,
+        refresh: (_) async {
+          refreshCalls++;
+          return const CoreStatus.started();
+        },
+        replay: () async {
+          replayCalls++;
+          return true;
+        },
+      );
+
+      expect(result, PostStartSelectRecovery.notApplicable);
+      expect(refreshCalls, 0);
+      expect(replayCalls, 0);
+    });
+
+    test('recognizes the observed local HTTP/2 termination but not unrelated UNKNOWN failures', () {
+      expect(
+        isExpectedLocalPostStartTransportShutdown(
+          const GrpcError.unknown('HTTP/2 connection error: Connection is being forcefully terminated. (errorCode: 1)'),
+        ),
+        isTrue,
+      );
+      expect(
+        isExpectedLocalPostStartTransportShutdown(
+          const GrpcError.unknown('remote upstream returned an unknown failure'),
+        ),
+        isFalse,
+      );
+    });
+
+    test('does not replay after a failed refresh or a failed replay', () async {
+      var refreshFailureReplayCalls = 0;
+      final refreshFailure = await recoverPostStartSelectOutboundTransport(
+        error: localTransportShutdown,
+        expectedGeneration: 41,
+        currentGeneration: () => 41,
+        isStarted: () => true,
+        refresh: (_) async => const CoreStatus.starting(),
+        replay: () async {
+          refreshFailureReplayCalls++;
+          return true;
+        },
+      );
+
+      var replayCalls = 0;
+      final replayFailure = await recoverPostStartSelectOutboundTransport(
+        error: localTransportShutdown,
+        expectedGeneration: 41,
+        currentGeneration: () => 41,
+        isStarted: () => true,
+        refresh: (_) async => const CoreStatus.started(),
+        replay: () async {
+          replayCalls++;
+          return false;
+        },
+      );
+
+      expect(refreshFailure, PostStartSelectRecovery.failed);
+      expect(refreshFailureReplayCalls, 0);
+      expect(replayFailure, PostStartSelectRecovery.failed);
+      expect(replayCalls, 1);
+    });
+
+    test('fails closed when refresh or its one replay throws', () async {
+      var refreshThrowReplayCalls = 0;
+      final refreshThrow = await recoverPostStartSelectOutboundTransport(
+        error: localTransportShutdown,
+        expectedGeneration: 41,
+        currentGeneration: () => 41,
+        isStarted: () => true,
+        refresh: (_) async => throw StateError('refresh failed'),
+        replay: () async {
+          refreshThrowReplayCalls++;
+          return true;
+        },
+      );
+
+      var replayThrowCalls = 0;
+      final replayThrow = await recoverPostStartSelectOutboundTransport(
+        error: localTransportShutdown,
+        expectedGeneration: 41,
+        currentGeneration: () => 41,
+        isStarted: () => true,
+        refresh: (_) async => const CoreStatus.started(),
+        replay: () {
+          replayThrowCalls++;
+          return Future<bool>.error(StateError('replay failed'));
+        },
+      );
+
+      expect(refreshThrow, PostStartSelectRecovery.failed);
+      expect(refreshThrowReplayCalls, 0);
+      expect(replayThrow, PostStartSelectRecovery.failed);
+      expect(replayThrowCalls, 1);
     });
   });
 

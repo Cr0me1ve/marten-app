@@ -54,7 +54,10 @@ private data class NetworkDnsResult(
  * Executes a real Android-network request on the VPN Network. Marten's UID is
  * intentionally part of its own VPN UID ranges; native upstream sockets are
  * separately protected and bound to the underlying Network by VPNService.
- * Consequently this request follows the same OS TUN path as user apps.
+ * This proves Marten's path through the current TUN generation. Admission of
+ * at least one external app for an include-only plan is enforced separately
+ * while applying [VpnAppRoutingPlan], so this self-probe cannot validate an
+ * otherwise empty allowlist.
  */
 internal class VpnDataPlaneProbe(context: Context) {
     private val connectivity = context.getSystemService(ConnectivityManager::class.java)

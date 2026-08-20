@@ -3,6 +3,7 @@ package app.marten.client.bg
 import android.util.Log
 import app.marten.core.mobile.Mobile
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicReference
 
@@ -29,6 +30,7 @@ internal class MobileCloseCoordinator(
 
     private val lock = Any()
     private var operation: Operation? = null
+    private var lastCompletedError: Throwable? = null
 
     fun start(): Boolean {
         val (_, started) = currentOrStart()
@@ -41,7 +43,12 @@ internal class MobileCloseCoordinator(
     }
 
     fun waitForClose(timeoutMs: Long): MobileCloseResult {
-        val current = synchronized(lock) { operation } ?: return MobileCloseResult(finished = true)
+        val current = synchronized(lock) {
+            operation ?: return MobileCloseResult(
+                finished = true,
+                error = lastCompletedError,
+            )
+        }
         return waitFor(current, timeoutMs)
     }
 
@@ -57,6 +64,7 @@ internal class MobileCloseCoordinator(
                     created.error.set(error)
                 } finally {
                     synchronized(lock) {
+                        lastCompletedError = created.error.get()
                         if (operation === created) {
                             operation = null
                         }
@@ -65,6 +73,7 @@ internal class MobileCloseCoordinator(
             }, threadName).apply {
                 isDaemon = true
             }
+            lastCompletedError = null
             operation = created
             created.thread.start()
             return created to true
@@ -82,13 +91,23 @@ internal class MobileCloseCoordinator(
 
 object MobileCoreCloser {
     private const val TAG = "A/MobileCoreCloser"
+    private const val CLOSE_WAIT_TIMEOUT_MS = 15_000L
 
     private val coordinator = MobileCloseCoordinator("marten-mobile-core-close") {
-        try {
-            Mobile.close(4L)
-        } catch (error: Throwable) {
-            Log.w(TAG, "Mobile.close failed on native close thread", error)
-            throw error
+        runBlocking {
+            // Native teardown is serialized with setup/start, but callers never
+            // hold this lifecycle mutex while waiting for it. A stuck native
+            // operation therefore leaves one tracked close pending instead of
+            // trapping manual Stop behind the recovery coroutine that requested
+            // it. The Android TUN has already been released by that point.
+            MobileCoreLifecycle.run {
+                try {
+                    Mobile.close(4L)
+                } catch (error: Throwable) {
+                    Log.w(TAG, "Mobile.close failed on native close thread", error)
+                    throw error
+                }
+            }
         }
     }
 
@@ -98,22 +117,36 @@ object MobileCoreCloser {
         }
     }
 
-    suspend fun closeBlocking(reason: String): Boolean = withContext(Dispatchers.IO) {
-        // A close may be slow, but a new setup cannot safely start until the
-        // process-global native operation has actually returned.
-        val result = coordinator.closeBlocking(0L)
+    suspend fun closeBlocking(
+        reason: String,
+        timeoutMs: Long = CLOSE_WAIT_TIMEOUT_MS,
+    ): Boolean = withContext(Dispatchers.IO) {
+        // The exact close keeps running on its single native thread after this
+        // wait expires. Android must never block a service lifecycle forever
+        // behind native cleanup; callers fail closed and may only start again
+        // after waitForCloseToFinish observes that same operation completing.
+        val result = coordinator.closeBlocking(timeoutMs)
         result.error?.let {
             Log.w(TAG, "Mobile.close failed during $reason", it)
             return@withContext false
         }
+        if (!result.finished) {
+            Log.w(TAG, "Mobile.close did not finish within ${timeoutMs}ms during $reason")
+        }
         return@withContext result.finished
     }
 
-    suspend fun waitForCloseToFinish(reason: String): Boolean = withContext(Dispatchers.IO) {
-        val result = coordinator.waitForClose(0L)
+    suspend fun waitForCloseToFinish(
+        reason: String,
+        timeoutMs: Long = CLOSE_WAIT_TIMEOUT_MS,
+    ): Boolean = withContext(Dispatchers.IO) {
+        val result = coordinator.waitForClose(timeoutMs)
         result.error?.let {
             Log.w(TAG, "Mobile.close failed before $reason", it)
             return@withContext false
+        }
+        if (!result.finished) {
+            Log.w(TAG, "previous Mobile.close is still running before $reason")
         }
         return@withContext result.finished
     }

@@ -12,6 +12,7 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.lifecycleScope
+import app.marten.client.bg.BoxService
 import app.marten.client.bg.ServiceConnection
 import app.marten.client.bg.ServiceNotification
 import app.marten.client.constant.Action
@@ -37,6 +38,8 @@ class MainActivity : FlutterFragmentActivity(), ServiceConnection.Callback {
     }
 
     private val connection = ServiceConnection(this, this)
+    private var pendingStartConfigFingerprint: String? = null
+    private var pendingStartConfigUsesTurncoat: Boolean? = null
 
     val logList = LinkedList<String>()
     var logCallback: ((Boolean) -> Unit)? = null
@@ -46,6 +49,9 @@ class MainActivity : FlutterFragmentActivity(), ServiceConnection.Callback {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         Application.logStartupPhase("activity_on_create_start")
+        // Cached Flutter engines do not guarantee a new plugin configuration
+        // pass. Publish the visible Activity before super attaches the engine.
+        instance = this
         super.onCreate(savedInstanceState)
         Application.logStartupPhase("activity_on_create_end")
     }
@@ -53,7 +59,6 @@ class MainActivity : FlutterFragmentActivity(), ServiceConnection.Callback {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         Application.logStartupPhase("flutter_engine_configure_start")
         super.configureFlutterEngine(flutterEngine)
-        instance = this
         reconnect()
         flutterEngine.plugins.add(MethodHandler(lifecycleScope))
         flutterEngine.plugins.add(PlatformSettingsHandler())
@@ -80,12 +85,27 @@ class MainActivity : FlutterFragmentActivity(), ServiceConnection.Callback {
         connection.reconnect()
     }
 
+    /**
+     * Re-attaches the Activity presentation to the process-owned service.
+     *
+     * A manual stop deliberately releases the old binding. If Quick Settings
+     * starts a new generation while the Flutter engine is retained, engine
+     * configuration does not run again, so every foreground attach must seed
+     * the cache from the service owner and restore the callback stream.
+     */
+    fun restoreServicePresentation() {
+        serviceStatus.value = BoxService.currentPlatformStatus()
+        connection.connect()
+    }
+
     fun disconnectServiceBinding() {
         connection.disconnect()
     }
 
     @SuppressLint("NewApi")
-    fun startService() {
+    fun startService(configFingerprint: String? = null, configUsesTurncoat: Boolean? = null) {
+        pendingStartConfigFingerprint = configFingerprint
+        pendingStartConfigUsesTurncoat = configUsesTurncoat.takeIf { configFingerprint != null }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !ServiceNotification.checkPermission()) {
             notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
             return
@@ -94,6 +114,8 @@ class MainActivity : FlutterFragmentActivity(), ServiceConnection.Callback {
     }
 
     private fun startService0() {
+        val requestedConfigFingerprint = pendingStartConfigFingerprint
+        val requestedConfigUsesTurncoat = pendingStartConfigUsesTurncoat
         lifecycleScope.launch(Dispatchers.IO) {
             if (Settings.rebuildServiceMode()) {
                 withContext(Dispatchers.Main) {
@@ -107,11 +129,24 @@ class MainActivity : FlutterFragmentActivity(), ServiceConnection.Callback {
             }
             val intent = Intent(Application.application, Settings.serviceClass())
                 .putExtra(Action.EXTRA_USER_INITIATED, true)
-            withContext(Dispatchers.Main) {
-                connection.connect()
-                ContextCompat.startForegroundService(this@MainActivity, intent)
+            if (requestedConfigFingerprint != null) {
+                intent.putExtra(Action.EXTRA_CONFIG_FINGERPRINT, requestedConfigFingerprint)
+                intent.putExtra(
+                    Action.EXTRA_CONFIG_USES_TURNCOAT,
+                    requestedConfigUsesTurncoat ?: Settings.activeConfigUsesTurncoat,
+                )
             }
-            Settings.startedByUser = true
+            try {
+                withContext(Dispatchers.Main) {
+                    connection.connect()
+                    ContextCompat.startForegroundService(this@MainActivity, intent)
+                }
+                Settings.startedByUser = true
+            } finally {
+                if (pendingStartConfigFingerprint == requestedConfigFingerprint) {
+                    clearPendingStartConfigIdentity()
+                }
+            }
         }
     }
 
@@ -125,6 +160,7 @@ class MainActivity : FlutterFragmentActivity(), ServiceConnection.Callback {
                 false
             }
         } catch (e: Exception) {
+            clearPendingStartConfigIdentity()
             onServiceAlert(Alert.RequestVPNPermission, e.message)
             true
         }
@@ -134,6 +170,7 @@ class MainActivity : FlutterFragmentActivity(), ServiceConnection.Callback {
             ActivityResultContracts.RequestPermission(),
         ) { isGranted ->
             if (Settings.dynamicNotification && !isGranted) {
+                clearPendingStartConfigIdentity()
                 onServiceAlert(Alert.RequestNotificationPermission, null)
             } else {
                 startService0()
@@ -147,9 +184,15 @@ class MainActivity : FlutterFragmentActivity(), ServiceConnection.Callback {
             if (result.resultCode == RESULT_OK) {
                 startService0()
             } else {
+                clearPendingStartConfigIdentity()
                 onServiceAlert(Alert.RequestVPNPermission, null)
             }
         }
+
+    private fun clearPendingStartConfigIdentity() {
+        pendingStartConfigFingerprint = null
+        pendingStartConfigUsesTurncoat = null
+    }
 
     override fun onServiceStatusChanged(status: Status) {
         serviceStatus.postValue(status)
@@ -186,6 +229,19 @@ class MainActivity : FlutterFragmentActivity(), ServiceConnection.Callback {
 
 
 
+    override fun onStart() {
+        super.onStart()
+        restoreServicePresentation()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Notification shade / Quick Settings can pause without stopping the
+        // Activity. connect() is idempotent, so resume closes that lifecycle
+        // gap without replacing a healthy binding.
+        restoreServicePresentation()
+    }
+
     override fun onDestroy() {
         connection.disconnect()
         super.onDestroy()
@@ -209,8 +265,11 @@ class MainActivity : FlutterFragmentActivity(), ServiceConnection.Callback {
     ) {
         if (requestCode == NOTIFICATION_PERMISSION_REQUEST_CODE) {
             if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                startService()
-            } else onServiceAlert(Alert.RequestNotificationPermission, null)
+                startService0()
+            } else {
+                clearPendingStartConfigIdentity()
+                onServiceAlert(Alert.RequestNotificationPermission, null)
+            }
         }
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
     }
@@ -218,11 +277,19 @@ class MainActivity : FlutterFragmentActivity(), ServiceConnection.Callback {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == VPN_PERMISSION_REQUEST_CODE) {
-            if (resultCode == RESULT_OK) startService()
-            else onServiceAlert(Alert.RequestVPNPermission, null)
+            if (resultCode == RESULT_OK) {
+                startService0()
+            } else {
+                clearPendingStartConfigIdentity()
+                onServiceAlert(Alert.RequestVPNPermission, null)
+            }
         } else if (requestCode == NOTIFICATION_PERMISSION_REQUEST_CODE) {
-            if (resultCode == RESULT_OK) startService()
-            else onServiceAlert(Alert.RequestNotificationPermission, null)
+            if (resultCode == RESULT_OK) {
+                startService0()
+            } else {
+                clearPendingStartConfigIdentity()
+                onServiceAlert(Alert.RequestNotificationPermission, null)
+            }
         }
     }
 }

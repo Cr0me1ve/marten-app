@@ -49,9 +49,86 @@ bool shouldApplyNativeRecoverySnapshot({
 bool shouldAttachBackgroundCoreDuringSetup({required bool isAndroid, required CoreStatus? platformStatus}) =>
     !isAndroid || platformStatus is! CoreStopped;
 
+enum PostStartSelectRecovery { notApplicable, recovered, failed }
+
+enum BackgroundObservationStreamErrorAction { reattach, finish, propagate }
+
+@visibleForTesting
+bool isExpectedLocalPostStartTransportShutdown(Object error) {
+  if (error is! GrpcError) return false;
+  if (error.code == StatusCode.unavailable) return true;
+  if (error.code != StatusCode.unknown) return false;
+  final message = (error.message ?? '').toLowerCase();
+  return message.contains('http/2') &&
+      (message.contains('forcefully terminated') ||
+          message.contains('protocol error') ||
+          message.contains('connection error'));
+}
+
+@visibleForTesting
+BackgroundObservationStreamErrorAction classifyBackgroundObservationStreamError({
+  required Object error,
+  required bool observationClientRetired,
+  required CoreStatus currentState,
+  required CoreStatus? platformStatus,
+  required bool disposed,
+}) {
+  final isLocalStreamShutdown =
+      error is GrpcError && (error.code == StatusCode.cancelled || isExpectedLocalPostStartTransportShutdown(error));
+  if (!isLocalStreamShutdown) return BackgroundObservationStreamErrorAction.propagate;
+
+  final currentLifecycleIsActive = currentState is CoreStarting || currentState is CoreStarted;
+  final lifecycleIsTerminal =
+      currentState is CoreStopping ||
+      currentState is CoreStopped ||
+      (!currentLifecycleIsActive && (platformStatus is CoreStopping || platformStatus is CoreStopped));
+  if (disposed || lifecycleIsTerminal) return BackgroundObservationStreamErrorAction.finish;
+  if (observationClientRetired) return BackgroundObservationStreamErrorAction.reattach;
+  return BackgroundObservationStreamErrorAction.propagate;
+}
+
+@visibleForTesting
+Future<PostStartSelectRecovery> recoverPostStartSelectOutboundTransport({
+  required Object error,
+  required int? expectedGeneration,
+  required int Function() currentGeneration,
+  required bool Function() isStarted,
+  required Future<CoreStatus?> Function(int expectedGeneration) refresh,
+  required Future<bool> Function() replay,
+}) async {
+  if (!isExpectedLocalPostStartTransportShutdown(error)) {
+    return PostStartSelectRecovery.notApplicable;
+  }
+
+  final generation = expectedGeneration;
+  if (generation == null) return PostStartSelectRecovery.failed;
+  bool ownsStartedGeneration() => isStarted() && currentGeneration() == generation;
+
+  if (!ownsStartedGeneration()) return PostStartSelectRecovery.failed;
+  try {
+    final status = await refresh(generation);
+    if (status is! CoreStarted || !ownsStartedGeneration()) {
+      return PostStartSelectRecovery.failed;
+    }
+    if (!await replay() || !ownsStartedGeneration()) {
+      return PostStartSelectRecovery.failed;
+    }
+    return PostStartSelectRecovery.recovered;
+  } catch (_) {
+    return PostStartSelectRecovery.failed;
+  }
+}
+
 @visibleForTesting
 String coreLogListenerKey({required bool isAndroid, required String role}) =>
     isAndroid ? "androidCoreLogListener" : "${role}LogListener";
+
+@visibleForTesting
+bool acceptsBackgroundLogGeneration({
+  required bool isAndroid,
+  required int? listenerGeneration,
+  required int currentGeneration,
+}) => !isAndroid || listenerGeneration == null || listenerGeneration == currentGeneration;
 
 class MartenCoreService with InfraLogger {
   MartenCoreService(this.ref);
@@ -89,11 +166,13 @@ class MartenCoreService with InfraLogger {
   Future<void>? _platformTriggeredInitFuture;
   int _statusRevision = 0;
   int _nativeRecoveryLogBridgeGeneration = 0;
+  int? _startedBackgroundGeneration;
   bool _disposed = false;
 
   void _setCurrentState(CoreStatus next, {bool emit = true}) {
     _statusRevision++;
     currentState = next;
+    if (next is! CoreStarted) _startedBackgroundGeneration = null;
     if (emit) statusController.add(next);
   }
 
@@ -124,7 +203,7 @@ class MartenCoreService with InfraLogger {
 
   Stream<CoreStatus> watchPlatformServiceStatus() => core.watchServiceStatus();
 
-  Future<bool> initializeStoppedPlatformStatus() async {
+  Future<bool> initializePassivePlatformStatus() async {
     if (!PlatformUtils.isAndroid) return false;
     final platformStatus = await readPlatformServiceStatus();
     if (!shouldUseLightweightPlatformBootstrap(isAndroid: true, platformStatus: platformStatus)) {
@@ -141,11 +220,30 @@ class MartenCoreService with InfraLogger {
 
   bool get nativePlatformRecoveryInProgress => _nativePlatformRecoveryInProgress;
 
+  void beginManualBackgroundLifecycle() {
+    _statusRevision++;
+    _startedBackgroundGeneration = null;
+    _nativePlatformRecoveryInProgress = false;
+    _stopNativeRecoveryLogBridge();
+    core.beginBackgroundLifecycle();
+  }
+
   Future<int?> tryBeginFlutterRestart() => core.tryBeginFlutterRestart();
 
   Future<void> endFlutterRestart(int token) => core.endFlutterRestart(token);
 
   Future<void> init() async {
+    if (PlatformUtils.isAndroid) {
+      try {
+        if (await initializePassivePlatformStatus()) {
+          loggy.info("Android core initialization deferred to the authoritative service lifecycle");
+          return;
+        }
+      } catch (error) {
+        loggy.debug("platform status unavailable before Android core initialization: $error");
+      }
+    }
+
     await setup()
         .mapLeft((e) {
           loggy.error(e);
@@ -308,6 +406,7 @@ class MartenCoreService with InfraLogger {
       _setCurrentState(const CoreStatus.starting());
       loggy.debug("starting");
       final background = await core.setupBackground(path, name);
+      final backgroundGeneration = core.backgroundLifecycleGeneration;
       if (background case BackgroundCoreSetupFailed(:final status)) {
         _setCurrentState(const CoreStatus.stopped());
         return _settleFailedStart(status.getCoreAlert() ?? const ConnectionFailure.unexpected("failed to start core"));
@@ -321,6 +420,18 @@ class MartenCoreService with InfraLogger {
           coreStatusAfterRuntimeEvent(status, nativeRecoveryInProgress: _nativePlatformRecoveryInProgress),
         );
         loggy.info("adopted existing background core; skipping fresh-start cleanup and duplicate start RPC");
+        if (currentState is! CoreStarted && !await _waitForBackgroundCoreStarted()) {
+          return _settleFailedStart(const ConnectionFailure.unexpected("background core did not reach started state"));
+        }
+        _setCurrentState(const CoreStatus.started());
+        if (!await _establishStartedBackgroundControlSession(backgroundGeneration)) {
+          if (currentState is CoreStarted && core.backgroundLifecycleGeneration == backgroundGeneration) {
+            loggy.error("local background control channel handoff failed");
+          } else {
+            loggy.info("discarding local control-channel handoff from a superseded start");
+          }
+          return _settleFailedStart(const ConnectionFailure.backgroundCoreNotAvailable());
+        }
         return right(unit);
       }
       if (!await _waitForCoreLocalPortsRelease()) {
@@ -421,6 +532,14 @@ class MartenCoreService with InfraLogger {
         return _settleFailedStart(const ConnectionFailure.unexpected("background core did not reach started state"));
       }
       _setCurrentState(const CoreStatus.started());
+      if (!await _establishStartedBackgroundControlSession(backgroundGeneration)) {
+        if (currentState is CoreStarted && core.backgroundLifecycleGeneration == backgroundGeneration) {
+          loggy.error("local background control channel handoff failed");
+        } else {
+          loggy.info("discarding local control-channel handoff from a superseded start");
+        }
+        return _settleFailedStart(const ConnectionFailure.backgroundCoreNotAvailable());
+      }
       // if (res.messageType != MessageType.EMPTY) return left(res);
 
       return right(unit);
@@ -673,6 +792,37 @@ class MartenCoreService with InfraLogger {
     return snapshot == const CoreStatus.started();
   }
 
+  Future<bool> _establishStartedBackgroundControlSession(int expectedGeneration) async {
+    if (currentState is! CoreStarted || core.backgroundLifecycleGeneration != expectedGeneration) {
+      return false;
+    }
+    if (!PlatformUtils.isAndroid) {
+      _startedBackgroundGeneration = expectedGeneration;
+      return true;
+    }
+
+    final status = await core.refreshBackgroundControlSession(expectedGeneration);
+    if (status is! CoreStarted ||
+        currentState is! CoreStarted ||
+        core.backgroundLifecycleGeneration != expectedGeneration) {
+      return false;
+    }
+
+    // The refresh installs a separate observation connection. Replace the old
+    // stream subscriptions immediately, while the validated control connection
+    // remains free for the latency-sensitive SelectOutbound call.
+    if (!core.isSingleChannel()) {
+      await startListeningLogs("bg", core.bgClient);
+      await startListeningStatus("bg", core.bgClient);
+    }
+    if (currentState is! CoreStarted || core.backgroundLifecycleGeneration != expectedGeneration) {
+      return false;
+    }
+    _startedBackgroundGeneration = expectedGeneration;
+    loggy.debug("background control channel ready for lifecycle generation $expectedGeneration");
+    return true;
+  }
+
   TaskEither<String, Unit> resetTunnel() {
     return TaskEither(() async {
       // only available on iOS (and macOS later)
@@ -697,18 +847,10 @@ class MartenCoreService with InfraLogger {
 
   Stream<OutboundGroup?> watchGroup() async* {
     loggy.debug("watching group");
-    // interrupt managed by core
-
-    if (!core.isInitialized()) {
-      loggy.debug("core is not initialized, returning empty group stream");
-      return;
-    }
-    try {
-      yield* core.bgClient.outboundsInfo(Empty()).map((event) => event.items.isEmpty ? null : event.items.first);
-    } catch (e) {
-      loggy.error("error watching group: $e");
-      rethrow;
-    }
+    yield* _watchBackgroundObservation<OutboundGroup?>(
+      label: "group",
+      open: (client) => client.outboundsInfo(Empty()).map((event) => event.items.isEmpty ? null : event.items.first),
+    );
     // //emitting first event immediately
     // yield* core.bgClient.outboundsInfo(Empty()).take(1).map((event) => event.items.isEmpty ? null : event.items.first);
     // //emitting other event after every 4 seconds(latest event)
@@ -717,22 +859,53 @@ class MartenCoreService with InfraLogger {
 
   Stream<List<OutboundGroup>> watchActiveGroups() async* {
     loggy.info("watching active groups");
+    yield* _watchBackgroundObservation<List<OutboundGroup>>(
+      label: "active groups",
+      open: (client) => client.mainOutboundsInfo(Empty()).map((event) => latest = event.items).startWith(latest),
+    );
+  }
 
+  Stream<T> _watchBackgroundObservation<T>({
+    required String label,
+    required Stream<T> Function(CoreClient client) open,
+  }) async* {
     if (!core.isInitialized()) {
-      loggy.debug("core is not initialized, returning empty group stream");
+      loggy.debug("core is not initialized, returning empty $label stream");
       return;
     }
 
-    try {
-      yield* core.bgClient
-          .mainOutboundsInfo(Empty())
-          .map((event) {
-            return latest = event.items;
-          })
-          .startWith(latest);
-    } catch (e) {
-      loggy.error("error watching active groups: $e");
-      rethrow;
+    while (!_disposed && core.isInitialized()) {
+      final observationClient = core.bgClient;
+      try {
+        yield* open(observationClient);
+      } catch (error, stackTrace) {
+        final action = classifyBackgroundObservationStreamError(
+          error: error,
+          observationClientRetired: !identical(observationClient, core.bgClient),
+          currentState: currentState,
+          platformStatus: _latestPlatformServiceStatus,
+          disposed: _disposed,
+        );
+        switch (action) {
+          case BackgroundObservationStreamErrorAction.reattach:
+            loggy.debug("$label stream moved to the replacement background observation client");
+            continue;
+          case BackgroundObservationStreamErrorAction.finish:
+            loggy.debug("$label stream closed with the background lifecycle");
+            return;
+          case BackgroundObservationStreamErrorAction.propagate:
+            Error.throwWithStackTrace(error, stackTrace);
+        }
+      }
+
+      final currentLifecycleIsActive = currentState is CoreStarting || currentState is CoreStarted;
+      final lifecycleIsTerminal =
+          currentState is CoreStopping ||
+          currentState is CoreStopped ||
+          (!currentLifecycleIsActive &&
+              (_latestPlatformServiceStatus is CoreStopping || _latestPlatformServiceStatus is CoreStopped));
+      if (_disposed || lifecycleIsTerminal || identical(observationClient, core.bgClient)) return;
+      loggy.debug("$label stream completed on a retired background observation client; reattaching");
     }
   }
 
@@ -752,17 +925,66 @@ class MartenCoreService with InfraLogger {
   TaskEither<String, Unit> selectOutbound(String groupTag, String outboundTag, {bool skipProbe = false}) {
     return TaskEither(() async {
       loggy.debug("selecting outbound");
+      final request = SelectOutboundRequest(groupTag: groupTag, outboundTag: outboundTag, skipProbe: skipProbe);
+      final expectedGeneration = _startedBackgroundGeneration;
+
+      Future<bool> select(CoreClient client) async {
+        final response = await client.selectOutbound(
+          request,
+          options: CallOptions(timeout: const Duration(seconds: 1)),
+        );
+        return response.code == ResponseCode.OK;
+      }
+
       try {
-        final res = await core.bgClient.selectOutbound(
-          SelectOutboundRequest(groupTag: groupTag, outboundTag: outboundTag, skipProbe: skipProbe),
+        final res = await core.backgroundControlClient.selectOutbound(
+          request,
           options: CallOptions(timeout: const Duration(seconds: 1)),
         );
         if (res.code != ResponseCode.OK) return left("${res.code} ${res.message}");
 
         return right(unit);
       } catch (e) {
-        loggy.error("error selecting outbound: $e");
-        return left(e.toString());
+        if (!isExpectedLocalPostStartTransportShutdown(e)) {
+          loggy.error("error selecting outbound: $e");
+          return left(e.toString());
+        }
+
+        final code = e is GrpcError ? e.code : -1;
+        loggy.warning("local background control channel closed after start (gRPC code=$code); refreshing once");
+        final recovery = await recoverPostStartSelectOutboundTransport(
+          error: e,
+          expectedGeneration: expectedGeneration,
+          currentGeneration: () => core.backgroundLifecycleGeneration,
+          isStarted: () => currentState is CoreStarted,
+          refresh: core.refreshBackgroundControlSession,
+          replay: () => select(core.backgroundControlClient),
+        );
+        switch (recovery) {
+          case PostStartSelectRecovery.recovered:
+            if (!core.isSingleChannel()) {
+              try {
+                await startListeningLogs("bg", core.bgClient);
+                await startListeningStatus("bg", core.bgClient);
+              } catch (error) {
+                loggy.warning("background observation channel reattach failed after control recovery: $error");
+              }
+            }
+            loggy.info("selected outbound after one local control-channel refresh");
+            return right(unit);
+          case PostStartSelectRecovery.failed:
+            if (expectedGeneration != null &&
+                currentState is CoreStarted &&
+                core.backgroundLifecycleGeneration == expectedGeneration) {
+              loggy.error("local background control channel recovery failed");
+            } else {
+              loggy.info("discarding local control-channel failure from a superseded start");
+            }
+            return left(localCoreControlChannelFailureMessage);
+          case PostStartSelectRecovery.notApplicable:
+            loggy.error("error selecting outbound: $e");
+            return left(e.toString());
+        }
       }
     });
   }
@@ -777,7 +999,7 @@ class MartenCoreService with InfraLogger {
         return left("core service is not running");
       }
       try {
-        final result = await core.bgClient.probeSelectedRoute(
+        final result = await core.backgroundControlClient.probeSelectedRoute(
           UrlTestRequest(groupTag: groupTag),
           options: CallOptions(timeout: timeout),
         );
@@ -1029,8 +1251,8 @@ class MartenCoreService with InfraLogger {
   void _applyPlatformServiceStatus(CoreStatus event) {
     final eventRevision = ++_statusRevision;
     _latestPlatformServiceStatus = event;
-    if (event case CoreStopped(alert: CoreAlert.vpnRevoked)) {
-      loggy.info("Android revoked Marten VPN; clearing user-started session intent");
+    if (event case CoreStopped(alert: final alert?)) {
+      loggy.info("Android service stopped with ${alert.name}; clearing user-started session intent");
       unawaited(ref.read(Preferences.startedByUser.notifier).update(false));
     }
     if (startsNativePlatformRecovery(currentState, event)) {
@@ -1039,11 +1261,14 @@ class MartenCoreService with InfraLogger {
       loggy.info("Android native core recovery started; keeping Flutter status in connecting");
     }
 
-    final recoveryInProgress = _nativePlatformRecoveryInProgress;
-    if (event is CoreStopped && event.alert != null) {
+    if (event is CoreStopping || event is CoreStopped) {
+      if (_nativePlatformRecoveryInProgress) {
+        loggy.info("Android native recovery ended in a terminal platform transition");
+      }
       _nativePlatformRecoveryInProgress = false;
       _stopNativeRecoveryLogBridge();
     }
+    final recoveryInProgress = _nativePlatformRecoveryInProgress;
     final next = coreStatusAfterPlatformEvent(currentState, event, nativeRecoveryInProgress: recoveryInProgress);
     if (!recoveryInProgress && next is CoreStarted && currentState is! CoreStarted) {
       loggy.info("Android route-verified Started replayed to late Flutter engine");
@@ -1059,6 +1284,7 @@ class MartenCoreService with InfraLogger {
     }
     if (currentState == next) return;
     currentState = next;
+    if (next is! CoreStarted) _startedBackgroundGeneration = null;
     statusController.add(currentState);
   }
 
@@ -1085,7 +1311,7 @@ class MartenCoreService with InfraLogger {
   }
 
   Future<void> _maintainNativeRecoveryLogBridge(int generation) async {
-    var attachCount = 0;
+    var attachmentLogged = false;
     final logListenerKey = coreLogListenerKey(isAndroid: PlatformUtils.isAndroid, role: "bg");
     while (!_disposed && _nativePlatformRecoveryInProgress && generation == _nativeRecoveryLogBridgeGeneration) {
       // Mobile.setup replaces the background gRPC server before Android can
@@ -1098,11 +1324,12 @@ class MartenCoreService with InfraLogger {
       if (subscriptions[logListenerKey] == null) {
         try {
           await startListeningLogs("bg", core.bgClient);
-          if (_nativePlatformRecoveryInProgress &&
+          if (!attachmentLogged &&
+              _nativePlatformRecoveryInProgress &&
               generation == _nativeRecoveryLogBridgeGeneration &&
               subscriptions[logListenerKey] != null) {
-            attachCount += 1;
-            loggy.info("Android native recovery attached CAPTCHA log bridge attempt=$attachCount");
+            attachmentLogged = true;
+            loggy.info("Android native recovery attached CAPTCHA log bridge");
           }
         } catch (error) {
           if (_nativePlatformRecoveryInProgress && generation == _nativeRecoveryLogBridgeGeneration) {
@@ -1116,6 +1343,19 @@ class MartenCoreService with InfraLogger {
 
   Future<void> _reattachAfterNativePlatformRecovery(int recoveryRevision) async {
     try {
+      final expectedGeneration = core.backgroundLifecycleGeneration;
+      final status = await core.refreshBackgroundControlSession(expectedGeneration);
+      if (status is! CoreStarted ||
+          !shouldApplyNativeRecoverySnapshot(
+            requestRevision: recoveryRevision,
+            currentRevision: _statusRevision,
+            currentStatus: currentState,
+          ) ||
+          core.backgroundLifecycleGeneration != expectedGeneration) {
+        loggy.warning("discarding stale or unconfirmed Android control-channel recovery");
+        return;
+      }
+      _startedBackgroundGeneration = expectedGeneration;
       await startListeningLogs("bg", core.bgClient);
       await startListeningStatus("bg", core.bgClient);
       await _refreshBackgroundCoreStatusSnapshot(
@@ -1158,6 +1398,7 @@ class MartenCoreService with InfraLogger {
   Future<void> startListeningLogs(String key, CoreClient cc) async {
     if (_disposed) return;
     final listenKey = coreLogListenerKey(isAndroid: PlatformUtils.isAndroid, role: key);
+    final listenerGeneration = PlatformUtils.isAndroid && key == "bg" ? core.backgroundLifecycleGeneration : null;
     if (PlatformUtils.isAndroid && key == "fg" && subscriptions[listenKey] != null) {
       // Android foreground/background gRPC servers expose the same process-wide
       // Go log hub. Once the service-owned background stream exists, a second
@@ -1167,6 +1408,13 @@ class MartenCoreService with InfraLogger {
     // await stopListenSingle(listenKey);
     await listenSingle<LogMessage>(listenKey, () {
       return cc.logListener(Empty(), options: grpcOptions).map((event) {
+        if (!acceptsBackgroundLogGeneration(
+          isAndroid: PlatformUtils.isAndroid,
+          listenerGeneration: listenerGeneration,
+          currentGeneration: core.backgroundLifecycleGeneration,
+        )) {
+          return event;
+        }
         // CAPTCHA markers are control-plane messages. The native core may
         // intentionally replay an unresolved request when a gRPC listener
         // reconnects, so an old fingerprint must never suppress it here.
@@ -1372,11 +1620,11 @@ bool startsNativePlatformRecovery(CoreStatus current, CoreStatus platform) {
 
 @visibleForTesting
 bool shouldUseLightweightPlatformBootstrap({required bool isAndroid, required CoreStatus? platformStatus}) =>
-    isAndroid && platformStatus is CoreStopped;
+    isAndroid && (platformStatus is CoreStopped || platformStatus is CoreStarting || platformStatus is CoreStopping);
 
 @visibleForTesting
 bool shouldInitializeCoreForPlatformEvent(CoreStatus platformStatus, {required bool coreInitialized}) =>
-    !coreInitialized && platformStatus is CoreStarting;
+    !coreInitialized && platformStatus is CoreStarted;
 
 CoreStatus coreStatusAfterRuntimeEvent(CoreStatus runtime, {required bool nativeRecoveryInProgress}) {
   if (nativeRecoveryInProgress &&
@@ -1391,15 +1639,11 @@ CoreStatus coreStatusAfterPlatformEvent(
   CoreStatus platform, {
   bool nativeRecoveryInProgress = false,
 }) {
-  // A native network recovery owns the whole stop/setup/start sequence. Its
-  // intermediate core STOPPING/STOPPED states are not a user-visible stop,
-  // and its final Started is emitted only after Android's selected-route gate.
-  if (nativeRecoveryInProgress) {
-    if (platform is CoreStarted) return const CoreStatus.started();
-    if (platform is CoreStopping || (platform is CoreStopped && platform.alert == null)) {
-      return const CoreStatus.starting();
-    }
-  }
+  // During native recovery Android keeps the platform service in Starting;
+  // runtime STOPPING/STOPPED events are filtered separately. A platform
+  // Stopping/Stopped event is therefore terminal, while Started is emitted
+  // only after Android's selected-route gate.
+  if (nativeRecoveryInProgress && platform is CoreStarted) return const CoreStatus.started();
   // Android publishes Started only after the native runtime, Android TUN and
   // selected route have passed their readiness gate. A new Flutter engine can
   // attach after that transition, so this retained service state must promote

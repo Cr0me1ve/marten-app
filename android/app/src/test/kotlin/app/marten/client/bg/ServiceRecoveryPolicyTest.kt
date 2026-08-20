@@ -888,19 +888,85 @@ class ServiceRecoveryPolicyTest {
     }
 
     @Test
-    fun `stalled core recovery should restart only when stalled beyond timeout and session is active`() {
-        assertEquals(true, shouldRestartProcessForStalledCoreRecovery(true, true, CoreStates.STOPPED, 1_000L, 1_000L))
-        assertEquals(true, shouldRestartProcessForStalledCoreRecovery(true, true, CoreStates.STARTING, 5_000L, 1_000L))
-        assertEquals(true, shouldRestartProcessForStalledCoreRecovery(true, true, CoreStates.STOPPING, 5_000L, 1_000L))
-        assertEquals(true, shouldRestartProcessForStalledCoreRecovery(true, true, null, 5_000L, 1_000L))
+    fun `stalled native recovery fails closed only after its bounded timeout while the user session remains active`() {
+        assertTrue(
+            shouldFailStalledCoreRecovery(
+                recoveryInProgress = true,
+                userSessionActive = true,
+                coreState = CoreStates.STOPPED,
+                elapsedMs = 1_000L,
+                timeoutMs = 1_000L,
+            ),
+        )
+        assertTrue(
+            shouldFailStalledCoreRecovery(
+                recoveryInProgress = true,
+                userSessionActive = true,
+                coreState = CoreStates.STARTING,
+                elapsedMs = 5_000L,
+                timeoutMs = 1_000L,
+            ),
+        )
+        assertFalse(
+            shouldFailStalledCoreRecovery(
+                recoveryInProgress = true,
+                userSessionActive = true,
+                coreState = CoreStates.STARTED,
+                elapsedMs = 5_000L,
+                timeoutMs = 1_000L,
+            ),
+        )
+        assertFalse(
+            shouldFailStalledCoreRecovery(
+                recoveryInProgress = true,
+                userSessionActive = true,
+                coreState = CoreStates.STOPPING,
+                elapsedMs = 999L,
+                timeoutMs = 1_000L,
+            ),
+        )
+        assertFalse(
+            shouldFailStalledCoreRecovery(
+                recoveryInProgress = false,
+                userSessionActive = true,
+                coreState = CoreStates.STOPPED,
+                elapsedMs = 5_000L,
+                timeoutMs = 1_000L,
+            ),
+        )
+        assertFalse(
+            shouldFailStalledCoreRecovery(
+                recoveryInProgress = true,
+                userSessionActive = false,
+                coreState = CoreStates.STOPPED,
+                elapsedMs = 5_000L,
+                timeoutMs = 1_000L,
+            ),
+        )
     }
 
     @Test
-    fun `stalled core recovery should not restart before timeout or when already started or inactive`() {
-        assertEquals(false, shouldRestartProcessForStalledCoreRecovery(true, true, CoreStates.STOPPED, 999L, 1_000L))
-        assertEquals(false, shouldRestartProcessForStalledCoreRecovery(true, true, CoreStates.STARTED, 5_000L, 1_000L))
-        assertEquals(false, shouldRestartProcessForStalledCoreRecovery(false, true, CoreStates.STOPPED, 5_000L, 1_000L))
-        assertEquals(false, shouldRestartProcessForStalledCoreRecovery(true, false, CoreStates.STOPPED, 5_000L, 1_000L))
+    fun `network reset never executes under lifecycle ownership and fails into core recovery`() {
+        val recovery = sourceSection(
+            sourceFile("BoxService.kt"),
+            "private suspend fun recoverNetworkRoute(",
+            "private fun requestRouteWatchdogCheck",
+        )
+        val reset = recovery.indexOf("Mobile.resetNetwork")
+        val failure = recovery.indexOf("if (resetResult.isFailure)", reset)
+        val recoveryRequest = recovery.indexOf("requestCoreRecovery(", failure)
+
+        assertTrue("network recovery must call the native reset", reset >= 0)
+        assertFalse(
+            "transport reset must not monopolize the lifecycle coordinator needed by Stop/Close",
+            recovery.contains("MobileCoreLifecycle.run"),
+        )
+        assertFalse(
+            "transport reset must not hold the lifecycle lock while crossing into native code",
+            recovery.substring(maxOf(0, reset - 400), reset).contains("synchronized(lifecycleLock)"),
+        )
+        assertTrue("a bounded native reset failure must fail closed into core recovery", failure > reset)
+        assertTrue("failed reset must request recovery instead of retrying the stuck transport", recoveryRequest > failure)
     }
 
     @Test
@@ -943,10 +1009,114 @@ class ServiceRecoveryPolicyTest {
     }
 
     @Test
+    fun `mobile close wait is bounded while the coalesced native close continues`() {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val closeCalls = AtomicInteger()
+        val coordinator = MobileCloseCoordinator("test-mobile-close-timeout") {
+            closeCalls.incrementAndGet()
+            entered.countDown()
+            release.await()
+        }
+
+        assertTrue(coordinator.start())
+        assertTrue(entered.await(1, TimeUnit.SECONDS))
+
+        val timedOut = coordinator.closeBlocking(10L)
+        assertFalse("caller must regain control at the bounded deadline", timedOut.finished)
+        assertEquals(1, closeCalls.get())
+        assertFalse("a waiter must join the existing close rather than start another", coordinator.start())
+
+        release.countDown()
+        val completed = coordinator.waitForClose(1_000L)
+        assertTrue(completed.finished)
+        assertEquals(1, closeCalls.get())
+    }
+
+    @Test
+    fun `completed mobile close error remains visible until one later successful retry clears it`() {
+        val closeCalls = AtomicInteger()
+        val expectedFailure = IllegalStateException("first native close failed")
+        val coordinator = MobileCloseCoordinator("test-mobile-close-retained-error") {
+            if (closeCalls.incrementAndGet() == 1) throw expectedFailure
+        }
+
+        val failed = coordinator.closeBlocking(1_000L)
+        assertTrue("first close must finish", failed.finished)
+        assertEquals(expectedFailure, failed.error)
+        assertEquals(1, closeCalls.get())
+
+        val lateWaiter = coordinator.waitForClose(1_000L)
+        assertTrue("late waiter must observe completed operation", lateWaiter.finished)
+        assertEquals("completed close error must not disappear with active-operation cleanup", expectedFailure, lateWaiter.error)
+        assertEquals(1, closeCalls.get())
+
+        val retried = coordinator.closeBlocking(1_000L)
+        assertTrue("the next closeBlocking call must admit one new retry", retried.finished)
+        assertEquals(null, retried.error)
+        assertEquals(2, closeCalls.get())
+
+        val afterSuccess = coordinator.waitForClose(1_000L)
+        assertTrue(afterSuccess.finished)
+        assertEquals("successful retry must clear retained completed error", null, afterSuccess.error)
+        assertEquals(2, closeCalls.get())
+    }
+
+    @Test
     fun `core lifecycle work only continues for its current active session`() {
         assertTrue(shouldContinueCoreLifecycleOperation(8L, 8L, true))
         assertFalse(shouldContinueCoreLifecycleOperation(7L, 8L, true))
         assertFalse(shouldContinueCoreLifecycleOperation(8L, 8L, false))
+    }
+
+    @Test
+    fun `failed native startup route retries only for the current active user session`() {
+        assertTrue(
+            shouldRetryFailedNativeStartup(
+                routeVerified = false,
+                userSessionActive = true,
+                startStillCurrent = true,
+            ),
+        )
+        assertFalse(
+            shouldRetryFailedNativeStartup(
+                routeVerified = false,
+                userSessionActive = true,
+                startStillCurrent = false,
+            ),
+        )
+        assertFalse(
+            shouldRetryFailedNativeStartup(
+                routeVerified = false,
+                userSessionActive = false,
+                startStillCurrent = true,
+            ),
+        )
+        assertFalse(
+            shouldRetryFailedNativeStartup(
+                routeVerified = true,
+                userSessionActive = true,
+                startStillCurrent = true,
+            ),
+        )
+
+        val request = sourceSection(
+            sourceFile("BoxService.kt"),
+            "private fun requestCoreRecovery(",
+            "private suspend fun recoverMobileCore",
+        )
+        assertTrue(request.contains("shouldContinueCoreLifecycleOperation("))
+        assertTrue(request.contains("while (currentCoroutineContext().isActive && shouldWatchCore(generation))"))
+        assertTrue(request.contains("core recovery admission remains pending"))
+
+        val nativeProof = sourceSection(
+            sourceFile("BoxService.kt"),
+            "private suspend fun verifyNativeStartupRoute(",
+            "fun onBind(intent: Intent)",
+        )
+        assertTrue(nativeProof.contains("shouldRetryFailedNativeStartup("))
+        assertTrue(nativeProof.contains("requestCoreRecovery("))
+        assertTrue(nativeProof.contains("discarding failed native startup route for stale or inactive generation"))
     }
 
     @Test

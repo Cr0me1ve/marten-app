@@ -7,6 +7,7 @@ import 'package:marten/core/preferences/general_preferences.dart';
 import 'package:marten/core/router/dialog/dialog_notifier.dart';
 import 'package:marten/core/router/go_router/helper/active_breakpoint_notifier.dart';
 import 'package:marten/features/per_app_proxy/model/per_app_proxy_mode.dart';
+import 'package:marten/features/per_app_proxy/overview/per_app_proxy_notifier.dart';
 import 'package:marten/features/settings/notifier/config_option/config_option_notifier.dart';
 import 'package:marten/features/settings/notifier/reset_tunnel/reset_tunnel_notifier.dart';
 import 'package:marten/utils/utils.dart';
@@ -17,7 +18,8 @@ class SettingsPage extends HookConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final t = ref.watch(translationsProvider).requireValue;
-    final perAppProxy = ref.watch(Preferences.perAppProxyMode).enabled;
+    final perAppProxyMode = ref.watch(Preferences.perAppProxyMode);
+    final perAppProxy = perAppProxyMode.enabled;
     // final scrollController = useScrollController();
 
     // useMemoized(
@@ -154,17 +156,22 @@ class SettingsPage extends HookConsumerWidget {
             if (PlatformUtils.isAndroid)
               ListTile(
                 title: Text(t.pages.settings.routing.perAppProxy.title),
+                subtitle: Text(perAppProxyMode.present(t).message),
                 leading: const Icon(Icons.apps_rounded),
                 trailing: Switch(
                   value: perAppProxy,
                   onChanged: (value) async {
                     final newMode = perAppProxy ? PerAppProxyMode.off : PerAppProxyMode.exclude;
+                    if (newMode != PerAppProxyMode.off) {
+                      await ref.read(PerAppProxyProvider(newMode.toAppProxy()).notifier).syncNativeSelection();
+                    }
                     await ref.read(Preferences.perAppProxyMode.notifier).update(newMode);
                     if (!perAppProxy && context.mounted) context.goNamed('perAppProxy');
                   },
                 ),
                 onTap: () async {
                   if (!perAppProxy) {
+                    await ref.read(PerAppProxyProvider(AppProxyMode.exclude).notifier).syncNativeSelection();
                     await ref.read(Preferences.perAppProxyMode.notifier).update(PerAppProxyMode.exclude);
                   }
                   if (context.mounted) context.goNamed('perAppProxy');

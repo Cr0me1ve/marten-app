@@ -230,7 +230,8 @@
       "routing": {
         "title": "Routing",
         "perAppProxy": {
-          "title": "Per-app proxy",
+          "title": "Split tunneling",
+          "currentMode": "Current mode",
           "hideSysApps": "Hide system apps",
           "subscriptionBypass": {
             "entry": "From subscription",
@@ -253,12 +254,12 @@
             "clearAllSelections": "Clear all selections"
           },
           "modes": {
-            "all": "All",
-            "proxy": "Proxy",
-            "bypass": "Bypass",
-            "allMsg": "Proxy all apps",
-            "proxyMsg": "Proxy only selected apps",
-            "bypassMsg": "Do not proxy selected apps"
+            "all": "All apps",
+            "proxy": "Selected apps only",
+            "bypass": "All except selected",
+            "allMsg": "All apps use the VPN.",
+            "proxyMsg": "Selected apps use the VPN. Other apps connect without a VPN.",
+            "bypassMsg": "Selected apps connect without a VPN. Other apps use the VPN."
           },
           "autoSelection": {
             "title": "Auto selection",
@@ -273,7 +274,7 @@
             },
             "dialog": {
               "title": "Auto apps selection",
-              "msg": "The auto selection feature for per-app proxy was disabled due to the region change to \"${region}\""
+              "msg": "Automatic app selection was disabled after changing the region to \"${region}\""
             }
           }
         },
@@ -522,7 +523,7 @@
           "msg": "By sharing selected apps, you help complete the \"auto selection\" list"
         },
         "import": {
-          "msg": "This will replace all your current per-app proxy selections. Are you sure you want to continue?"
+          "msg": "Your current split tunneling app selection will be replaced. Continue?"
         }
       },
       "routeRule": {

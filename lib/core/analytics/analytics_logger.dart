@@ -111,10 +111,11 @@ class CrashlyticsLoggyIntegration extends LoggyPrinter with WidgetsBindingObserv
     if (backend == null) return Future<void>.value();
     final context = contextSnapshot;
     final safeReason = _truncate(SensitiveDataRedactor.redact(reason), 256);
+    final sourceStackTrace = stackTrace ?? StackTrace.current;
     return _enqueue(
       () => backend.recordError(
         sanitizeCrashException(error),
-        sanitizeCrashStackTrace(stackTrace),
+        sanitizeCrashStackTrace(sourceStackTrace),
         reason: safeReason,
         information: context,
         fatal: fatal,
@@ -157,9 +158,11 @@ class CrashlyticsLoggyIntegration extends LoggyPrinter with WidgetsBindingObserv
       await backend.setCustomKey('last_logger', _truncate(SensitiveDataRedactor.redact(record.loggerName), 128));
       await backend.setCustomKey('last_level', record.level.name);
       await backend.setCustomKey('error_context_records', context.length);
+      final sourceStackTrace =
+          record.stackTrace ?? fallbackCrashStackTrace(loggerName: record.loggerName, error: error);
       await backend.recordError(
         sanitizeCrashException(error),
-        sanitizeCrashStackTrace(record.stackTrace),
+        sanitizeCrashStackTrace(sourceStackTrace),
         reason: safeReason,
         information: context,
         fatal: fatal,

@@ -63,6 +63,10 @@ object Settings {
         get() = preferences.getBoolean(SettingsKey.ACTIVE_CONFIG_USES_TURNCOAT, false)
         set(value) = preferences.edit().putBoolean(SettingsKey.ACTIVE_CONFIG_USES_TURNCOAT, value).apply()
 
+    var activeConfigFingerprint: String
+        get() = preferences.getString(SettingsKey.ACTIVE_CONFIG_FINGERPRINT, "")!!
+        set(value) = preferences.edit().putString(SettingsKey.ACTIVE_CONFIG_FINGERPRINT, value).apply()
+
     var serviceMode: String
         get() = preferences.getString(SettingsKey.SERVICE_MODE, ServiceMode.VPN)!!
         set(value) = preferences.edit().putString(SettingsKey.SERVICE_MODE, value).apply()

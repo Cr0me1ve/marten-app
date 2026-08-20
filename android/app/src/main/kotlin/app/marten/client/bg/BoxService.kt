@@ -1,6 +1,5 @@
 package app.marten.client.bg
 
-import android.app.AlarmManager
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -70,6 +69,10 @@ import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.net.NetworkInterface
 
+private class RuntimeConfigIdentityMismatchException : IllegalStateException(
+    "active VPN configuration does not belong to the current runtime generation",
+)
+
 class BoxService(
         private val service: Service,
         private val platformInterface: PlatformInterface
@@ -83,15 +86,13 @@ class BoxService(
         private const val CORE_RECOVERY_BACKOFF_MS = 2_000L
         private const val CORE_NATIVE_START_GRACE_MS = 20_000L
         private const val CORE_NATIVE_STARTING_STALL_MS = 20_000L
-        private const val PROCESS_RECOVERY_RESTART_DELAY_MS = 2_000L
-        private const val PROCESS_RECOVERY_REBIND_DELAY_MS = 3_000L
-        private const val PROCESS_RECOVERY_REQUEST_CODE = 4031
+        private const val LEGACY_PROCESS_RECOVERY_REQUEST_CODE = 4031
         // Closing the retained Android descriptor and the native duplicate is
         // asynchronous under load. Two seconds produced false-positive
         // cleanup failures and killed the foreground app during an otherwise
         // healthy Disconnect/start cancellation. Keep this bounded, but give
-        // Android enough time to remove the TUN before the fail-closed VPN
-        // service replacement fallback is admitted.
+        // Android enough time to remove the TUN before the current generation
+        // is failed closed and its framework VPN is retired.
         private const val TUN_RELEASE_TIMEOUT_MS = 5_000L
         private const val TUN_RELEASE_POLL_MS = 100L
         private const val CORE_RECOVERY_STALL_TIMEOUT_MS = 45_000L
@@ -219,6 +220,16 @@ class BoxService(
 
         fun currentPlatformStatus(): Status =
             activeInstance?.status?.value ?: Status.Stopped
+
+        fun currentRuntimeConfigMatches(fingerprint: String): Boolean {
+            val instance = activeInstance ?: return false
+            if (!ServiceLifecycleOwnership.isCurrent(instance.serviceOwnerToken)) return false
+            return instance.runtimeConfigOwnership.matchesActive(
+                status = instance.status.value ?: Status.Stopped,
+                currentGeneration = instance.currentStartGeneration(),
+                expectedFingerprint = fingerprint,
+            )
+        }
 
         /**
          * Returns the owner that can actually receive the stop request.
@@ -399,7 +410,10 @@ class BoxService(
 
     private val fileDescriptorLock = Any()
     private var fileDescriptor: ParcelFileDescriptor? = null
-    private var tunDescriptorAdmissionClosed = false
+    // Every service instance starts fail closed. Admission is opened only after
+    // pending service cleanup and the exact process-wide Mobile.close operation
+    // have both completed for the accepted start generation.
+    private var tunDescriptorAdmissionClosed = true
     @Volatile
     private var tunGeneration = 0L
     private val serviceOwnerToken = ServiceLifecycleOwnership.acquire()
@@ -412,6 +426,7 @@ class BoxService(
 //    private var boxService: BoxService? = null
     private var commandServer: CommandServer? = null
     private val lifecycleLock = Any()
+    private val runtimeConfigOwnership = RuntimeConfigOwnership()
     private var receiverRegistered = false
     @Volatile
     private var startGeneration = 0L
@@ -445,7 +460,7 @@ class BoxService(
     @Volatile
     private var coreRecoveryAttemptStartedAtElapsed = 0L
     @Volatile
-    private var vpnServiceReplacementRequested = false
+    private var terminalCoreCleanupFailurePublished = false
     @Volatile
     private var routeWatchdogFailures = 0
     @Volatile
@@ -542,6 +557,33 @@ class BoxService(
 
     private fun currentStartGeneration(): Long = synchronized(lifecycleLock) { startGeneration }
 
+    private fun ensureRuntimeConfigOwnership(
+        generation: Long,
+        allowStoredIdentityMigration: Boolean,
+    ): Boolean {
+        if (runtimeConfigOwnership.ownsGeneration(generation)) return true
+        if (!allowStoredIdentityMigration) return false
+
+        val persistedFingerprint = normalizeConfigFingerprint(Settings.activeConfigFingerprint)
+        val fingerprint = persistedFingerprint ?: runCatching {
+            NativeResumeConfigStore.fingerprintStoredConfig(service)
+        }.onFailure {
+            Log.e(TAG, "failed to recover native config identity", it)
+        }.getOrNull()
+        if (fingerprint == null) return false
+        if (persistedFingerprint == null) {
+            Settings.activeConfigFingerprint = fingerprint
+        }
+        return runtimeConfigOwnership.admit(
+            generation = generation,
+            fingerprint = fingerprint,
+            usesTurncoat = Settings.activeConfigUsesTurncoat,
+        )
+    }
+
+    private fun currentRuntimeUsesTurncoat(): Boolean =
+        runtimeConfigOwnership.usesTurncoat(currentStartGeneration()) ?: false
+
     private fun isCurrentLifecycleGeneration(generation: Long): Boolean =
         generation == currentStartGeneration()
 
@@ -577,30 +619,24 @@ class BoxService(
         stopRouteWatchdog()
         stopExternalVpnWatchdog()
         resetUnderlyingNetworkGeneration()
-        val cleanupResult = MobileCoreLifecycle.run {
-            if (!isCurrentLifecycleGeneration(generation)) return@run null
-            NativeResumeConfigStore.cleanupPlaintextLeases(service)
-            DefaultNetworkMonitor.stop(serviceOwnerToken)
-            runCatching {
-                Mobile.stop()
-            }.onFailure {
-                Log.w(TAG, "error stopping mobile core after cancelled start", it)
-            }
-            closeMobileCoreAndAwaitTunQuiescence(
-                "cancelled service start: $reason",
-                serviceStopping = true,
-            )
-        }
-        if (cleanupResult == null) return
+        if (!isCurrentLifecycleGeneration(generation)) return
+        NativeResumeConfigStore.cleanupPlaintextLeases(service)
+        DefaultNetworkMonitor.stop(serviceOwnerToken)
+        val cleanupResult = closeMobileCoreAndAwaitTunQuiescence(
+            "cancelled service start: $reason",
+            serviceStopping = true,
+        )
         coreShutdownCompleted = cleanupResult.completed
+        if (coreShutdownCompleted) {
+            runtimeConfigOwnership.clearThrough(generation)
+        }
         if (requiresCoreCleanupEscalation(
                 cleanupResult.closeCompleted,
                 cleanupResult.tunQuiescent,
             )
         ) {
-            replaceVpnServiceAfterCoreCleanupFailure(
+            finishCoreCleanupFailure(
                 "cancelled service start did not release the native core and TUN",
-                preserveUserSession = false,
             )
             return
         }
@@ -616,7 +652,10 @@ class BoxService(
         }
     }
 
-    private suspend fun startService(generation: Long) {
+    private suspend fun startService(
+        generation: Long,
+        allowStoredIdentityMigration: Boolean = true,
+    ) {
         if (
             !ServiceLifecycleOwnership.isCurrent(serviceOwnerToken) ||
             !shouldContinueCoreLifecycleOperation(
@@ -629,6 +668,10 @@ class BoxService(
             return
         }
         try {
+            if (!ensureRuntimeConfigOwnership(generation, allowStoredIdentityMigration)) {
+                stopAndAlert(Alert.StartService, "active VPN configuration identity is unavailable")
+                return
+            }
             keepStoppedNotificationOnDestroy = false
             routeWatchdogDegraded = false
             invalidateVpnDataPlaneProof("service start")
@@ -656,7 +699,14 @@ class BoxService(
 
             if (!ServiceLifecycleOwnership.awaitPendingCleanup(serviceOwnerToken)) {
                 if (ServiceLifecycleOwnership.isCurrent(serviceOwnerToken)) {
-                    stopAndAlert(Alert.StartService, "previous service cleanup did not finish")
+                    // The previous service already owns its registered cleanup.
+                    // Do not start another full close wait from this rejected
+                    // Connect; publish the same bounded fail-closed result used
+                    // for an in-flight process-wide Mobile.close operation.
+                    finishCoreCleanupFailure(
+                        "previous service cleanup did not finish before service start",
+                        service.getString(R.string.error_connection_still_stopping),
+                    )
                 }
                 return
             }
@@ -665,11 +715,30 @@ class BoxService(
                 return
             }
             if (!MobileCoreCloser.waitForCloseToFinish("service start")) {
-                stopAndAlert(Alert.StartService, "previous core is still stopping")
+                // The exact close is already owned by MobileCoreCloser. Do not
+                // spend a second bounded interval joining it from the rejected
+                // start path; keep admission sealed and publish one clear,
+                // fail-closed result for this Connect attempt.
+                finishCoreCleanupFailure(
+                    "previous core is still stopping before service start",
+                    service.getString(R.string.error_connection_still_stopping),
+                )
                 return
             }
             if (!shouldContinueStart(generation)) {
                 finishCancelledStart(generation, "waiting for previous core close")
+                return
+            }
+            val tunAdmissionOpened = synchronized(fileDescriptorLock) {
+                if (shouldContinueStart(generation)) {
+                    tunDescriptorAdmissionClosed = false
+                    true
+                } else {
+                    false
+                }
+            }
+            if (!tunAdmissionOpened) {
+                finishCancelledStart(generation, "opening TUN admission after previous core close")
                 return
             }
             closedByStopService = false
@@ -754,10 +823,9 @@ class BoxService(
                     Settings.activeConfigPath,
                     "service start",
                     generation,
-                    stopServiceOnRouteFailure = true,
                 )
                 if (!routeVerified) {
-                    Log.w(TAG, "native service startup ended after terminal VPN data-plane failure")
+                    Log.w(TAG, "native service startup retained for selected-route recovery")
                     return
                 }
             }
@@ -806,21 +874,15 @@ class BoxService(
         stopExternalVpnWatchdog()
         status.postValue(Status.Starting)
 
-        val cleanupResult = MobileCoreLifecycle.run {
-            if (!shouldContinueCoreLifecycleOperation(
-                    operationGeneration = generation,
-                    currentGeneration = currentStartGeneration(),
-                    userSessionActive = Settings.startedByUser,
-                )
-            ) {
-                return@run null
-            }
+        val cleanupResult = if (!shouldContinueCoreLifecycleOperation(
+                operationGeneration = generation,
+                currentGeneration = currentStartGeneration(),
+                userSessionActive = Settings.startedByUser,
+            )
+        ) {
+            null
+        } else {
             DefaultNetworkMonitor.clearListener(serviceOwnerToken)
-            runCatching {
-                Mobile.stop()
-            }.onFailure {
-                Log.w(TAG, "error stopping mobile core during service reload", it)
-            }
             closeMobileCoreAndAwaitTunQuiescence("service reload")
         }
         coreShutdownCompleted = cleanupResult?.completed == true
@@ -840,9 +902,8 @@ class BoxService(
                 cleanupResult.tunQuiescent,
             )
         ) {
-            replaceVpnServiceAfterCoreCleanupFailure(
+            finishCoreCleanupFailure(
                 "service reload did not release the native core and TUN",
-                preserveUserSession = true,
             )
             return
         }
@@ -883,7 +944,7 @@ class BoxService(
         // A user-mediated takeover authorizes exactly one TUN creation attempt.
         // No stop, revoke, or later recovery may inherit that authorization.
         explicitUserVpnStartPending = false
-        cancelProcessRecovery()
+        cancelLegacyProcessRecoveryAlarm()
         if (vpnRevoked) {
             vpnOwnershipRevoked = true
             Log.w(TAG, "VPN permission revoked by Android; stopping without session restore")
@@ -895,12 +956,6 @@ class BoxService(
                 callback.onServiceAlert(Alert.VpnRevoked.ordinal, null)
             }
         }
-        if (serviceStopJob?.isActive == true && !vpnRevoked) {
-            Log.i(TAG, "coalescing duplicate service stop")
-            return
-        }
-        val stopGeneration = cancelPendingStarts()
-        closedByStopService = true
         synchronized(fileDescriptorLock) {
             // Seal descriptor admission atomically with the visible stop
             // transition. Otherwise openTun could pass its pre-stop checks,
@@ -911,6 +966,17 @@ class BoxService(
                 status.value = Status.Stopping
             }
         }
+        // Android owns the original ParcelFileDescriptor while native code owns
+        // a duplicate. Release the framework descriptor synchronously at Stop
+        // admission, before any native lifecycle wait. This makes Disconnect
+        // fail closed even when an existing recovery call is wedged in Go.
+        closeTunFileDescriptor()
+        if (serviceStopJob?.isActive == true) {
+            Log.i(TAG, "coalescing duplicate service stop")
+            return
+        }
+        val stopGeneration = cancelPendingStarts()
+        closedByStopService = true
         keepStoppedNotificationOnDestroy = keepNotification && !vpnRevoked
         if (receiverRegistered) {
             runCatching {
@@ -937,29 +1003,24 @@ class BoxService(
             Dispatchers.IO,
             start = CoroutineStart.LAZY,
         ) {
-            val coreClosed = MobileCoreLifecycle.run {
-                if (
-                    !isCurrentLifecycleGeneration(stopGeneration) ||
-                    !ServiceLifecycleOwnership.isCurrent(serviceOwnerToken)
-                ) {
-                    Log.i(TAG, "discarding stale service stop generation=$stopGeneration")
-                    return@run null
-                }
-                DefaultNetworkMonitor.clearListener(serviceOwnerToken)
-                runCatching {
-                    Mobile.stop()
-                }.onFailure {
-                    Log.w(TAG, "error stopping mobile core", it)
-                }
-                NativeResumeConfigStore.cleanupPlaintextLeases(service)
-                DefaultNetworkMonitor.stop(serviceOwnerToken)
-                closeMobileCoreAndAwaitTunQuiescence(
-                    "service stop",
-                    serviceStopping = true,
-                )
+            if (
+                !isCurrentLifecycleGeneration(stopGeneration) ||
+                !ServiceLifecycleOwnership.isCurrent(serviceOwnerToken)
+            ) {
+                Log.i(TAG, "discarding stale service stop generation=$stopGeneration")
+                return@launch
             }
-            if (coreClosed == null) return@launch
+            DefaultNetworkMonitor.clearListener(serviceOwnerToken)
+            NativeResumeConfigStore.cleanupPlaintextLeases(service)
+            DefaultNetworkMonitor.stop(serviceOwnerToken)
+            val coreClosed = closeMobileCoreAndAwaitTunQuiescence(
+                "service stop",
+                serviceStopping = true,
+            )
             coreShutdownCompleted = coreClosed.completed
+            if (coreShutdownCompleted) {
+                runtimeConfigOwnership.clearThrough(stopGeneration)
+            }
             val externalVpnActive = isExternalVpnActive(service, "platform VPN retirement")
             val ownershipRevoked = vpnOwnershipRevoked
             val vpnService = service as? VPNService
@@ -988,9 +1049,8 @@ class BoxService(
                     coreClosed.tunQuiescent,
                 )
             ) {
-                replaceVpnServiceAfterCoreCleanupFailure(
+                finishCoreCleanupFailure(
                     "manual service stop did not release the native core and TUN",
-                    preserveUserSession = false,
                 )
                 return@launch
             }
@@ -1219,7 +1279,7 @@ class BoxService(
     }
 
     private fun unverifiedStartupRecoveryTimeoutMs(): Long {
-        val verificationTimeout = if (Settings.activeConfigUsesTurncoat) {
+        val verificationTimeout = if (currentRuntimeUsesTurncoat()) {
             STARTUP_ROUTE_VERIFY_TURNCOAT_TIMEOUT_MS
         } else {
             STARTUP_ROUTE_VERIFY_TIMEOUT_MS
@@ -1286,11 +1346,14 @@ class BoxService(
     private suspend fun verifyAndMarkCoreRuntimeStarted(reason: String) {
         val generation = currentStartGeneration()
         if (!shouldContinueStart(generation)) return
+        if (nativeRouteRecoveryOwnsGeneration(generation)) {
+            Log.i(TAG, "delegating platform started signal to active native route recovery")
+            return
+        }
         val routeVerified = verifyNativeStartupRoute(
-            usesTurncoat = configUsesTurncoat(Settings.activeConfigPath),
+            usesTurncoat = currentRuntimeUsesTurncoat(),
             reason = reason,
             generation = generation,
-            stopServiceOnFailure = true,
         )
         if (routeVerified) {
             markCoreRuntimeStarted(routeVerified = true, generation = generation)
@@ -1300,21 +1363,34 @@ class BoxService(
     private suspend fun acknowledgeVerifiedRouteFromFlutter(): Boolean {
         val generation = currentStartGeneration()
         if (!shouldContinueStart(generation)) return false
+        if (nativeRouteRecoveryOwnsGeneration(generation)) {
+            Log.i(TAG, "delegating Flutter started acknowledgement to active native route recovery")
+            return false
+        }
         if (Settings.serviceMode == ServiceMode.VPN && !hasReusableVpnDataPlaneProof(generation)) {
             // Flutter may reach this acknowledgement before the lazy
             // TURNcoat/Hysteria carrier has finished its first recovery. Use
             // the same bounded, real VPN-network retry gate as native startup
             // instead of tearing the service down after one slow GET.
             val verified = verifyNativeStartupRoute(
-                usesTurncoat = configUsesTurncoat(Settings.activeConfigPath),
+                usesTurncoat = currentRuntimeUsesTurncoat(),
                 reason = "Flutter started acknowledgement",
                 generation = generation,
-                stopServiceOnFailure = true,
             )
             if (!verified) return false
         }
         return markCoreRuntimeStarted(routeVerified = true, generation = generation)
     }
+
+    private fun nativeRouteRecoveryOwnsGeneration(generation: Long): Boolean =
+        shouldDelegateRouteVerificationToNativeRecovery(
+            nativeRecoveryActive =
+                coreRecoveryInProgress ||
+                    routeWatchdogDegraded ||
+                    networkRecoveryJob?.isActive == true,
+            userSessionActive = Settings.startedByUser,
+            startStillCurrent = shouldContinueStart(generation),
+        )
 
     private fun hasReusableVpnDataPlaneProof(generation: Long): Boolean {
         if (Settings.serviceMode != ServiceMode.VPN) return true
@@ -1443,6 +1519,8 @@ class BoxService(
             }
             return false
         }
+        routeWatchdogFailures = 0
+        routeWatchdogDegraded = false
         if (Settings.serviceMode == ServiceMode.VPN) {
             vpnOwnershipWasEstablished = true
         }
@@ -1491,7 +1569,7 @@ class BoxService(
                             0L
                         }
                         val stallTimeoutMs = coreRecoveryStallTimeoutMs()
-                        if (shouldRestartProcessForStalledCoreRecovery(
+                        if (shouldFailStalledCoreRecovery(
                                 recoveryInProgress = true,
                                 userSessionActive = shouldWatchCore(generation),
                                 coreState = coreState,
@@ -1499,7 +1577,7 @@ class BoxService(
                                 timeoutMs = stallTimeoutMs,
                             )
                         ) {
-                            replaceVpnServiceForStalledCoreRecovery(coreState, elapsedMs)
+                            failStalledCoreRecovery(coreState, elapsedMs)
                             return@launch
                         }
                         continue
@@ -1719,19 +1797,21 @@ class BoxService(
                 forcedTurncoatRetirementAttempted = true
             }
             val resetResult = runCatching {
-                MobileCoreLifecycle.run {
-                    if (forceTurncoatCarrier) {
-                        Mobile.resetNetworkForRouteRecovery()
-                    } else {
-                        Mobile.resetNetwork()
-                    }
+                // Network reset is bound to the current native Box snapshot,
+                // but is deliberately not a lifecycle-exclusive operation.
+                // Stop/Close must remain able to detach that Box and break a
+                // transport reset that has stopped making progress.
+                if (forceTurncoatCarrier) {
+                    Mobile.resetNetworkForRouteRecovery()
+                } else {
+                    Mobile.resetNetwork()
                 }
             }
             if (resetResult.isFailure) {
                 val resetKind = if (forceTurncoatCarrier) "forced TURNcoat carrier reset" else "network reset"
-                Log.w(TAG, "native $resetKind failed ($reason); retrying", resetResult.exceptionOrNull())
-                delay(NETWORK_ROUTE_RECOVERY_RETRY_MS)
-                continue
+                Log.w(TAG, "native $resetKind failed ($reason); rebuilding core and TUN", resetResult.exceptionOrNull())
+                requestCoreRecovery("native $resetKind failed during $reason")
+                return
             }
             val resetKind = if (forceTurncoatCarrier) "forced TURNcoat carrier reset" else "network reset"
             Log.i(TAG, "native $resetKind completed ($reason); awaiting fresh VPN data-plane proof")
@@ -1845,7 +1925,7 @@ class BoxService(
             )
             val nowElapsedRealtimeMs = SystemClock.elapsedRealtime()
             val currentProof = currentVpnDataPlaneProof(currentStartGeneration())
-            val usesTurncoat = configUsesTurncoat(Settings.activeConfigPath)
+            val usesTurncoat = currentRuntimeUsesTurncoat()
             val scheduledVpnDataPlaneProof = Settings.serviceMode == ServiceMode.VPN &&
                 shouldRunVpnDataPlaneProbe(
                     forced = status.value == Status.Starting,
@@ -1996,7 +2076,7 @@ class BoxService(
         val configPath = Settings.activeConfigPath
         if (configPath.isBlank()) return ROUTE_WATCHDOG_INITIAL_DELAY_MS
         return when {
-            configUsesTurncoat(configPath) -> ROUTE_WATCHDOG_TURNCOAT_INITIAL_DELAY_MS
+            currentRuntimeUsesTurncoat() -> ROUTE_WATCHDOG_TURNCOAT_INITIAL_DELAY_MS
             lastSelectedOutboundType.equals("icmp", ignoreCase = true) -> ROUTE_WATCHDOG_ICMP_INITIAL_DELAY_MS
             else -> ROUTE_WATCHDOG_INITIAL_DELAY_MS
         }
@@ -2010,7 +2090,7 @@ class BoxService(
 
     private fun configUsesTurncoat(configPath: String): Boolean {
         if (configPath.isBlank()) return false
-        if (configPath == Settings.activeConfigPath) return Settings.activeConfigUsesTurncoat
+        if (configPath == Settings.activeConfigPath) return currentRuntimeUsesTurncoat()
         return runCatching {
             File(configPath).takeIf { it.exists() }?.readText()?.contains("\"turncoat\"", ignoreCase = true) == true
         }.getOrDefault(false)
@@ -2023,7 +2103,7 @@ class BoxService(
     ): RouteHealth {
         if (requireVpnDataPlane && Settings.serviceMode == ServiceMode.VPN) {
             val timeoutMs = dataPlaneAttemptTimeoutMs ?: vpnDataPlaneAttemptTimeoutMs(
-                turncoatRoute = configUsesTurncoat(Settings.activeConfigPath),
+                turncoatRoute = currentRuntimeUsesTurncoat(),
             )
             return checkVpnDataPlaneRoute(timeoutMs)
         }
@@ -2139,7 +2219,7 @@ class BoxService(
         if (now - lastRouteRecoveryAttemptAt < ROUTE_RECOVERY_BACKOFF_MS) return
         lastRouteRecoveryAttemptAt = now
         if (
-            configUsesTurncoat(Settings.activeConfigPath) ||
+            currentRuntimeUsesTurncoat() ||
             lastSelectedOutboundType.equals("icmp", ignoreCase = true)
         ) {
             launchNetworkRouteRecovery(
@@ -2147,7 +2227,7 @@ class BoxService(
                 reason = "route watchdog recovery: $reason",
                 settleDelayMs = 0L,
                 replaceActive = false,
-                forceTurncoatCarrierRetirement = configUsesTurncoat(Settings.activeConfigPath),
+                forceTurncoatCarrierRetirement = currentRuntimeUsesTurncoat(),
             )
         } else {
             requestCoreRecovery("route watchdog recovery: $reason")
@@ -2338,6 +2418,14 @@ class BoxService(
         reason: String,
         serviceStopping: Boolean = false,
     ): CoreCleanupResult {
+        synchronized(fileDescriptorLock) {
+            tunDescriptorAdmissionClosed = true
+        }
+        // Descriptor/framework quiescence gets one deadline starting at the
+        // fail-closed release itself. A stuck native close must not add another
+        // fresh five-second wait after its own bounded join expires.
+        val releaseDeadlineElapsedRealtimeMs =
+            SystemClock.elapsedRealtime() + TUN_RELEASE_TIMEOUT_MS
         closeTunFileDescriptor()
         val closeCompleted = MobileCoreCloser.closeBlocking(reason)
         if (!closeCompleted) {
@@ -2345,8 +2433,6 @@ class BoxService(
         }
         // Framework retirement and TUN quiescence are one release barrier;
         // neither phase receives a fresh grace period after the other.
-        val releaseDeadlineElapsedRealtimeMs =
-            SystemClock.elapsedRealtime() + TUN_RELEASE_TIMEOUT_MS
         val platformVpnRetired = if (
             closeCompleted &&
             !serviceStopping &&
@@ -2376,7 +2462,7 @@ class BoxService(
                 return@withContext false
             }
             status.value = Status.Starting
-            notification.show(activeProfileName, R.string.status_starting)
+            notification.show(activeProfileName, R.string.status_recovering)
             true
         }
         if (changed) {
@@ -2440,102 +2526,102 @@ class BoxService(
     }
 
     private fun coreRecoveryStallTimeoutMs(): Long =
-        if (configUsesTurncoat(Settings.activeConfigPath)) {
+        if (currentRuntimeUsesTurncoat()) {
             CORE_RECOVERY_TURNCOAT_STALL_TIMEOUT_MS
         } else {
             CORE_RECOVERY_STALL_TIMEOUT_MS
         }
 
-    private suspend fun replaceVpnServiceForStalledCoreRecovery(coreState: CoreStates?, elapsedMs: Long) {
-        if (vpnServiceReplacementRequested || !shouldWatchCore()) return
-        replaceVpnServiceAfterCoreCleanupFailure(
+    private suspend fun failStalledCoreRecovery(coreState: CoreStates?, elapsedMs: Long) {
+        if (terminalCoreCleanupFailurePublished || !shouldWatchCore()) return
+        finishCoreCleanupFailure(
             "core recovery stalled for ${elapsedMs}ms in state=${coreState ?: "unavailable"}",
-            preserveUserSession = true,
         )
     }
 
-    private suspend fun replaceVpnServiceAfterCoreCleanupFailure(
+    /**
+     * Cleanup escalation is terminal for the current generation. Starting a
+     * second service cannot replace a VpnService that Android still binds to an
+     * active TUN, so keep the exact owner, retire the framework VPN once, and
+     * publish one consistent stopped/error state. The coalesced native close
+     * thread may finish later; a future explicit Connect must first observe it.
+     */
+    private suspend fun finishCoreCleanupFailure(
         reason: String,
-        preserveUserSession: Boolean,
-    ) {
-        if (vpnServiceReplacementRequested) return
-        vpnServiceReplacementRequested = true
-        val restoreSession =
-            preserveUserSession &&
-                Settings.startedByUser &&
-                NativeResumeConfigStore.hasStoredConfig(service)
-        Settings.startedByUser = restoreSession
-        Settings.startCoreAfterStartingService = restoreSession
-        val recoveryScheduled = restoreSession && scheduleProcessRecovery()
-        Log.e(
-            TAG,
-            "native core cleanup incomplete; replacing VPN service without terminating app process: $reason; " +
-                "${readTunRuntimeHealth().summary}; recovery_scheduled=$recoveryScheduled",
-        )
-        withContext(Dispatchers.Main) {
-            if (restoreSession) {
-                status.value = Status.Starting
-                notification.show(activeProfileName, R.string.status_recovering)
-                if (recoveryScheduled) {
-                    releaseActivityServiceBindingForRecovery()
+        userMessage: String = service.getString(R.string.error_connection_recovery_failed),
+    ) =
+        runNonCancellableServiceCleanup {
+            val admitted = synchronized(lifecycleLock) {
+                if (terminalCoreCleanupFailurePublished) {
+                    false
+                } else {
+                    terminalCoreCleanupFailurePublished = true
+                    true
                 }
-            } else {
+            }
+            if (!admitted) return@runNonCancellableServiceCleanup
+            val failedGeneration = cancelPendingStarts()
+            explicitUserVpnStartPending = false
+            closedByStopService = true
+            keepStoppedNotificationOnDestroy = true
+            Settings.startedByUser = false
+            Settings.startCoreAfterStartingService = false
+            cancelLegacyProcessRecoveryAlarm()
+            stopCoreRuntimeMonitor()
+            stopCoreWatchdog()
+            stopRouteWatchdog()
+            stopExternalVpnWatchdog()
+            resetUnderlyingNetworkGeneration()
+            synchronized(fileDescriptorLock) {
+                tunDescriptorAdmissionClosed = true
+            }
+            closeTunFileDescriptor()
+            DefaultNetworkMonitor.clearListener(serviceOwnerToken)
+            DefaultNetworkMonitor.stop(serviceOwnerToken)
+            NativeResumeConfigStore.cleanupPlaintextLeases(service)
+            MobileCoreCloser.closeAsync("terminal core cleanup failure")
+
+            withContext(Dispatchers.Main) {
+                if (!ServiceLifecycleOwnership.isCurrent(serviceOwnerToken)) return@withContext
                 status.value = Status.Stopping
                 notification.stopDynamicUpdates()
-                notification.close()
+                notification.show(activeProfileName, R.string.status_stopping)
+            }
+
+            val platformReleased = if (service is VPNService) {
+                service.retirePlatformVpnSessionAfterFailedCoreCleanup {
+                    ServiceLifecycleOwnership.isCurrent(serviceOwnerToken) &&
+                        !vpnOwnershipRevoked &&
+                        !isExternalVpnActive("terminal core cleanup failure")
+                }
+            } else {
+                true
+            }
+            Log.e(
+                TAG,
+                "native core cleanup reached terminal failure: $reason; " +
+                    "platform_released=$platformReleased; ${readTunRuntimeHealth().summary}",
+            )
+            runtimeConfigOwnership.clearThrough(failedGeneration)
+
+            withContext(Dispatchers.Main) {
+                if (!ServiceLifecycleOwnership.isCurrent(serviceOwnerToken)) return@withContext
+                status.value = Status.Stopped
+                notification.showStopped(activeProfileName)
+                binder.broadcast { callback ->
+                    callback.onServiceAlert(Alert.StartService.ordinal, userMessage)
+                }
+                service.stopSelf()
             }
         }
-        if (!restoreSession || recoveryScheduled) {
-            service.stopSelf()
-        } else {
-            Log.w(TAG, "VPN service recovery alarm unavailable; preserving sticky service ownership")
-        }
-    }
 
-    private fun releaseActivityServiceBindingForRecovery() {
-        val activity = runCatching { MainActivity.instance }.getOrNull() ?: return
-        if (activity.isFinishing || activity.isDestroyed) return
-        Log.w(TAG, "temporarily releasing Activity binding for VPN service replacement")
-        activity.disconnectServiceBinding()
-        mainHandler.postDelayed({
-            val currentActivity = runCatching { MainActivity.instance }.getOrNull()
-            if (
-                currentActivity === activity &&
-                !activity.isFinishing &&
-                !activity.isDestroyed
-            ) {
-                activity.reconnect()
-            }
-        }, PROCESS_RECOVERY_REBIND_DELAY_MS)
-    }
-
-    private fun scheduleProcessRecovery(): Boolean = runCatching {
-        val pendingIntent = processRecoveryPendingIntent(
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        ) ?: error("failed to create VPN recovery intent")
-        val alarmManager = service.getSystemService(AlarmManager::class.java)
-            ?: error("AlarmManager unavailable")
-        alarmManager.setAndAllowWhileIdle(
-            AlarmManager.ELAPSED_REALTIME_WAKEUP,
-            SystemClock.elapsedRealtime() + PROCESS_RECOVERY_RESTART_DELAY_MS,
-            pendingIntent,
-        )
-        Log.w(
-            TAG,
-            "scheduled user-started VPN recovery in ${PROCESS_RECOVERY_RESTART_DELAY_MS}ms",
-        )
-        true
-    }.onFailure {
-        Log.e(TAG, "failed to schedule user-started VPN process recovery", it)
-    }.getOrDefault(false)
-
-    private fun cancelProcessRecovery() {
+    private fun cancelLegacyProcessRecoveryAlarm() {
         val pendingIntent = processRecoveryPendingIntent(
             PendingIntent.FLAG_NO_CREATE or PendingIntent.FLAG_IMMUTABLE,
         ) ?: return
-        service.getSystemService(AlarmManager::class.java)?.cancel(pendingIntent)
+        service.getSystemService(android.app.AlarmManager::class.java)?.cancel(pendingIntent)
         pendingIntent.cancel()
-        Log.i(TAG, "cancelled pending VPN service recovery")
+        Log.i(TAG, "cancelled legacy VPN service recovery alarm")
     }
 
     private fun processRecoveryPendingIntent(flags: Int): PendingIntent? {
@@ -2545,14 +2631,14 @@ class BoxService(
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             PendingIntent.getForegroundService(
                 service,
-                PROCESS_RECOVERY_REQUEST_CODE,
+                LEGACY_PROCESS_RECOVERY_REQUEST_CODE,
                 recoveryIntent,
                 flags,
             )
         } else {
             PendingIntent.getService(
                 service,
-                PROCESS_RECOVERY_REQUEST_CODE,
+                LEGACY_PROCESS_RECOVERY_REQUEST_CODE,
                 recoveryIntent,
                 flags,
             )
@@ -2700,22 +2786,21 @@ class BoxService(
                 withContext(Dispatchers.Main) {
                     if (!shouldWatchCore(generation)) return@withContext
                     status.value = Status.Starting
-                    notification.show(activeProfileName, R.string.status_starting)
+                    notification.show(activeProfileName, R.string.status_recovering)
                 }
 
                 var preparationCleanupFailed = false
                 val prepared = try {
-                    MobileCoreLifecycle.run {
-                        if (!shouldWatchCore(generation)) return@run false
+                    if (!shouldWatchCore(generation)) {
+                        false
+                    } else {
                         DefaultNetworkMonitor.clearListener(serviceOwnerToken)
-                        runCatching {
-                            Mobile.stop()
-                        }.onFailure {
-                            Log.w(TAG, "error stopping mobile core before recovery attempt $attempt", it)
-                        }
-                        val cleanupResult =
-                            closeMobileCoreAndAwaitTunQuiescence("core watchdog recovery attempt $attempt")
-                        if (requiresCoreCleanupEscalation(
+                        val cleanupResult = closeMobileCoreAndAwaitTunQuiescence(
+                            "core watchdog recovery attempt $attempt",
+                        )
+                        if (!shouldWatchCore(generation)) {
+                            false
+                        } else if (requiresCoreCleanupEscalation(
                                 cleanupResult.closeCompleted,
                                 cleanupResult.tunQuiescent,
                             )
@@ -2725,23 +2810,40 @@ class BoxService(
                                 "previous mobile core or TUN did not quiesce before recovery attempt $attempt",
                             )
                             preparationCleanupFailed = true
-                            return@run false
+                            false
+                        } else if (shouldYieldToExternalVpn("core watchdog recovery before mobile setup")) {
+                            false
+                        } else {
+                            val tunAdmissionOpened = synchronized(fileDescriptorLock) {
+                                if (shouldWatchCore(generation)) {
+                                    tunDescriptorAdmissionClosed = false
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            if (!tunAdmissionOpened) {
+                                false
+                            } else {
+                                MobileCoreLifecycle.run {
+                                    if (!shouldWatchCore(generation)) return@run false
+                                    if (shouldYieldToExternalVpn("core watchdog recovery before mobile setup")) {
+                                        return@run false
+                                    }
+                                    Mobile.setup(
+                                        Settings.baseDir,
+                                        Settings.workingDir,
+                                        Settings.tempDir,
+                                        4L,
+                                        "127.0.0.1:${Settings.grpcServiceModePort}",
+                                        "",
+                                        Settings.debugMode,
+                                        platformInterface,
+                                    )
+                                    true
+                                }
+                            }
                         }
-                        if (!shouldWatchCore(generation)) return@run false
-                        if (shouldYieldToExternalVpn("core watchdog recovery before mobile setup")) {
-                            return@run false
-                        }
-                        Mobile.setup(
-                            Settings.baseDir,
-                            Settings.workingDir,
-                            Settings.tempDir,
-                            4L,
-                            "127.0.0.1:${Settings.grpcServiceModePort}",
-                            "",
-                            Settings.debugMode,
-                            platformInterface,
-                        )
-                        true
                     }
                 } catch (e: CancellationException) {
                     throw e
@@ -2752,9 +2854,8 @@ class BoxService(
 
                 if (!prepared) {
                     if (preparationCleanupFailed) {
-                        replaceVpnServiceAfterCoreCleanupFailure(
+                        finishCoreCleanupFailure(
                             "recovery attempt $attempt could not release the previous native core and TUN",
-                            preserveUserSession = true,
                         )
                         return
                     }
@@ -2774,7 +2875,6 @@ class BoxService(
                             configPath,
                             "core watchdog recovery attempt $attempt",
                             generation = generation,
-                            stopServiceOnRouteFailure = false,
                         )
                     } catch (e: CancellationException) {
                         throw e
@@ -2801,9 +2901,8 @@ class BoxService(
                 when (closeFailedRecoveryRuntime("failed core recovery attempt $attempt", generation)) {
                     null -> return
                     false -> {
-                        replaceVpnServiceAfterCoreCleanupFailure(
+                        finishCoreCleanupFailure(
                             "failed recovery attempt $attempt did not release the native core and TUN",
-                            preserveUserSession = true,
                         )
                         return
                     }
@@ -2826,17 +2925,10 @@ class BoxService(
 
     private suspend fun closeFailedRecoveryRuntime(reason: String, generation: Long): Boolean? =
         runNonCancellableServiceCleanup {
-            MobileCoreLifecycle.run {
-                if (!shouldWatchCore(generation)) return@run null
-                DefaultNetworkMonitor.clearListener(serviceOwnerToken)
-                runCatching {
-                    Mobile.stop()
-                }.onFailure {
-                    Log.w(TAG, "error stopping mobile core after $reason", it)
-                }
-                val cleanupResult = closeMobileCoreAndAwaitTunQuiescence(reason)
-                cleanupResult.completed
-            }
+            if (!shouldWatchCore(generation)) return@runNonCancellableServiceCleanup null
+            DefaultNetworkMonitor.clearListener(serviceOwnerToken)
+            val cleanupResult = closeMobileCoreAndAwaitTunQuiescence(reason)
+            if (!shouldWatchCore(generation)) null else cleanupResult.completed
         }
 
     private suspend fun stopAndAlert(type: Alert, message: String? = null) {
@@ -2857,36 +2949,30 @@ class BoxService(
             stopRouteWatchdog()
             stopExternalVpnWatchdog()
             resetUnderlyingNetworkGeneration()
-            val coreClosed = MobileCoreLifecycle.run {
-                if (
-                    !isCurrentLifecycleGeneration(stopGeneration) ||
-                    !ServiceLifecycleOwnership.isCurrent(serviceOwnerToken)
-                ) {
-                    return@run null
-                }
-                DefaultNetworkMonitor.clearListener(serviceOwnerToken)
-                runCatching {
-                    Mobile.stop()
-                }.onFailure {
-                    Log.w(TAG, "error stopping mobile core after service alert", it)
-                }
-                NativeResumeConfigStore.cleanupPlaintextLeases(service)
-                DefaultNetworkMonitor.stop(serviceOwnerToken)
-                closeMobileCoreAndAwaitTunQuiescence(
-                    "service alert",
-                    serviceStopping = true,
-                )
+            if (
+                !isCurrentLifecycleGeneration(stopGeneration) ||
+                !ServiceLifecycleOwnership.isCurrent(serviceOwnerToken)
+            ) {
+                return@runNonCancellableServiceCleanup
             }
-            if (coreClosed == null) return@runNonCancellableServiceCleanup
+            DefaultNetworkMonitor.clearListener(serviceOwnerToken)
+            NativeResumeConfigStore.cleanupPlaintextLeases(service)
+            DefaultNetworkMonitor.stop(serviceOwnerToken)
+            val coreClosed = closeMobileCoreAndAwaitTunQuiescence(
+                "service alert",
+                serviceStopping = true,
+            )
             coreShutdownCompleted = coreClosed.completed
+            if (coreShutdownCompleted) {
+                runtimeConfigOwnership.clearThrough(stopGeneration)
+            }
             if (requiresCoreCleanupEscalation(
                     coreClosed.closeCompleted,
                     coreClosed.tunQuiescent,
                 )
             ) {
-                replaceVpnServiceAfterCoreCleanupFailure(
+                finishCoreCleanupFailure(
                     "service alert did not release the native core and TUN",
-                    preserveUserSession = false,
                 )
                 return@runNonCancellableServiceCleanup
             }
@@ -2921,11 +3007,10 @@ class BoxService(
         val connectFromNotification = intent?.action == Action.SERVICE_CONNECT
         val processRecoveryRequested = intent?.action == Action.SERVICE_RECOVER
         if (processRecoveryRequested) {
-            // AlarmManager delivers recovery through startForegroundService on
-            // Android O+. A stale alarm may race a manual Disconnect, but every
-            // delivery must still acknowledge the foreground-service contract
-            // before an early stopSelf()/return.
-            notification.show(activeProfileName, R.string.status_recovering)
+            // Builds before 0.7.11 could leave one AlarmManager PendingIntent.
+            // Consume it once, but never use alarms to replace an active,
+            // system-bound VpnService again.
+            cancelLegacyProcessRecoveryAlarm()
         }
         val restartedBySystem = intent == null ||
             (flags and Service.START_FLAG_REDELIVERY) != 0 ||
@@ -2973,21 +3058,6 @@ class BoxService(
         }
 
         if (status.value != Status.Stopped) {
-            if (
-                processRecoveryRequested &&
-                vpnServiceReplacementRequested &&
-                shouldRestoreUserSession
-            ) {
-                Log.w(
-                    TAG,
-                    "scheduled VPN recovery found the old service still active; " +
-                        "retrying after releasing Activity binding",
-                )
-                releaseActivityServiceBindingForRecovery()
-                scheduleProcessRecovery()
-                service.stopSelf()
-                return Service.START_STICKY
-            }
             if ((restartedBySystem || processRecoveryRequested) && !connectFromNotification) {
                 Log.i(TAG, "ignoring system service restart while service is already active")
                 return Service.START_STICKY
@@ -2997,6 +3067,22 @@ class BoxService(
                 Log.i(TAG, "ignoring notification connect while core is already started")
                 return Service.START_STICKY
             }
+            if (
+                status.value == Status.Stopping &&
+                (connectFromNotification || Settings.startCoreAfterStartingService || explicitUserStartRequested)
+            ) {
+                Settings.startedByUser = false
+                Settings.startCoreAfterStartingService = false
+                explicitUserVpnStartPending = false
+                Log.w(TAG, "rejecting connect while the previous native teardown is still active")
+                binder.broadcast { callback ->
+                    callback.onServiceAlert(
+                        Alert.StartService.ordinal,
+                        service.getString(R.string.error_connection_still_stopping),
+                    )
+                }
+                return Service.START_NOT_STICKY
+            }
             if ((connectFromNotification || Settings.startCoreAfterStartingService) && status.value != Status.Stopping) {
                 Settings.startCoreAfterStartingService = false
                 serviceScope.launch(Dispatchers.IO) {
@@ -3005,13 +3091,33 @@ class BoxService(
             }
             return Service.START_STICKY
         }
+        val explicitConfigIdentity = intent?.hasExtra(Action.EXTRA_CONFIG_FINGERPRINT) == true
+        val requestedConfigFingerprint = if (explicitConfigIdentity) {
+            intent?.getStringExtra(Action.EXTRA_CONFIG_FINGERPRINT)
+        } else {
+            Settings.activeConfigFingerprint
+        }
+        val requestedConfigUsesTurncoat = if (
+            explicitConfigIdentity && intent?.hasExtra(Action.EXTRA_CONFIG_USES_TURNCOAT) == true
+        ) {
+            intent.getBooleanExtra(Action.EXTRA_CONFIG_USES_TURNCOAT, false)
+        } else {
+            Settings.activeConfigUsesTurncoat
+        }
+        val generation = nextStartGeneration()
+        runtimeConfigOwnership.admit(
+            generation = generation,
+            fingerprint = requestedConfigFingerprint,
+            usesTurncoat = requestedConfigUsesTurncoat,
+        )
         explicitUserVpnStartPending =
             explicitUserStartRequested && Settings.serviceMode == ServiceMode.VPN
+        synchronized(lifecycleLock) {
+            terminalCoreCleanupFailurePublished = false
+        }
         synchronized(fileDescriptorLock) {
-            // A bound VpnService instance can survive stopSelf() after a clean
-            // Disconnect. Re-open descriptor admission only for this newly
-            // accepted start; stopService() seals it again under the same lock.
-            tunDescriptorAdmissionClosed = false
+            // Keep descriptor admission closed until startService has crossed
+            // both the prior service-cleanup and exact native-close barriers.
             status.value = Status.Starting
         }
 
@@ -3047,7 +3153,6 @@ class BoxService(
         }
 
         serviceScope.launch(Dispatchers.IO) {
-            val generation = nextStartGeneration()
             Settings.startedByUser = true
             initialize()
 //            try {
@@ -3056,7 +3161,10 @@ class BoxService(
 //                stopAndAlert(Alert.StartCommandServer, e.message)
 //                return@launch
 //            }
-            startService(generation)
+            startService(
+                generation = generation,
+                allowStoredIdentityMigration = !explicitConfigIdentity,
+            )
         }
         return Service.START_STICKY
     }
@@ -3087,13 +3195,12 @@ class BoxService(
                 configPath,
                 "native core start",
                 generation = generation,
-                stopServiceOnRouteFailure = true,
             )
             if (routeVerified) {
                 markCoreRuntimeStarted(routeVerified = true, generation = generation)
                 return
             }
-            Log.w(TAG, "native entry-point startup ended after terminal VPN data-plane failure")
+            Log.w(TAG, "native entry-point startup retained for selected-route recovery")
         } catch (error: CancellationException) {
             throw error
         } catch (error: Throwable) {
@@ -3105,40 +3212,53 @@ class BoxService(
         configPath: String,
         reason: String,
         generation: Long? = null,
-        stopServiceOnRouteFailure: Boolean = true,
     ): Boolean {
-        val usesTurncoat = if (configPath == Settings.activeConfigPath) {
-            Settings.activeConfigUsesTurncoat
+        val usesTurncoat = if (generation != null) {
+            runtimeConfigOwnership.usesTurncoat(generation) ?: false
         } else {
             configUsesTurncoat(configPath)
         }
-        val started = MobileCoreLifecycle.run {
-            if (generation != null && !shouldContinueStart(generation)) {
-                return@run false
+        val started = try {
+            MobileCoreLifecycle.run {
+                if (generation != null && !shouldContinueStart(generation)) {
+                    return@run false
+                }
+                val lease = if (configPath == Settings.activeConfigPath) {
+                    NativeResumeConfigStore.createPlaintextLease(service, generation ?: currentStartGeneration())
+                } else {
+                    null
+                }
+                val actualPath = lease?.absolutePath ?: configPath
+                try {
+                    if (
+                        generation != null &&
+                        !runtimeConfigOwnership.matches(
+                            generation,
+                            NativeResumeConfigStore.fingerprintPlaintextFile(File(actualPath)),
+                        )
+                    ) {
+                        throw RuntimeConfigIdentityMismatchException()
+                    }
+                    Mobile.start(actualPath, "")
+                } finally {
+                    NativeResumeConfigStore.deleteLease(lease)
+                }
+                true
             }
-            val lease = if (configPath == Settings.activeConfigPath) {
-                NativeResumeConfigStore.createPlaintextLease(service, generation ?: currentStartGeneration())
-            } else {
-                null
-            }
-            val actualPath = lease?.absolutePath ?: configPath
-            try {
-                Mobile.start(actualPath, "")
-            } finally {
-                NativeResumeConfigStore.deleteLease(lease)
-            }
-            true
+        } catch (error: RuntimeConfigIdentityMismatchException) {
+            Log.e(TAG, "refusing native start for a superseded runtime configuration")
+            stopAndAlert(Alert.StartService, error.message)
+            return false
         }
         if (!started) return false
         if (generation != null && !shouldContinueStart(generation)) return false
-        return verifyNativeStartupRoute(usesTurncoat, reason, generation, stopServiceOnRouteFailure)
+        return verifyNativeStartupRoute(usesTurncoat, reason, generation)
     }
 
     private suspend fun verifyNativeStartupRoute(
         usesTurncoat: Boolean,
         reason: String,
         generation: Long? = null,
-        stopServiceOnFailure: Boolean = true,
     ): Boolean {
         val timeoutMs = if (usesTurncoat) {
             STARTUP_ROUTE_VERIFY_TURNCOAT_TIMEOUT_MS
@@ -3219,10 +3339,32 @@ class BoxService(
         }
 
         Log.w(TAG, "native startup route failed ($reason): $lastSummary")
-        if (stopServiceOnFailure) {
-            stopAndAlert(Alert.StartService, "VPN data plane failed startup connectivity check: $lastSummary")
+        val recoveryGeneration = generation ?: currentStartGeneration()
+        val retryFailedStart = shouldRetryFailedNativeStartup(
+            routeVerified = false,
+            userSessionActive = Settings.startedByUser,
+            startStillCurrent = shouldContinueStart(recoveryGeneration),
+        )
+        if (retryFailedStart) {
+            val recoveryAlreadyOwned = nativeRouteRecoveryOwnsGeneration(recoveryGeneration)
+            routeWatchdogDegraded = true
+            withContext(Dispatchers.Main) {
+                if (shouldContinueStart(recoveryGeneration)) {
+                    status.value = Status.Starting
+                    notification.show(activeProfileName, R.string.status_recovering)
+                }
+            }
+            if (recoveryAlreadyOwned) {
+                Log.w(TAG, "native startup route remains owned by active recovery ($reason)")
+            } else {
+                requestCoreRecovery(
+                    "native startup route unavailable during $reason: $lastSummary",
+                    recoveryGeneration,
+                )
+                Log.w(TAG, "native startup route handed to retry recovery ($reason)")
+            }
         } else {
-            Log.w(TAG, "native startup route will be closed and retried ($reason)")
+            Log.i(TAG, "discarding failed native startup route for stale or inactive generation ($reason)")
         }
         return false
     }
@@ -3280,25 +3422,18 @@ class BoxService(
         val cleanupAccepted = ServiceLifecycleOwnership.beginCleanup(serviceOwnerToken) {
             DefaultNetworkMonitor.stop(serviceOwnerToken)
             NativeResumeConfigStore.cleanupPlaintextLeases(service)
-            MobileCoreLifecycle.run {
-                if (!coreShutdownCompleted) {
-                    runCatching {
-                        Mobile.stop()
-                    }.onFailure {
-                        Log.w(TAG, "error stopping mobile core during service destroy", it)
-                    }
-                    val cleanupResult = closeMobileCoreAndAwaitTunQuiescence(
-                        "service destroy",
-                        serviceStopping = true,
+            if (!coreShutdownCompleted) {
+                val cleanupResult = closeMobileCoreAndAwaitTunQuiescence(
+                    "service destroy",
+                    serviceStopping = true,
+                )
+                coreShutdownCompleted = cleanupResult.completed
+                if (requiresCoreCleanupEscalation(
+                        cleanupResult.closeCompleted,
+                        cleanupResult.tunQuiescent,
                     )
-                    coreShutdownCompleted = cleanupResult.completed
-                    if (requiresCoreCleanupEscalation(
-                            cleanupResult.closeCompleted,
-                            cleanupResult.tunQuiescent,
-                        )
-                    ) {
-                        error("mobile core or TUN cleanup did not finish during service destroy")
-                    }
+                ) {
+                    error("mobile core or TUN cleanup did not finish during service destroy")
                 }
             }
         }

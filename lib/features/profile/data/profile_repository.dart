@@ -52,21 +52,21 @@ class ProfileRepositoryImpl with ExceptionHandler, InfraLogger implements Profil
   ProfileRepositoryImpl({
     required ProfileDataSource profileDataSource,
     required ProfilePathResolver profilePathResolver,
-    required MartenCoreService singbox,
-    required ConfigOptionRepository configOptionRepository,
+    required MartenCoreService Function() readSingbox,
+    required ConfigOptionRepository Function() readConfigOptionRepository,
     required ProfileParser profileParser,
     required DeviceIdentity deviceIdentity,
   }) : _profileParser = profileParser,
-       _configOptionRepo = configOptionRepository,
-       _singbox = singbox,
+       _readConfigOptionRepository = readConfigOptionRepository,
+       _readSingbox = readSingbox,
        _profilePathResolver = profilePathResolver,
        _profileDataSource = profileDataSource,
        _deviceIdentity = deviceIdentity;
 
   final ProfileDataSource _profileDataSource;
   final ProfilePathResolver _profilePathResolver;
-  final MartenCoreService _singbox;
-  final ConfigOptionRepository _configOptionRepo;
+  final MartenCoreService Function() _readSingbox;
+  final ConfigOptionRepository Function() _readConfigOptionRepository;
   final ProfileParser _profileParser;
   final DeviceIdentity _deviceIdentity;
 
@@ -281,38 +281,44 @@ class ProfileRepositoryImpl with ExceptionHandler, InfraLogger implements Profil
       });
 
   @override
-  TaskEither<ProfileFailure, Unit> validateConfig(String path, String tempPath, String? profileOverride, bool debug) =>
-      TaskEither.fromEither(_configOptionRepo.fullOptionsOverrided(profileOverride))
-          .mapLeft((configOptionFailure) => ProfileFailure.invalidConfig(null, configOptionFailure))
-          .flatMap(
-            (overridedOptions) => TaskEither.tryCatch(() async {
-              final rawContent = ProfileParser.normalizeMartenSubscriptionContent(await File(tempPath).readAsString());
-              final sanitizedTemp = File('$tempPath.core');
-              await sanitizedTemp.writeAsString(ProfileParser.stripMartenSubscriptionMetadata(rawContent), flush: true);
-              try {
-                final changeResult = await _singbox.changeOptions(overridedOptions).run();
-                final changeError = changeResult.match<String?>((err) => err, (_) => null);
-                if (changeError != null) throw ProfileFailure.invalidConfig(changeError);
+  TaskEither<ProfileFailure, Unit> validateConfig(String path, String tempPath, String? profileOverride, bool debug) {
+    // Core-backed validation is intentionally resolved only for foreground
+    // operations that request it. Background refresh persists an already
+    // fail-closed parsed candidate and must not construct the VPN/core graph.
+    final configOptionRepository = _readConfigOptionRepository();
+    final singbox = _readSingbox();
+    return TaskEither.fromEither(configOptionRepository.fullOptionsOverrided(profileOverride))
+        .mapLeft((configOptionFailure) => ProfileFailure.invalidConfig(null, configOptionFailure))
+        .flatMap(
+          (overridedOptions) => TaskEither.tryCatch(() async {
+            final rawContent = ProfileParser.normalizeMartenSubscriptionContent(await File(tempPath).readAsString());
+            final sanitizedTemp = File('$tempPath.core');
+            await sanitizedTemp.writeAsString(ProfileParser.stripMartenSubscriptionMetadata(rawContent), flush: true);
+            try {
+              final changeResult = await singbox.changeOptions(overridedOptions).run();
+              final changeError = changeResult.match<String?>((err) => err, (_) => null);
+              if (changeError != null) throw ProfileFailure.invalidConfig(changeError);
 
-                final validateResult = await _singbox.validateConfigByPath(path, sanitizedTemp.path, debug).run();
-                final validateError = validateResult.match<String?>((err) => err, (_) => null);
-                if (validateError != null) throw ProfileFailure.invalidConfig(validateError);
-                final parsedContent = await File(path).readAsString();
-                if (!ProfileParser.hasSelectableOutbound(parsedContent)) {
-                  throw const ProfileFailure.invalidConfig('profile has no supported outbounds');
-                }
-
-                final canonicalContent = ProfileParser.restoreMartenSubscriptionMetadata(
-                  parsedContent: parsedContent,
-                  sourceContent: rawContent,
-                );
-                await ProfileCrypto.encryptContentToFile(File(path), canonicalContent, _deviceIdentity.clientSecret);
-                return unit;
-              } finally {
-                if (await sanitizedTemp.exists()) await sanitizedTemp.delete();
+              final validateResult = await singbox.validateConfigByPath(path, sanitizedTemp.path, debug).run();
+              final validateError = validateResult.match<String?>((err) => err, (_) => null);
+              if (validateError != null) throw ProfileFailure.invalidConfig(validateError);
+              final parsedContent = await File(path).readAsString();
+              if (!ProfileParser.hasSelectableOutbound(parsedContent)) {
+                throw const ProfileFailure.invalidConfig('profile has no supported outbounds');
               }
-            }, (err, st) => err is ProfileFailure ? err : ProfileFailure.unexpected(err, st)),
-          );
+
+              final canonicalContent = ProfileParser.restoreMartenSubscriptionMetadata(
+                parsedContent: parsedContent,
+                sourceContent: rawContent,
+              );
+              await ProfileCrypto.encryptContentToFile(File(path), canonicalContent, _deviceIdentity.clientSecret);
+              return unit;
+            } finally {
+              if (await sanitizedTemp.exists()) await sanitizedTemp.delete();
+            }
+          }, (err, st) => err is ProfileFailure ? err : ProfileFailure.unexpected(err, st)),
+        );
+  }
 
   TaskEither<ProfileFailure, Unit> _persistProfileFile({
     required File file,
@@ -335,18 +341,21 @@ class ProfileRepositoryImpl with ExceptionHandler, InfraLogger implements Profil
   }
 
   @override
-  TaskEither<ProfileFailure, String> generateConfig(String id) => TaskEither.tryCatch(() async {
-    final configFile = _profilePathResolver.file(id);
-    final tempFile = _profilePathResolver.tempFile(id);
-    try {
-      if (!await configFile.exists()) throw const ProfileFailure.notFound();
-      await ProfileCrypto.decryptToTemp(configFile, tempFile, _deviceIdentity.clientSecret);
-      final result = await _singbox.generateFullConfigByPath(tempFile.path).run();
-      return result.getOrElse((l) => throw ProfileFailure.unexpected(l));
-    } finally {
-      if (await tempFile.exists()) await tempFile.delete();
-    }
-  }, _profileStorageFailure);
+  TaskEither<ProfileFailure, String> generateConfig(String id) {
+    final singbox = _readSingbox();
+    return TaskEither.tryCatch(() async {
+      final configFile = _profilePathResolver.file(id);
+      final tempFile = _profilePathResolver.tempFile(id);
+      try {
+        if (!await configFile.exists()) throw const ProfileFailure.notFound();
+        await ProfileCrypto.decryptToTemp(configFile, tempFile, _deviceIdentity.clientSecret);
+        final result = await singbox.generateFullConfigByPath(tempFile.path).run();
+        return result.getOrElse((l) => throw ProfileFailure.unexpected(l));
+      } finally {
+        if (await tempFile.exists()) await tempFile.delete();
+      }
+    }, _profileStorageFailure);
+  }
 
   @override
   TaskEither<ProfileFailure, String> getRawConfig(String id) {

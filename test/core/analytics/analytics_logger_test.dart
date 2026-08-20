@@ -253,6 +253,42 @@ void main() {
     expect(backend.reports, isEmpty);
   });
 
+  test('gives unrelated null-stack Loggy errors distinct privacy-safe fallback origins', () async {
+    const secret = 'https://edge.example/sub/private-token?access_token=private-access-token';
+    final backend = FakeCrashReportingBackend();
+    final reporter = CrashlyticsLoggyIntegration(backend: backend);
+
+    await reporter.enable();
+    reporter.onLog(
+      LogRecord(
+        LogLevel.error,
+        'connection failed for $secret',
+        'connection.refresh.$secret',
+        StateError('connection failure for $secret'),
+      ),
+    );
+    reporter.onLog(
+      LogRecord(
+        LogLevel.error,
+        'profile persistence failed for $secret',
+        'profile.persist.$secret',
+        ArgumentError('profile persistence failure for $secret'),
+      ),
+    );
+    await reporter.disable();
+
+    expect(backend.reports, hasLength(2));
+    final stacks = backend.reports.map((report) => report.stackTrace.toString()).toList(growable: false);
+    final topFrames = stacks.map((stack) => stack.split('\n').first).toSet();
+    final delivered = stacks.join('\n');
+
+    expect(topFrames, hasLength(2));
+    expect(delivered, isNot(contains('analytics_filter.dart')));
+    expect(delivered, isNot(contains('sanitizeCrashStackTrace')));
+    expect(delivered, isNot(contains('private-token')));
+    expect(delivered, isNot(contains('private-access-token')));
+  });
+
   test('does not create non-fatal events for network or expected failures', () async {
     final backend = FakeCrashReportingBackend();
     final reporter = CrashlyticsLoggyIntegration(backend: backend);

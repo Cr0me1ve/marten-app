@@ -13,6 +13,7 @@ object NativeResumeConfigPublisher {
     private const val ACTIVE_CONFIG_PATH = "flutter.active_config_path"
     private const val ACTIVE_PROFILE_NAME = "flutter.active_profile_name"
     private const val ACTIVE_CONFIG_USES_TURNCOAT = "flutter.active_config_uses_turncoat"
+    private const val ACTIVE_CONFIG_FINGERPRINT = "flutter.active_config_fingerprint"
 
     @Synchronized
     fun store(context: Context, source: File, profileName: String): NativeResumeConfigStore.StoredConfig {
@@ -22,6 +23,7 @@ object NativeResumeConfigPublisher {
                 .putString(ACTIVE_CONFIG_PATH, stored.encryptedPath)
                 .putString(ACTIVE_PROFILE_NAME, profileName)
                 .putBoolean(ACTIVE_CONFIG_USES_TURNCOAT, stored.usesTurncoat)
+                .putString(ACTIVE_CONFIG_FINGERPRINT, stored.fingerprint)
                 .commit(),
         ) { "failed to publish native resume config metadata" }
         return stored
@@ -35,6 +37,7 @@ object NativeResumeConfigPublisher {
                 .putString(ACTIVE_CONFIG_PATH, "")
                 .putString(ACTIVE_PROFILE_NAME, "")
                 .putBoolean(ACTIVE_CONFIG_USES_TURNCOAT, false)
+                .putString(ACTIVE_CONFIG_FINGERPRINT, "")
                 .commit(),
         ) { "failed to clear native resume config metadata" }
     }

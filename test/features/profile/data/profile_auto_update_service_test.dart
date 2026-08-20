@@ -2,9 +2,108 @@ import 'dart:io';
 
 import 'package:dio/dio.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:fpdart/fpdart.dart';
+import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:marten/features/profile/data/profile_auto_update_service.dart';
+import 'package:marten/features/profile/data/profile_data_providers.dart';
 import 'package:marten/features/profile/data/profile_refresh_diagnostics.dart';
+import 'package:marten/features/profile/data/profile_repository.dart';
+import 'package:marten/features/profile/model/profile_entity.dart';
 import 'package:marten/features/profile/model/profile_failure.dart';
+import 'package:marten/features/profile/model/profile_sort_enum.dart';
+
+final class _ServiceRef implements Ref<Object?> {
+  _ServiceRef(this._container);
+
+  final ProviderContainer _container;
+
+  @override
+  ProviderContainer get container => _container;
+
+  @override
+  bool exists(ProviderBase<Object?> provider) => _container.exists(provider);
+
+  @override
+  void invalidate(ProviderOrFamily provider) => _container.invalidate(provider);
+
+  @override
+  void invalidateSelf() => throw UnsupportedError('not used by this service test');
+
+  @override
+  KeepAliveLink keepAlive() => throw UnsupportedError('not used by this service test');
+
+  @override
+  ProviderSubscription<T> listen<T>(
+    ProviderListenable<T> provider,
+    void Function(T? previous, T next) listener, {
+    void Function(Object error, StackTrace stackTrace)? onError,
+    bool fireImmediately = false,
+  }) => _container.listen(provider, listener, onError: onError, fireImmediately: fireImmediately);
+
+  @override
+  void listenSelf(
+    void Function(Object? previous, Object? next) listener, {
+    void Function(Object, StackTrace)? onError,
+  }) => throw UnsupportedError('not used by this service test');
+
+  @override
+  void notifyListeners() => throw UnsupportedError('not used by this service test');
+
+  @override
+  void onAddListener(void Function() cb) => throw UnsupportedError('not used by this service test');
+
+  @override
+  void onCancel(void Function() cb) => throw UnsupportedError('not used by this service test');
+
+  @override
+  void onDispose(void Function() cb) => throw UnsupportedError('not used by this service test');
+
+  @override
+  void onRemoveListener(void Function() cb) => throw UnsupportedError('not used by this service test');
+
+  @override
+  void onResume(void Function() cb) => throw UnsupportedError('not used by this service test');
+
+  @override
+  T read<T>(ProviderListenable<T> provider) => _container.read(provider);
+
+  @override
+  T refresh<T>(Refreshable<T> provider) => _container.refresh(provider);
+
+  @override
+  T watch<T>(ProviderListenable<T> provider) => _container.read(provider);
+}
+
+final class _RecordingProfileRepository implements ProfileRepository {
+  _RecordingProfileRepository(this.profile);
+
+  final RemoteProfileEntity profile;
+  final List<CancelToken?> updateTokens = [];
+
+  @override
+  TaskEither<ProfileFailure, ProfileEntity?> getById(String id) => TaskEither.right(profile);
+
+  @override
+  TaskEither<ProfileFailure, Unit> upsertRemote(
+    String url, {
+    UserOverride? userOverride,
+    CancelToken? cancelToken,
+    bool markAsActive = true,
+    bool validate = true,
+  }) {
+    updateTokens.add(cancelToken);
+    return TaskEither.right(unit);
+  }
+
+  @override
+  Stream<Either<ProfileFailure, List<ProfileEntity>>> watchAll({
+    ProfilesSort sort = ProfilesSort.lastUpdate,
+    SortMode sortMode = SortMode.ascending,
+  }) => Stream.value(right([profile]));
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
 
 void main() {
   const sensitiveMessage =
@@ -135,35 +234,35 @@ void main() {
       final cases = [
         (
           name: 'socket exception',
-          failure: ProfileFailure.unexpected(const SocketException(sensitiveMessage)),
+          failure: const ProfileFailure.unexpected(SocketException(sensitiveMessage)),
           category: 'network_connection',
           errorType: 'network_exception',
           httpStatusClass: 'none',
         ),
         (
           name: 'HTTP exception',
-          failure: ProfileFailure.unexpected(const HttpException(sensitiveMessage)),
+          failure: const ProfileFailure.unexpected(HttpException(sensitiveMessage)),
           category: 'network_connection',
           errorType: 'network_exception',
           httpStatusClass: 'none',
         ),
         (
           name: 'TLS handshake exception',
-          failure: ProfileFailure.unexpected(const HandshakeException(sensitiveMessage)),
+          failure: const ProfileFailure.unexpected(HandshakeException(sensitiveMessage)),
           category: 'network_tls',
           errorType: 'handshake_exception',
           httpStatusClass: 'none',
         ),
         (
           name: 'file system exception',
-          failure: ProfileFailure.unexpected(const FileSystemException(sensitiveMessage, sensitiveUrl)),
+          failure: const ProfileFailure.unexpected(FileSystemException(sensitiveMessage, sensitiveUrl)),
           category: 'storage',
           errorType: 'file_system_exception',
           httpStatusClass: 'none',
         ),
         (
           name: 'format exception',
-          failure: ProfileFailure.unexpected(const FormatException(sensitiveMessage)),
+          failure: const ProfileFailure.unexpected(FormatException(sensitiveMessage)),
           category: 'validation',
           errorType: 'format_exception',
           httpStatusClass: 'none',
@@ -236,6 +335,46 @@ void main() {
           httpStatusClass: testCase.httpStatusClass,
         );
       }
+    });
+  });
+
+  group('ProfileAutoUpdateService background cancellation', () {
+    RemoteProfileEntity profile() => RemoteProfileEntity(
+      id: 'remote-profile',
+      active: true,
+      name: 'Remote profile',
+      url: 'https://example.test/subscription',
+      lastUpdate: DateTime.utc(2026),
+    );
+
+    Future<({ProfileAutoUpdateService service, _RecordingProfileRepository repository, ProviderContainer container})>
+    newService() async {
+      final repository = _RecordingProfileRepository(profile());
+      final container = ProviderContainer(
+        overrides: [profileRepositoryProvider.overrideWith((_) => Future.value(repository))],
+      );
+      addTearDown(container.dispose);
+      return (service: ProfileAutoUpdateService(_ServiceRef(container)), repository: repository, container: container);
+    }
+
+    test('forwards a live background cancellation token to the profile download', () async {
+      final context = await newService();
+      final cancelToken = CancelToken();
+
+      final results = await context.service.updateProfiles(force: true, cancelToken: cancelToken);
+
+      expect(results.single.outcome, ProfileAutoUpdateOutcome.updated);
+      expect(context.repository.updateTokens, [same(cancelToken)]);
+    });
+
+    test('does not start another profile refresh after the background task is cancelled', () async {
+      final context = await newService();
+      final cancelToken = CancelToken()..cancel('workmanager stopped the task');
+
+      final results = await context.service.updateProfiles(force: true, cancelToken: cancelToken);
+
+      expect(results, isEmpty);
+      expect(context.repository.updateTokens, isEmpty);
     });
   });
 }

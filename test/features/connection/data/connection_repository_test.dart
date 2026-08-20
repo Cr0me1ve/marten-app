@@ -95,6 +95,20 @@ void main() {
   });
 
   group('android route gate', () {
+    test('platform service is authoritative for every Android connection status', () {
+      expect(connectionStatusFromAndroidPlatform(const CoreStatus.starting(), false), const Connecting());
+      expect(connectionStatusFromAndroidPlatform(const CoreStatus.started(), false), const Connecting());
+      expect(connectionStatusFromAndroidPlatform(const CoreStatus.started(), true), const Connected());
+      expect(connectionStatusFromAndroidPlatform(const CoreStatus.stopping(), true), const Disconnecting());
+      expect(
+        connectionStatusFromAndroidPlatform(
+          const CoreStatus.stopped(alert: CoreAlert.startFailed, message: 'route failed'),
+          true,
+        ),
+        isA<Disconnected>(),
+      );
+    });
+
     test('Starting/Stopping/Stopped close the route gate', () {
       for (final status in [const CoreStatus.starting(), const CoreStatus.stopping(), const CoreStatus.stopped()]) {
         expect(androidRouteGateReset(status), isFalse);
@@ -103,6 +117,33 @@ void main() {
 
     test('Started never opens the route gate by itself', () {
       expect(androidRouteGateReset(const CoreStatus.started()), isNull);
+    });
+
+    test('route-gated Starting and Started remain separate raw lifecycle events despite the same visible status', () {
+      final rawLifecycleStatuses = [
+        connectionStatusFromAndroidPlatform(const CoreStatus.starting(), false),
+        connectionStatusFromAndroidPlatform(const CoreStatus.started(), false),
+      ];
+
+      expect(rawLifecycleStatuses, [const Connecting(), const Connecting()]);
+      expect(
+        rawLifecycleStatuses.first,
+        rawLifecycleStatuses.last,
+        reason: 'the notifier must see the final Started-derived Connecting to start route verification',
+      );
+
+      final source = File('lib/features/connection/data/connection_repository.dart').readAsStringSync();
+      final androidBranch = source.indexOf('final platformStatus = singbox');
+      final methodEnd = source.indexOf('\n  @override\n  TaskEither<ConnectionFailure, Unit> connect', androidBranch);
+      expect(androidBranch, isNonNegative);
+      expect(methodEnd, greaterThan(androidBranch));
+      final androidStream = source.substring(androidBranch, methodEnd);
+      expect(androidStream, contains('Rx.combineLatest3<CoreStatus, bool, CoreStatus, ConnectionStatus>('));
+      expect(
+        androidStream,
+        isNot(contains('.distinct()')),
+        reason: 'Android lifecycle events must remain raw until the notifier runs its route-verification hook',
+      );
     });
 
     test('wires the platform status stream into the connection status gate', () {
@@ -117,10 +158,49 @@ void main() {
       expect(watch, contains('watchPlatformServiceStatus()'));
       expect(watch, contains('androidRouteGateReset('));
       expect(watch, contains('_startupRouteReadyController.stream'));
+      expect(
+        RegExp(r'watchStatus\(\)\.handleError|runtimeStatus\.handleError').hasMatch(watch),
+        isTrue,
+        reason: 'Android runtime stream transport errors must not terminate the UI stream during native recovery',
+      );
+      expect(watch, contains('watchPlatformServiceStatus()\n        .handleError'));
     });
   });
 
   group('startup route readiness', () {
+    test('manual lifecycle reservation precedes TURNcoat features and core start', () {
+      final source = File('lib/features/connection/data/connection_repository.dart').readAsStringSync();
+      final configuredStart = source.indexOf('TaskEither<ConnectionFailure, Unit> _withPreparedConfig(');
+      final configuredEnd = source.indexOf(
+        '\n  TaskEither<ConnectionFailure, Unit> _unlessConnectionStale',
+        configuredStart,
+      );
+      final configured = configuredStart < 0 || configuredEnd < 0
+          ? ''
+          : source.substring(configuredStart, configuredEnd);
+      final preparedStart = source.indexOf(
+        'Future<({String? tag, bool usesTurncoat, StartupEndpointProbe? startupEndpoint})> _prepareSelectedOutboundAttempt(',
+      );
+      final preparedEnd = source.indexOf('\n  void _armTurncoatFeatures', preparedStart);
+      final prepared = preparedStart < 0 || preparedEnd < 0 ? '' : source.substring(preparedStart, preparedEnd);
+
+      expect(configured, isNotEmpty);
+      expect(prepared, isNotEmpty);
+      final reserve = configured.indexOf('singbox.beginManualBackgroundLifecycle();');
+      final reset = configured.indexOf('_resetTurncoatFeatures();');
+      final arm = configured.indexOf('_armTurncoatFeatures(');
+      final action = configured.indexOf('final result = await action(');
+      expect(reserve, isNonNegative);
+      expect(reset, greaterThan(reserve));
+      expect(arm, greaterThan(reset));
+      expect(action, greaterThan(arm));
+      expect(
+        prepared,
+        isNot(contains('_armTurncoatFeatures(')),
+        reason: 'config preparation must not arm a new route while the previous lifecycle can still emit events',
+      );
+    });
+
     test('cold attach gates already started Android core until route verification', () {
       expect(initialStartupRouteReady, isTrue);
       expect(initialStartupRouteReadyForPlatform(isAndroid: false), isTrue);
@@ -337,9 +417,91 @@ void main() {
         ),
       );
     });
+
+    test('classifies an exhausted local control-channel handoff without exposing raw gRPC as server failure', () {
+      expect(
+        () => requireCoreOperationSuccess<Unit>(
+          left(localCoreControlChannelFailureMessage),
+          operation: 'select outbound',
+        ),
+        throwsA(isA<BackgroundCoreNotAvailable>().having((failure) => failure.message, 'message', isNull)),
+      );
+    });
   });
 
-  test('syncNativeResumeConfig writes active profile via native resume bridge and clears missing profiles', () {
+  group('connection repository setup', () {
+    test('Android stopped service forces a fresh control-shell setup despite retained client flags', () {
+      expect(
+        shouldRunConnectionRepositorySetup(
+          isAndroid: true,
+          repositoryInitialized: true,
+          coreInitialized: true,
+          platformStatus: const CoreStatus.stopped(),
+        ),
+        isTrue,
+      );
+    });
+
+    test('Android running service retains the initialized fast path', () {
+      for (final platformStatus in [const CoreStatus.starting(), const CoreStatus.started()]) {
+        expect(
+          shouldRunConnectionRepositorySetup(
+            isAndroid: true,
+            repositoryInitialized: true,
+            coreInitialized: true,
+            platformStatus: platformStatus,
+          ),
+          isFalse,
+          reason: '$platformStatus still owns the foreground control shell',
+        );
+      }
+    });
+
+    test('non-Android setup keeps the existing both-uninitialized rule', () {
+      expect(
+        shouldRunConnectionRepositorySetup(
+          isAndroid: false,
+          repositoryInitialized: false,
+          coreInitialized: false,
+          platformStatus: const CoreStatus.stopped(),
+        ),
+        isTrue,
+      );
+      for (final flags in [
+        (repositoryInitialized: true, coreInitialized: false),
+        (repositoryInitialized: false, coreInitialized: true),
+        (repositoryInitialized: true, coreInitialized: true),
+      ]) {
+        expect(
+          shouldRunConnectionRepositorySetup(
+            isAndroid: false,
+            repositoryInitialized: flags.repositoryInitialized,
+            coreInitialized: flags.coreInitialized,
+            platformStatus: const CoreStatus.stopped(),
+          ),
+          isFalse,
+        );
+      }
+    });
+
+    test('setup reads Android platform ownership before applying its initialized fast path', () {
+      final source = File('lib/features/connection/data/connection_repository.dart').readAsStringSync();
+      final setupStart = source.indexOf('TaskEither<ConnectionFailure, Unit> setup() {');
+      final setupEnd = source.indexOf('\n  @override\n  Stream<ConnectionStatus> watchConnectionStatus()', setupStart);
+      expect(setupStart, isNonNegative);
+      expect(setupEnd, greaterThan(setupStart));
+      final setup = source.substring(setupStart, setupEnd);
+      final platformStatus = setup.indexOf('readPlatformServiceStatus()');
+      final setupDecision = setup.indexOf('shouldRunConnectionRepositorySetup(');
+      final earlySkip = setup.indexOf('return right(unit);');
+
+      expect(platformStatus, isNonNegative);
+      expect(setupDecision, greaterThan(platformStatus));
+      expect(earlySkip, greaterThan(setupDecision));
+    });
+  });
+
+  test('syncNativeResumeConfig delegates to the native resume synchronizer with its connection generation guard', () {
     final source = File('lib/features/connection/data/connection_repository.dart').readAsStringSync();
     final syncStart = source.indexOf('@override\n  TaskEither<ConnectionFailure, Unit> syncNativeResumeConfig(');
     final syncEnd = source.indexOf(
@@ -349,35 +511,9 @@ void main() {
     final sync = syncStart < 0 || syncEnd < 0 ? '' : source.substring(syncStart, syncEnd);
 
     expect(sync, isNotEmpty);
-    expect(sync, contains('if (!Platform.isAndroid)'));
-    expect(sync, contains('if (activeProfile == null)'));
-    expect(sync, contains('singbox.clearNativeResumeConfig();'));
-    expect(sync, contains('final encFile = profilePathResolver.file(activeProfile.id);'));
-    expect(sync, contains('_stripNativeStartMetadata(decFile);'));
-    expect(sync, contains('singbox.storeNativeResumeConfig('));
-    expect(sync, contains('if (!await encFile.exists())'));
-    expect(sync, contains('await decFile.delete();'));
-  });
-
-  test('syncNativeResumeConfig fail-closed clears a stale native resume config after sync errors', () {
-    final source = File('lib/features/connection/data/connection_repository.dart').readAsStringSync();
-    final syncStart = source.indexOf('@override\n  TaskEither<ConnectionFailure, Unit> syncNativeResumeConfig(');
-    final syncEnd = source.indexOf(
-      '\n  @override\n  TaskEither<ConnectionFailure, Unit> verifyConnectedRoute',
-      syncStart,
-    );
-    final sync = syncStart < 0 || syncEnd < 0 ? '' : source.substring(syncStart, syncEnd);
-    final catchStart = sync.indexOf('} catch (error, stackTrace) {');
-    final clear = sync.indexOf('singbox.clearNativeResumeConfig();');
-    final warning = sync.indexOf('failed to clear stale native resume config after sync failure');
-
-    expect(sync, isNotEmpty);
-    expect(catchStart, isNonNegative);
-    expect(clear, isNonNegative);
-    expect(warning, isNonNegative);
-    final catchBlock = sync.substring(catchStart);
-    expect(catchBlock, contains('if (!_isConnectionStale(generation)) {'));
-    expect(catchBlock, contains('failed to clear stale native resume config after sync failure'));
+    expect(sync, contains('final generation = _connectionGeneration;'));
+    expect(sync, contains('nativeResumeConfigSynchronizer.synchronize('));
+    expect(sync, contains('isCurrent: () => !_isConnectionStale(generation)'));
   });
 
   group('disconnect cleanup', () {

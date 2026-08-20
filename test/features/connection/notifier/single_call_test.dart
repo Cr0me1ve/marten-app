@@ -69,6 +69,28 @@ void main() {
     expect(stopFromManual, contains('_abortConnectionImmediately();'));
   });
 
+  test('Android route verification observes raw lifecycle-equivalent Connecting before UI deduplication', () {
+    final source = File('lib/features/connection/notifier/connection_notifier.dart').readAsStringSync();
+    final build = _extractFunctionBlock(source, 'Stream<ConnectionStatus> build() async* {');
+
+    expect(build, isNotEmpty);
+    final statusStream = build.indexOf('yield* _connectionRepo');
+    final routeVerification = build.indexOf(
+      'if (Platform.isAndroid) _handleStartupRouteVerification(event);',
+      statusStream,
+    );
+    final deduplication = build.indexOf('.distinct()', statusStream);
+
+    expect(statusStream, isNonNegative);
+    expect(routeVerification, greaterThan(statusStream));
+    expect(deduplication, greaterThan(routeVerification));
+    expect(
+      build.substring(statusStream, deduplication),
+      contains('.doOnData((event) {'),
+      reason: 'the startup-route verifier must observe every raw repository event before public UI deduplication',
+    );
+  });
+
   test(
     'normal disconnect and abort publish terminal Disconnected after authoritative stop despite delayed stream status',
     () {

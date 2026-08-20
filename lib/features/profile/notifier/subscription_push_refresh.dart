@@ -13,15 +13,14 @@ import 'package:marten/core/app_info/app_info_provider.dart';
 import 'package:marten/core/device/device_identity.dart';
 import 'package:marten/core/directories/directories_provider.dart';
 import 'package:marten/core/http_client/http_client_provider.dart';
-import 'package:marten/core/model/environment.dart';
 import 'package:marten/core/preferences/preferences_provider.dart';
+import 'package:marten/features/profile/data/background_profile_refresh_scope.dart';
 import 'package:marten/features/profile/data/profile_auto_update_service.dart';
 import 'package:marten/features/profile/data/profile_data_providers.dart';
 import 'package:marten/features/profile/data/profile_parser.dart';
 import 'package:marten/features/profile/data/profile_repository.dart';
 import 'package:marten/features/profile/model/profile_entity.dart';
 import 'package:marten/features/profile/notifier/background_profiles_update.dart';
-import 'package:marten/riverpod_observer.dart';
 import 'package:marten/utils/custom_loggers.dart';
 import 'package:marten/utils/platform_utils.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -188,10 +187,8 @@ Future<void> subscriptionRefreshPushBackgroundHandler(RemoteMessage message) asy
 }
 
 Future<void> _runBackgroundSubscriptionPushRefresh(Map<String, dynamic> data) async {
-  final container = ProviderContainer(
-    overrides: [environmentProvider.overrideWithValue(Environment.prod)],
-    observers: [RiverpodObserver()],
-  );
+  final scope = BackgroundProfileRefreshScope();
+  final container = scope.container;
   try {
     await container.read(appDirectoriesProvider.future);
     await container.read(appInfoProvider.future);
@@ -203,7 +200,7 @@ Future<void> _runBackgroundSubscriptionPushRefresh(Map<String, dynamic> data) as
       throw StateError('background native resume sync failed');
     }
   } finally {
-    container.dispose();
+    await scope.close();
   }
 }
 

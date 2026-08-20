@@ -55,8 +55,19 @@ class DioHttpClient with InfraLogger {
   }
 
   int port = 0;
+  bool _closed = false;
 
   String userAgent;
+
+  void close({bool force = true}) {
+    if (_closed) return;
+    _closed = true;
+    for (final dio in _dio.values) {
+      dio.close(force: force);
+    }
+    _dio.clear();
+  }
+
   // bool isPortOpen(String host, int port, {Duration timeout = const Duration(milliseconds: 200)}) async{
   //   try {
   //     Socket.connect(host, port, timeout: timeout).then((socket) {

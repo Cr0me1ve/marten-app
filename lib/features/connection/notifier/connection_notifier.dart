@@ -49,6 +49,12 @@ bool canExecuteManualConnectionCommand(ManualConnectionCommand command, Connecti
   ManualConnectionCommand.disconnect || ManualConnectionCommand.abort => status is Connected || status is Connecting,
 };
 
+bool shouldReportBootstrapSetupFailure({
+  required int requestAbortToken,
+  required int currentAbortToken,
+  required bool manualDisconnectRequested,
+}) => requestAbortToken == currentAbortToken && !manualDisconnectRequested;
+
 @Riverpod(keepAlive: true)
 class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
   static const List<Duration> _autoReconnectDelays = [
@@ -97,10 +103,23 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
   @override
   Stream<ConnectionStatus> build() async* {
     if (PlatformUtils.isMobile) {
-      final platformStopped = Platform.isAndroid && await _connectionRepo.initializeStoppedPlatformStatus();
-      if (!platformStopped) {
+      final platformBootstrapHandled = Platform.isAndroid && await _connectionRepo.initializePassivePlatformStatus();
+      if (!platformBootstrapHandled) {
+        final setupAbortToken = _abortToken;
         await _connectionRepo.setup().mapLeft((l) {
-          loggy.error("error setting up connection repository", l);
+          if (!shouldReportBootstrapSetupFailure(
+            requestAbortToken: setupAbortToken,
+            currentAbortToken: _abortToken,
+            manualDisconnectRequested: _manualDisconnectRequested,
+          )) {
+            loggy.info("ignoring bootstrap setup failure superseded by a manual stop");
+            return;
+          }
+          final stackTrace = switch (l) {
+            UnexpectedConnectionFailure(:final stackTrace?) => stackTrace,
+            _ => StackTrace.current,
+          };
+          loggy.error("error setting up connection repository", l, stackTrace);
         }).run();
       }
     }
@@ -168,11 +187,17 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
       unawaited(_handleTurncoatConnectTimeout());
     });
     yield* _connectionRepo.watchConnectionStatus().map(_visibleConnectionStatus).doOnData((event) {
+      // Android Starting and route-gated Started are both rendered as
+      // Connecting. Observe the raw lifecycle-derived event before UI
+      // deduplication so the latter can start cold-attach verification.
+      // Otherwise a service that has already proved its VPN data plane can
+      // remain Connecting forever after a Flutter engine/process restart.
+      if (Platform.isAndroid) _handleStartupRouteVerification(event);
       if (event case Disconnected(connectionFailure: final _?) when PlatformUtils.isDesktop) {
         ref.read(Preferences.startedByUser.notifier).update(false);
       }
       loggy.info("connection status: ${event.format()}");
-    });
+    }).distinct();
   }
 
   ConnectionRepository get _connectionRepo => ref.read(connectionRepositoryProvider);

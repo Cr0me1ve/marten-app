@@ -11,6 +11,7 @@ import java.io.FileOutputStream
 import java.math.BigInteger
 import java.security.KeyPairGenerator
 import java.security.KeyStore
+import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.Calendar
 import javax.crypto.Cipher
@@ -36,7 +37,11 @@ object NativeResumeConfigStore {
     private const val LEASE_DIR = "marten-recovery-leases"
     private val header = "MARTEN_ANDROID_RECOVERY_V1\n".toByteArray(Charsets.US_ASCII)
 
-    data class StoredConfig(val encryptedPath: String, val usesTurncoat: Boolean)
+    data class StoredConfig(
+        val encryptedPath: String,
+        val usesTurncoat: Boolean,
+        val fingerprint: String,
+    )
 
     @Synchronized
     fun storeFromPlaintextFile(context: Context, source: File): StoredConfig {
@@ -44,6 +49,7 @@ object NativeResumeConfigStore {
         val plaintext = source.readBytes()
         require(plaintext.isNotEmpty()) { "prepared config is empty" }
         val usesTurncoat = containsAsciiIgnoreCase(plaintext, "\"turncoat\"")
+        val fingerprint = sha256Hex(plaintext)
         val encrypted = encrypt(context, plaintext)
         val target = encryptedFile(context)
         target.parentFile?.mkdirs()
@@ -64,7 +70,40 @@ object NativeResumeConfigStore {
         }
         cleanupPlaintextLeases(context)
         deleteLegacyPlaintextCopies(context)
-        return StoredConfig(target.absolutePath, usesTurncoat)
+        return StoredConfig(target.absolutePath, usesTurncoat, fingerprint)
+    }
+
+    /**
+     * Returns the semantic identity used to bind a prepared route to one
+     * Android service generation. The digest is compared locally and is never
+     * written to logs or exposed outside the app process.
+     */
+    fun fingerprintPlaintextFile(source: File): String {
+        require(source.isFile) { "prepared config is missing" }
+        val plaintext = source.readBytes()
+        require(plaintext.isNotEmpty()) { "prepared config is empty" }
+        return try {
+            sha256Hex(plaintext)
+        } finally {
+            plaintext.fill(0)
+        }
+    }
+
+    /**
+     * Compatibility path for an encrypted snapshot created before fingerprints
+     * were persisted in preferences. New publishers always store the digest in
+     * the same metadata commit as the encrypted config path.
+     */
+    @Synchronized
+    fun fingerprintStoredConfig(context: Context): String {
+        val encrypted = encryptedFile(context)
+        require(encrypted.isFile) { "encrypted recovery config is missing" }
+        val plaintext = decrypt(context, encrypted.readBytes())
+        return try {
+            sha256Hex(plaintext)
+        } finally {
+            plaintext.fill(0)
+        }
     }
 
     @Synchronized
@@ -143,6 +182,12 @@ object NativeResumeConfigStore {
             if (matches) return true
         }
         return false
+    }
+
+    private fun sha256Hex(value: ByteArray): String {
+        return MessageDigest.getInstance("SHA-256")
+            .digest(value)
+            .joinToString(separator = "") { "%02x".format(it.toInt() and 0xff) }
     }
 
     private fun encrypt(context: Context, plaintext: ByteArray): ByteArray {

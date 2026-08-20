@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:dartx/dartx_io.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/services.dart';
+import 'package:installed_apps/index.dart';
 import 'package:marten/core/localization/translations.dart';
 import 'package:marten/core/model/region.dart';
 import 'package:marten/core/notification/in_app_notification_controller.dart';
@@ -18,7 +19,6 @@ import 'package:marten/features/per_app_proxy/model/per_app_proxy_mode.dart';
 import 'package:marten/features/per_app_proxy/model/pkg_flag.dart';
 import 'package:marten/features/settings/data/config_option_repository.dart';
 import 'package:marten/utils/utils.dart';
-import 'package:installed_apps/index.dart';
 import 'package:riverpod_annotation/riverpod_annotation.dart';
 
 part 'per_app_proxy_notifier.g.dart';
@@ -31,6 +31,7 @@ class PerAppProxy extends _$PerAppProxy with AppLogger {
   Stream<Map<String, int>> build(AppProxyMode? mode) {
     _mode = mode;
     if (_mode == null) return Stream.value({});
+    unawaited(syncNativeSelection());
     final appsInfo = InstalledApps.getInstalledApps(false);
     return Stream.fromFuture(appsInfo).asyncExpand((appsInfo) {
       final phonePkgs = appsInfo.map((e) => e.packageName).toSet();
@@ -45,6 +46,18 @@ class PerAppProxy extends _$PerAppProxy with AppLogger {
   Future<void> updatePkg(String pkg) async {
     loggy.info('Updationg $pkg status');
     await ref.read(appProxyDataSourceProvider).updatePkg(pkg: pkg, mode: _mode!);
+    await syncNativeSelection();
+  }
+
+  Future<void> syncNativeSelection() async {
+    final mode = _mode;
+    if (mode == null) return;
+    final packages = await ref.read(appProxyDataSourceProvider).getActivePackages(mode: mode);
+    final preference = switch (mode) {
+      AppProxyMode.include => Preferences.includeApps,
+      AppProxyMode.exclude => Preferences.excludeApps,
+    };
+    await ref.read(preference.notifier).update(packages);
   }
 
   Future<bool> applyAutoSelection() async {
@@ -56,6 +69,7 @@ class PerAppProxy extends _$PerAppProxy with AppLogger {
       case AutoSelectionResult.success:
         final autoList = rs.$1!;
         await ref.read(appProxyDataSourceProvider).applyAutoSelection(autoList: autoList, mode: _mode!);
+        await syncNativeSelection();
         await ref.read(Preferences.autoAppsSelectionRegion.notifier).update(region);
         await ref.read(Preferences.autoAppsSelectionLastUpdate.notifier).update(DateTime.now());
         return true;
@@ -80,11 +94,13 @@ class PerAppProxy extends _$PerAppProxy with AppLogger {
   Future<void> revertForceDeselection() async {
     loggy.info('Reverting force deselection');
     await ref.read(appProxyDataSourceProvider).revertForceDeselection(mode: _mode!);
+    await syncNativeSelection();
   }
 
   Future<void> clearAutoSelected() async {
     loggy.info('Clearing auto selected');
     await ref.read(appProxyDataSourceProvider).clearAutoSelected(mode: _mode!);
+    await syncNativeSelection();
     await ref.watch(Preferences.autoAppsSelectionRegion.notifier).update(null);
     await ref.read(Preferences.autoAppsSelectionLastUpdate.notifier).update(null);
   }
@@ -92,6 +108,7 @@ class PerAppProxy extends _$PerAppProxy with AppLogger {
   Future<void> clearAll() async {
     loggy.info('Clearing all items');
     await ref.read(appProxyDataSourceProvider).clearAll(mode: _mode!);
+    await syncNativeSelection();
     await ref.watch(Preferences.autoAppsSelectionRegion.notifier).update(null);
   }
 
@@ -217,6 +234,17 @@ class PerAppProxy extends _$PerAppProxy with AppLogger {
   Future<void> _importJson(String input) async {
     final backup = PerAppProxyBackup.fromJson((jsonDecode(input) as Map).cast());
     await ref.read(appProxyDataSourceProvider).importPkgs(backup: backup);
+    await _syncAllNativeSelections();
+  }
+
+  Future<void> _syncAllNativeSelections() async {
+    final dataSource = ref.read(appProxyDataSourceProvider);
+    final includePackages = await dataSource.getActivePackages(mode: AppProxyMode.include);
+    final excludePackages = await dataSource.getActivePackages(mode: AppProxyMode.exclude);
+    await Future.wait([
+      ref.read(Preferences.includeApps.notifier).update(includePackages),
+      ref.read(Preferences.excludeApps.notifier).update(excludePackages),
+    ]);
   }
 
   Future<String> _exportJson() async {

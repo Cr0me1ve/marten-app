@@ -28,6 +28,12 @@ class EventHandler : FlutterPlugin {
 
         statusChannel!!.setStreamHandler(object : EventChannel.StreamHandler {
             override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                val activity = MainActivity.instance
+                // MutableLiveData belongs to the Activity presentation and
+                // may retain Stopped after its old binding was intentionally
+                // released. Seed and rebind before observing so a retained or
+                // new Flutter listener cannot overwrite service-owned Started.
+                activity.restoreServicePresentation()
                 statusObserver = Observer {
                     Log.d(TAG, "new status: $it")
                     val map = listOf(
@@ -36,7 +42,7 @@ class EventHandler : FlutterPlugin {
                         .toMap()
                     events?.success(map)
                 }
-                MainActivity.instance.serviceStatus.observeForever(statusObserver!!)
+                activity.serviceStatus.observeForever(statusObserver!!)
             }
 
             override fun onCancel(arguments: Any?) {

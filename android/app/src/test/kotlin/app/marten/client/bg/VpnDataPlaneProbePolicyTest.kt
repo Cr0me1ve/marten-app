@@ -74,7 +74,25 @@ class VpnDataPlaneProbePolicyTest {
             "TURNcoat must not defer its first watchdog proof beyond one minute",
             source.contains("private const val ROUTE_WATCHDOG_TURNCOAT_INITIAL_DELAY_MS = 60_000L"),
         )
-        assertTrue("TURNcoat initial delay must select the dedicated one-minute constant", initialDelay.contains("configUsesTurncoat(configPath) -> ROUTE_WATCHDOG_TURNCOAT_INITIAL_DELAY_MS"))
+        assertTrue(
+            "TURNcoat initial delay must select the dedicated one-minute constant from the live generation owner",
+            initialDelay.contains("currentRuntimeUsesTurncoat() -> ROUTE_WATCHDOG_TURNCOAT_INITIAL_DELAY_MS"),
+        )
+        val runtimeHelperStart = source.indexOf("private fun currentRuntimeUsesTurncoat(): Boolean")
+        val runtimeHelperEnd = source.indexOf("\n    private fun", runtimeHelperStart + 1)
+        val runtimeUsesTurncoat = if (runtimeHelperStart < 0 || runtimeHelperEnd < 0) {
+            ""
+        } else {
+            source.substring(runtimeHelperStart, runtimeHelperEnd)
+        }
+        assertTrue(
+            "live route policy must read TURNcoat capability from immutable runtime ownership",
+            runtimeUsesTurncoat.contains("runtimeConfigOwnership.usesTurncoat(currentStartGeneration())"),
+        )
+        assertFalse(
+            "live route policy must not read future resume intent from Settings",
+            runtimeUsesTurncoat.contains("Settings.activeConfig"),
+        )
         assertTrue("the watchdog must use the full VPN data-plane proof policy", watchdog.contains("shouldRunVpnDataPlaneProbe("))
         assertTrue("the full proof policy must know that the selected route is TURNcoat", watchdog.contains("turncoatRoute = usesTurncoat"))
     }
@@ -101,23 +119,19 @@ class VpnDataPlaneProbePolicyTest {
     @Test
     fun `vpn source keeps Marten UID in the VPN and admits started only with current tun proof`() {
         val openTun = functionBody(sourceFile("VPNService.kt"), "openTun")
-        val ownPackageExclusion = "\\s*\\{\\s*it\\s*!=\\s*packageName\\s*\\}"
+        val routingPolicy = sourceFile("VpnAppRoutingPolicy.kt")
         assertTrue(
-            "include-mode bypasses must retain Marten",
-            Regex("optionExcludePackages\\.filter$ownPackageExclusion").containsMatchIn(openTun),
+            "VPNService must resolve routing with its own package name",
+            Regex("resolveVpnAppRoutingPlan\\([\\s\\S]*ownPackageName\\s*=\\s*packageName").containsMatchIn(openTun),
         )
         assertTrue(
-            "per-app exclude mode must retain Marten",
-            Regex("\\(appList\\s*\\+\\s*optionExcludePackages\\).*?$ownPackageExclusion", RegexOption.DOT_MATCHES_ALL)
-                .containsMatchIn(openTun),
+            "include-only policy must retain Marten's package",
+            routingPolicy.contains("it == ownPackageName || it !in bypassPackages"),
         )
         assertTrue(
-            "option exclude mode must retain Marten",
-            Regex("optionExcludePackages\\.distinct\\(\\).*?$ownPackageExclusion", RegexOption.DOT_MATCHES_ALL)
-                .containsMatchIn(openTun),
+            "exclude policy must remove Marten's package",
+            routingPolicy.contains(".filter { it != ownPackageName }"),
         )
-        assertTrue("include-mode must add Marten's package", Regex("\\(appList\\s*\\+\\s*packageName\\)").containsMatchIn(openTun))
-        assertTrue("option allow-list must add Marten's package", Regex("\\(optionIncludePackages\\s*\\+\\s*packageName\\)").containsMatchIn(openTun))
 
         val serviceSource = sourceFile("BoxService.kt")
         val currentProof = functionBody(serviceSource, "currentVpnDataPlaneProof")
@@ -185,7 +199,7 @@ class VpnDataPlaneProbePolicyTest {
         val source = sourceFile("BoxService.kt")
         val acknowledgement = functionBody(source, "acknowledgeVerifiedRouteFromFlutter")
         val retry = acknowledgement.indexOf("verifyNativeStartupRoute(")
-        val turncoatPlan = acknowledgement.indexOf("usesTurncoat = configUsesTurncoat(Settings.activeConfigPath)", retry)
+        val turncoatPlan = acknowledgement.indexOf("usesTurncoat = currentRuntimeUsesTurncoat()", retry)
         val deadline = source.indexOf("private const val STARTUP_ROUTE_VERIFY_TURNCOAT_TIMEOUT_MS = 75_000L")
         val retryDelay = source.indexOf("private const val STARTUP_ROUTE_VERIFY_RETRY_MS = 700L")
 
@@ -195,7 +209,7 @@ class VpnDataPlaneProbePolicyTest {
     }
 
     @Test
-    fun `native startup proves the vpn data plane then stops terminally while watchdog recovery remains retry capable`() {
+    fun `native startup proves the vpn data plane then hands current route failure to retry recovery`() {
         val source = sourceFile("BoxService.kt")
         val startupProbe = functionBody(source, "verifyNativeStartupRoute")
         assertTrue(
@@ -209,20 +223,17 @@ class VpnDataPlaneProbePolicyTest {
         val successfulReturn = startupProbe.indexOf("return true")
         assertTrue("startup may succeed only after the VPN GET is healthy", routeHealthy >= 0 && successfulReturn > routeHealthy)
 
-        val startup = functionBody(source, "startService")
+        val retryFailedStart = startupProbe.indexOf("shouldRetryFailedNativeStartup(")
+        val recoveryRequest = startupProbe.indexOf("requestCoreRecovery(", retryFailedStart)
         assertTrue(
-            "initial native startup must pass a failed VPN GET into the terminal Stop/Close path",
-            startup.contains("stopServiceOnRouteFailure = true"),
+            "a failed current user-owned VPN GET must be handed to recovery admission",
+            retryFailedStart >= 0 && recoveryRequest > retryFailedStart,
         )
-        assertFalse(
-            "initial native startup must not leave the service retrying after a failed VPN GET",
-            startup.contains("requestCoreRecovery(\"native service start route is not ready\", generation)"),
-        )
-        assertTrue(
-            "terminal startup failure must call the normal stop-and-alert path",
-            startupProbe.contains("if (stopServiceOnFailure)") &&
-                startupProbe.contains("stopAndAlert(Alert.StartService"),
-        )
+        assertTrue("failed current route must remain visibly fail-closed", startupProbe.contains("status.value = Status.Starting"))
+        assertTrue("failed current route must publish recovery status", startupProbe.contains("R.string.status_recovering"))
+        assertTrue("stale or inactive startup must be discarded without retry", startupProbe.contains("stale or inactive generation"))
+        assertFalse("route failure must not terminally stop the service", startupProbe.contains("stopAndAlert(Alert.StartService"))
+        assertFalse("route failure must not retain the old terminal-stop option", startupProbe.contains("stopServiceOnRouteFailure"))
 
         val watchdog = functionBody(source, "runRouteWatchdogCheck")
         assertTrue(
@@ -233,10 +244,6 @@ class VpnDataPlaneProbePolicyTest {
         assertTrue("threshold escalation must enter route recovery", watchdog.contains("recoverRoute("))
 
         val establishedRecovery = functionBody(source, "recoverMobileCore")
-        assertTrue(
-            "established watchdog recovery remains retry-capable after its own failed startup probe",
-            establishedRecovery.contains("stopServiceOnRouteFailure = false"),
-        )
         assertTrue(
             "established watchdog recovery keeps its bounded retry loop",
             establishedRecovery.contains("while (currentCoroutineContext().isActive && shouldWatchCore(generation))"),
@@ -255,21 +262,21 @@ class VpnDataPlaneProbePolicyTest {
     }
 
     @Test
-    fun `startup probe failure cleans native vpn before publishing the terminal alert`() {
+    fun `route probe failure enters recovery while terminal alert cleanup remains ordered`() {
         val source = sourceFile("BoxService.kt")
         val startupProbe = functionBody(source, "verifyNativeStartupRoute")
         val stopAndAlert = functionBody(source, "stopAndAlert")
 
-        val startupFailureStop = startupProbe.indexOf("stopAndAlert(Alert.StartService")
-        assertTrue("a terminal startup probe failure must start the normal stop path", startupFailureStop >= 0)
+        assertTrue("failed current startup route must request recovery", startupProbe.contains("requestCoreRecovery("))
+        assertTrue("stale or inactive startup route must be discarded", startupProbe.contains("stale or inactive generation"))
+        assertFalse("route unavailability must not enter terminal alert cleanup", startupProbe.contains("stopAndAlert(Alert.StartService"))
 
-        val nativeStop = stopAndAlert.indexOf("Mobile.stop()")
         val closeAndTunWait = stopAndAlert.indexOf("closeMobileCoreAndAwaitTunQuiescence(")
         val alert = stopAndAlert.indexOf("callback.onServiceAlert(type.ordinal, message)")
         val stopped = stopAndAlert.indexOf("status.value = Status.Stopped")
 
-        assertTrue("terminal alert cleanup must stop the mobile core", nativeStop >= 0)
-        assertTrue("terminal alert cleanup must close the core and await TUN quiescence", closeAndTunWait > nativeStop)
+        assertFalse("terminal alert cleanup must not bypass the shared MobileCoreCloser", stopAndAlert.contains("Mobile.stop()"))
+        assertTrue("terminal alert cleanup must close the core and await TUN quiescence", closeAndTunWait >= 0)
         assertTrue("the dialog callback must be published after native cleanup", alert > closeAndTunWait)
         assertTrue("Stopped must be published after native cleanup", stopped > closeAndTunWait)
         assertTrue("Stopped must follow the terminal alert callback", stopped > alert)
@@ -289,7 +296,7 @@ class VpnDataPlaneProbePolicyTest {
         assertTrue(
             "TURNcoat watchdog recovery must request the stronger reset only for TURNcoat configs",
             recoverRoute.contains(
-                "forceTurncoatCarrierRetirement = configUsesTurncoat(Settings.activeConfigPath)",
+                "forceTurncoatCarrierRetirement = currentRuntimeUsesTurncoat()",
             ),
         )
         assertTrue(

@@ -54,6 +54,7 @@ class MethodHandler(private val scope: CoroutineScope) : FlutterPlugin,
             MarkStarted("markStarted"),
             GetStartedByUser("get_started_by_user"),
             GetServiceStatus("get_service_status"),
+            MatchesActiveConfigGeneration("matches_active_config_generation"),
             TryBeginFlutterRestart("try_begin_flutter_restart"),
             EndFlutterRestart("end_flutter_restart"),
             AddGrpcClientPublicKey("add_grpc_client_public_key"),
@@ -187,7 +188,7 @@ class MethodHandler(private val scope: CoroutineScope) : FlutterPlugin,
                     result.runCatching {
                         val args = call.arguments as Map<*, *>
                         val preparedPath = args["path"] as String? ?: ""
-                        storeNativeResumeConfig(preparedPath, args["name"] as String? ?: "")
+                        val storedConfig = storeNativeResumeConfig(preparedPath, args["name"] as String? ?: "")
                         Settings.debugMode = args["debug"] as Boolean? ?: true
                         Settings.grpcServiceModePort = args["grpcPort"] as Int
                         // The foreground/background gRPC services are long-lived.
@@ -203,7 +204,10 @@ class MethodHandler(private val scope: CoroutineScope) : FlutterPlugin,
 //                        }
                         Settings.startCoreAfterStartingService = false
 
-                        mainActivity.startService()
+                        mainActivity.startService(
+                            configFingerprint = storedConfig.fingerprint,
+                            configUsesTurncoat = storedConfig.usesTurncoat,
+                        )
                         success(true)
                     }
                 }
@@ -289,6 +293,19 @@ class MethodHandler(private val scope: CoroutineScope) : FlutterPlugin,
                 result.success(BoxService.currentPlatformStatus().name)
             }
 
+            Trigger.MatchesActiveConfigGeneration.method -> {
+                scope.launch(Dispatchers.IO) {
+                    result.runCatching {
+                        val args = call.arguments as? Map<*, *>
+                            ?: error("missing config identity arguments")
+                        val preparedPath = args["path"] as? String
+                            ?: error("missing prepared config path")
+                        val fingerprint = NativeResumeConfigStore.fingerprintPlaintextFile(File(preparedPath))
+                        success(BoxService.currentRuntimeConfigMatches(fingerprint))
+                    }
+                }
+            }
+
             Trigger.TryBeginFlutterRestart.method -> {
                 val activity = MainActivity.instance
                 val initialStatus = activity.boundServiceStatus ?: activity.serviceStatus.value ?: Status.Stopped
@@ -350,9 +367,11 @@ class MethodHandler(private val scope: CoroutineScope) : FlutterPlugin,
         appContext.stopService(Intent(appContext, Settings.serviceClass()))
     }
 
-    private fun storeNativeResumeConfig(preparedPath: String, profileName: String) {
+    private fun storeNativeResumeConfig(
+        preparedPath: String,
+        profileName: String,
+    ): NativeResumeConfigStore.StoredConfig =
         NativeResumeConfigPublisher.store(appContext, File(preparedPath), profileName)
-    }
 
     private suspend fun awaitStoppedPlatformServiceRelease(
         ownerToken: Long,

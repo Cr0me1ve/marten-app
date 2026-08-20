@@ -7,6 +7,7 @@ object SettingsKey {
     const val ACTIVE_CONFIG_PATH = "${KEY_PREFIX}active_config_path"
     const val ACTIVE_PROFILE_NAME = "${KEY_PREFIX}active_profile_name"
     const val ACTIVE_CONFIG_USES_TURNCOAT = "${KEY_PREFIX}active_config_uses_turncoat"
+    const val ACTIVE_CONFIG_FINGERPRINT = "${KEY_PREFIX}active_config_fingerprint"
 
     const val PER_APP_PROXY_MODE = "${KEY_PREFIX}per_app_proxy_mode"
     const val PER_APP_PROXY_INCLUDE_LIST = "${KEY_PREFIX}per_app_proxy_include_list"

@@ -125,6 +125,12 @@ internal fun shouldRetryFailedNativeStartup(
     startStillCurrent: Boolean,
 ): Boolean = !routeVerified && userSessionActive && startStillCurrent
 
+internal fun shouldDelegateRouteVerificationToNativeRecovery(
+    nativeRecoveryActive: Boolean,
+    userSessionActive: Boolean,
+    startStillCurrent: Boolean,
+): Boolean = nativeRecoveryActive && userSessionActive && startStillCurrent
+
 internal fun shouldRestoreUserSessionFromServiceCommand(
     restartedBySystem: Boolean,
     processRecoveryRequested: Boolean,
@@ -175,7 +181,7 @@ internal fun shouldRecoverUnverifiedRunningCore(
     coreState == CoreStates.STARTED &&
     elapsedMs >= timeoutMs
 
-internal fun shouldRestartProcessForStalledCoreRecovery(
+internal fun shouldFailStalledCoreRecovery(
     recoveryInProgress: Boolean,
     userSessionActive: Boolean,
     coreState: CoreStates?,

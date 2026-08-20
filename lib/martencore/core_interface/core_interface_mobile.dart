@@ -36,6 +36,9 @@ bool shouldProbeExistingBackgroundCoreForManualStart({
 bool shouldJoinAuthoritativeBackgroundStart({required bool isAndroid, required CoreStatus? platformStatus}) =>
     isAndroid && platformStatus is CoreStarting;
 
+bool mayAttachToActiveConfigGeneration({required bool isAndroid, required bool configIdentityMatches}) =>
+    !isAndroid || configIdentityMatches;
+
 typedef _BackgroundCoreEndpoint = ({int port, CoreStatus status});
 
 class CoreInterfaceMobile extends CoreInterface with InfraLogger {
@@ -81,9 +84,24 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
   bool _debug = false;
   int _backgroundLifecycleGeneration = 0;
   ChannelCredentials _channelCredentials = const ChannelCredentials.insecure();
+  ClientChannel? _backgroundObservationChannel;
+  ClientChannel? _backgroundControlChannel;
+  CoreClient? _backgroundControlClient;
 
   late LastStream<CoreStatus> _status;
   Stream<CoreStatus>? _serviceStatus;
+
+  @override
+  CoreClient get backgroundControlClient => _backgroundControlClient ?? bgClient;
+
+  @override
+  int get backgroundLifecycleGeneration => _backgroundLifecycleGeneration;
+
+  @override
+  void beginBackgroundLifecycle() {
+    _backgroundLifecycleGeneration++;
+    _clearBackgroundControlClient();
+  }
 
   void _ensurePlatformStatusStreams() {
     if (_serviceStatus != null) return;
@@ -133,7 +151,8 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
         _isBgClientAvailable = false;
       }
     }
-    bgClient = CoreClient(_coreChannel(_portBack, channelOption));
+    _replaceBackgroundObservationClient(_coreChannel(_portBack, channelOption));
+    _clearBackgroundControlClient();
     // await start("/sdcard/Android/data/app.marten.client/files/configs/cdc633e9-8cfc-4a67-948d-009f779a5c91.json", "marten");
     return "";
   }
@@ -292,7 +311,16 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
   Future<CoreStatus?> _coreStatusOnPort(int port, ChannelCredentials channelCredentials) async {
     final channel = _coreChannel(port, channelCredentials);
     try {
-      final client = CoreClient(channel);
+      return await _coreStatusOnClient(CoreClient(channel));
+    } catch (_) {
+      return null;
+    } finally {
+      await channel.shutdown();
+    }
+  }
+
+  Future<CoreStatus?> _coreStatusOnClient(CoreClient client) async {
+    try {
       final event = await client
           .coreInfoListener(Empty(), options: CallOptions(timeout: _healthCheckTimeout))
           .first
@@ -300,8 +328,6 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
       return CoreStatus.fromCoreInfo(event);
     } catch (_) {
       return null;
-    } finally {
-      await channel.shutdown();
     }
   }
 
@@ -321,7 +347,7 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
       );
       if (endpoint != null) {
         _portBack = endpoint.port;
-        bgClient = CoreClient(_coreChannel(_portBack, _channelCredentials));
+        _replaceBackgroundObservationClient(_coreChannel(_portBack, _channelCredentials));
         _isBgClientAvailable = true;
         return endpoint;
       }
@@ -368,6 +394,78 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
       port: port,
       options: ChannelOptions(credentials: channelCredentials),
     );
+  }
+
+  void _replaceBackgroundObservationClient(ClientChannel channel) {
+    final previous = _backgroundObservationChannel;
+    _backgroundObservationChannel = channel;
+    bgClient = CoreClient(channel);
+    if (previous != null && !identical(previous, channel)) {
+      unawaited(_terminateChannel(previous, "retired background observation"));
+    }
+  }
+
+  void _clearBackgroundControlClient() {
+    final previous = _backgroundControlChannel;
+    _backgroundControlChannel = null;
+    _backgroundControlClient = null;
+    if (previous != null) {
+      unawaited(_terminateChannel(previous, "retired background control"));
+    }
+  }
+
+  Future<void> _terminateChannel(ClientChannel channel, String role) async {
+    try {
+      await channel.terminate();
+    } catch (error) {
+      loggy.debug("failed to terminate $role channel: $error");
+    }
+  }
+
+  bool _platformOwnsCurrentBackgroundLifecycle(CoreStatus? status) {
+    return !Platform.isAndroid || status is CoreStarting || status is CoreStarted;
+  }
+
+  @override
+  Future<CoreStatus?> refreshBackgroundControlSession(int expectedGeneration) async {
+    if (expectedGeneration != _backgroundLifecycleGeneration || !_isBgClientAvailable) return null;
+
+    final platformBefore = await readPlatformServiceStatus();
+    if (!_platformOwnsCurrentBackgroundLifecycle(platformBefore) ||
+        expectedGeneration != _backgroundLifecycleGeneration) {
+      return null;
+    }
+
+    // Validate the exact connection that will carry SelectOutbound. A separate
+    // probe channel would leave the real command transport exposed to the same
+    // post-Start race. Do not scan ports or wait: the current lifecycle already
+    // owns [_portBack], and healthy handoff is one local gRPC round-trip.
+    final controlChannel = _coreChannel(_portBack, _channelCredentials);
+    final controlClient = CoreClient(controlChannel);
+    final status = await _coreStatusOnClient(controlClient);
+    if (status is! CoreStarted) {
+      await _terminateChannel(controlChannel, "unconfirmed background control");
+      return null;
+    }
+
+    final platformAfter = await readPlatformServiceStatus();
+    if (!_platformOwnsCurrentBackgroundLifecycle(platformAfter) ||
+        expectedGeneration != _backgroundLifecycleGeneration) {
+      await _terminateChannel(controlChannel, "stale background control");
+      return null;
+    }
+
+    // Keep unary control calls independent from long-lived log/status streams:
+    // one HTTP/2 connection failure can no longer take both down together.
+    final observationChannel = _coreChannel(_portBack, _channelCredentials);
+    final previousControl = _backgroundControlChannel;
+    _backgroundControlChannel = controlChannel;
+    _backgroundControlClient = controlClient;
+    _replaceBackgroundObservationClient(observationChannel);
+    if (previousControl != null && !identical(previousControl, controlChannel)) {
+      unawaited(_terminateChannel(previousControl, "retired background control"));
+    }
+    return status;
   }
 
   Future<HelloResponse> _waitForMartenCore(int port, ChannelCredentials channelCredentials) async {
@@ -428,9 +526,23 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
 
   @override
   Future<BackgroundCoreSetupResult> setupBackground(String path, String name) async {
-    final platformStatus = await readPlatformServiceStatus();
-    if (shouldJoinAuthoritativeBackgroundStart(isAndroid: Platform.isAndroid, platformStatus: platformStatus)) {
-      return _joinAuthoritativeBackgroundStart();
+    var platformStatus = await readPlatformServiceStatus();
+    var configIdentityMatches = !Platform.isAndroid || await _matchesActiveConfigGeneration(path);
+    var platformCleanupConfirmed = false;
+    if (Platform.isAndroid && !configIdentityMatches) {
+      loggy.info("active Android runtime does not own the requested configuration; retiring it before start");
+      if (!await stop()) {
+        return const BackgroundCoreSetupResult.failed(CoreStatus.stopped(alert: CoreAlert.createService));
+      }
+      platformCleanupConfirmed = true;
+      platformStatus = await readPlatformServiceStatus();
+    }
+    if (shouldJoinAuthoritativeBackgroundStart(isAndroid: Platform.isAndroid, platformStatus: platformStatus) &&
+        mayAttachToActiveConfigGeneration(
+          isAndroid: Platform.isAndroid,
+          configIdentityMatches: configIdentityMatches,
+        )) {
+      return _joinAuthoritativeBackgroundStart(path);
     }
     final shouldProbeExisting = shouldProbeExistingBackgroundCoreForManualStart(
       isAndroid: Platform.isAndroid,
@@ -452,16 +564,32 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
       );
     }
     if (attachedExisting?.status case CoreStarting() || CoreStarted()) {
-      loggy.info(
-        "background service gRPC is already available with ${attachedExisting!.status}; attached without stopping it",
-      );
-      return BackgroundCoreSetupResult.attached(attachedExisting.status);
+      configIdentityMatches = !Platform.isAndroid || await _matchesActiveConfigGeneration(path);
+      if (mayAttachToActiveConfigGeneration(
+        isAndroid: Platform.isAndroid,
+        configIdentityMatches: configIdentityMatches,
+      )) {
+        _clearBackgroundControlClient();
+        _backgroundLifecycleGeneration++;
+        loggy.info(
+          "background service gRPC is already available with ${attachedExisting!.status}; attached to matching runtime",
+        );
+        return BackgroundCoreSetupResult.attached(attachedExisting.status);
+      }
+      loggy.info("discarding a healthy background endpoint owned by a superseded configuration");
+      attachedExisting = null;
+      if (!platformCleanupConfirmed) {
+        if (!await stop()) {
+          return const BackgroundCoreSetupResult.failed(CoreStatus.stopped(alert: CoreAlert.createService));
+        }
+        platformCleanupConfirmed = true;
+      }
     }
 
     if (attachedExisting != null) {
       loggy.info("background core gRPC shell is stopped; starting Android service on existing 127.0.0.1:$_portBack");
     } else {
-      if (!await stop()) {
+      if (!platformCleanupConfirmed && !await stop()) {
         return const BackgroundCoreSetupResult.failed(CoreStatus.stopped(alert: CoreAlert.createService));
       }
       _status.clean();
@@ -471,8 +599,9 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
         channelCredentials: _channelCredentials,
         reservedPorts: {_portFront},
       );
-      bgClient = CoreClient(_coreChannel(_portBack, _channelCredentials));
+      _replaceBackgroundObservationClient(_coreChannel(_portBack, _channelCredentials));
     }
+    _clearBackgroundControlClient();
     final startGeneration = ++_backgroundLifecycleGeneration;
     await _invokeBackgroundStartAndWait(path, name, _portBack);
 
@@ -491,7 +620,12 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
     }
     final setupResult = BackgroundCoreSetupResult.fromStatus(startStatus);
     if (setupResult is! BackgroundCoreSetupFailed) {
-      return setupResult;
+      if (!Platform.isAndroid || await _matchesActiveConfigGeneration(path)) {
+        return setupResult;
+      }
+      loggy.warning("Android runtime identity changed while the background service was starting");
+      await stop();
+      return const BackgroundCoreSetupResult.failed(CoreStatus.stopped(alert: CoreAlert.startService));
     }
 
     final lateAttached = await _attachExistingBackgroundCore(
@@ -499,8 +633,13 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
       includeStarting: true,
     );
     if (lateAttached != null) {
-      loggy.warning("background core became healthy during late attach grace");
-      return BackgroundCoreSetupResult.attached(lateAttached.status);
+      if (!Platform.isAndroid || await _matchesActiveConfigGeneration(path)) {
+        loggy.warning("background core became healthy during late attach grace");
+        return BackgroundCoreSetupResult.attached(lateAttached.status);
+      }
+      loggy.warning("discarding late background attach from a superseded configuration");
+      await stop();
+      return const BackgroundCoreSetupResult.failed(CoreStatus.stopped(alert: CoreAlert.startService));
     }
 
     if (startStatus is CoreStopped && startStatus.alert != null) {
@@ -514,7 +653,8 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
     );
   }
 
-  Future<BackgroundCoreSetupResult> _joinAuthoritativeBackgroundStart() async {
+  Future<BackgroundCoreSetupResult> _joinAuthoritativeBackgroundStart(String path) async {
+    _clearBackgroundControlClient();
     final joinGeneration = ++_backgroundLifecycleGeneration;
     final deadline = DateTime.now().add(_platformStartedSyncTimeout);
     loggy.info("Android service is already Starting; joining its authoritative native generation");
@@ -532,6 +672,11 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
       final nativeStatus = await readPlatformServiceStatus();
       switch (nativeStatus) {
         case CoreStarted():
+          if (!await _matchesActiveConfigGeneration(path)) {
+            loggy.warning("authoritative Android start completed for a superseded configuration");
+            await stop();
+            return const BackgroundCoreSetupResult.failed(CoreStatus.stopped(alert: CoreAlert.startService));
+          }
           // The gRPC shell can survive a native core replacement. Re-read its
           // state only after BoxService has published Started for the current
           // generation; a stale Started response while BoxService is Starting
@@ -539,7 +684,7 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
           final endpoint = await _findAttachableBackgroundCore(_channelCredentials);
           if (endpoint?.status is CoreStarted) {
             _portBack = endpoint!.port;
-            bgClient = CoreClient(_coreChannel(_portBack, _channelCredentials));
+            _replaceBackgroundObservationClient(_coreChannel(_portBack, _channelCredentials));
             _isBgClientAvailable = true;
             loggy.info("joined authoritative Android core generation on 127.0.0.1:$_portBack");
             return const BackgroundCoreSetupResult.attached(CoreStatus.started());
@@ -627,6 +772,7 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
   @override
   Future<bool> stop() async {
     _backgroundLifecycleGeneration++;
+    _clearBackgroundControlClient();
     var platformStopSucceeded = false;
     var platformStopReturned = false;
     try {
@@ -744,6 +890,19 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
     } catch (e) {
       loggy.warning("failed to read native service status: $e");
       return null;
+    }
+  }
+
+  Future<bool> _matchesActiveConfigGeneration(String path) async {
+    if (!Platform.isAndroid) return true;
+    try {
+      return await methodChannel
+              .invokeMethod<bool>("matches_active_config_generation", {"path": path})
+              .timeout(_platformSessionStateTimeout) ??
+          false;
+    } catch (e) {
+      loggy.warning("failed to verify active Android runtime configuration: $e");
+      return false;
     }
   }
 

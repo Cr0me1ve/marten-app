@@ -40,6 +40,17 @@ class CoreInterface {
   late CoreClient fgClient;
   late CoreClient bgClient;
 
+  /// Unary operations that must not share the long-lived log/status HTTP/2
+  /// transport use this client after the background runtime has started.
+  CoreClient get backgroundControlClient => bgClient;
+
+  /// Monotonically identifies the Flutter-owned background lifecycle.
+  int get backgroundLifecycleGeneration => 0;
+
+  /// Invalidates observers from the previous manual route before the next
+  /// route enables any control-plane features.
+  void beginBackgroundLifecycle() {}
+
   Future<String> setup(Directories directories, bool debug, int mode) async {
     return "";
   }
@@ -58,6 +69,12 @@ class CoreInterface {
 
   Future<bool> isBgClientAvailable() async {
     return true;
+  }
+
+  /// Opens and validates a fresh control transport for the current background
+  /// lifecycle. Non-mobile implementations keep their existing client.
+  Future<CoreStatus?> refreshBackgroundControlSession(int expectedGeneration) async {
+    return const CoreStatus.started();
   }
 
   bool isSingleChannel() {

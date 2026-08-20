@@ -1,13 +1,14 @@
 package app.marten.client.bg
 
 import java.io.File
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class IcmpResilienceSourceGuardTest {
     @Test
-    fun `route acknowledgement is fail-closed and delegates through bounded current-generation VPN data-plane proof`() {
+    fun `route unavailability remains owned recovery work rather than a terminal Flutter acknowledgement failure`() {
         val source = sourceFile("BoxService.kt")
         assertTrue(
             "active BoxService publication must be visible across MethodHandler and service threads",
@@ -27,15 +28,22 @@ class IcmpResilienceSourceGuardTest {
         val flutterAcknowledgement = functionBody(source, "acknowledgeVerifiedRouteFromFlutter")
         assertTrue(flutterAcknowledgement.contains("shouldContinueStart(generation)"))
         assertTrue(flutterAcknowledgement.contains("!hasReusableVpnDataPlaneProof(generation)"))
+        val delegateToOwner = flutterAcknowledgement.indexOf("nativeRouteRecoveryOwnsGeneration(generation)")
         val nativeRetry = flutterAcknowledgement.indexOf("val verified = verifyNativeStartupRoute(")
         val sameGeneration = flutterAcknowledgement.indexOf("generation = generation", nativeRetry)
-        val terminalFailure = flutterAcknowledgement.indexOf("stopServiceOnFailure = true", nativeRetry)
         val failClosed = flutterAcknowledgement.indexOf("if (!verified) return false", nativeRetry)
         val markStarted = flutterAcknowledgement.indexOf("return markCoreRuntimeStarted(routeVerified = true, generation = generation)")
+        val recoveryOwner = functionBody(source, "nativeRouteRecoveryOwnsGeneration")
         assertTrue("Flutter acknowledgement must delegate to bounded native VPN proof", nativeRetry >= 0)
+        assertTrue("Flutter acknowledgement must yield immediately to the active native recovery owner", delegateToOwner >= 0)
         assertTrue("native proof must stay in the acknowledged lifecycle generation", sameGeneration > nativeRetry)
-        assertTrue("failed acknowledgement proof must use terminal cleanup", terminalFailure > sameGeneration)
-        assertTrue("failed acknowledgement proof must return before Started", failClosed > terminalFailure && markStarted > failClosed)
+        assertTrue("an active core recovery owns the acknowledged generation", recoveryOwner.contains("coreRecoveryInProgress"))
+        assertTrue("an active network recovery owns the acknowledged generation", recoveryOwner.contains("networkRecoveryJob?.isActive == true"))
+        assertTrue("a degraded route watchdog owns the acknowledged generation", recoveryOwner.contains("routeWatchdogDegraded"))
+        assertTrue("ownership must remain generation and user-session guarded", recoveryOwner.contains("shouldDelegateRouteVerificationToNativeRecovery("))
+        assertTrue("failed acknowledgement proof must return before Started", failClosed > sameGeneration && markStarted > failClosed)
+        assertFalse("Flutter acknowledgement must never terminally stop for route unavailability", flutterAcknowledgement.contains("stopServiceOnFailure = true"))
+        assertFalse("Flutter acknowledgement must leave recovery notifications/status to the owner", flutterAcknowledgement.contains("stopAndAlert(Alert.StartService"))
 
         val nativeProof = functionBody(source, "verifyNativeStartupRoute")
         assertTrue("native proof must retry rather than trust one route snapshot", nativeProof.contains("while (SystemClock.elapsedRealtime() < deadline)"))
@@ -43,7 +51,14 @@ class IcmpResilienceSourceGuardTest {
             "native proof must require the Android VPN data-plane GET",
             nativeProof.contains("checkSelectedRoute(") && nativeProof.contains("requireVpnDataPlane = true"),
         )
-        assertTrue("native proof expiry must remain fail-closed", nativeProof.contains("stopAndAlert(Alert.StartService"))
+        assertTrue("native proof expiry must enter guarded core recovery", nativeProof.contains("requestCoreRecovery("))
+        assertFalse("route unavailability must not terminally stop the foreground service", nativeProof.contains("stopAndAlert(Alert.StartService"))
+        assertFalse("route verification must not retain a terminal-stop parameter", nativeProof.contains("stopServiceOnFailure"))
+
+        assertFalse(
+            "no route-verification caller may opt into terminal Stop/Close for route unavailability",
+            source.contains("stopServiceOnRouteFailure = true"),
+        )
 
         val started = functionBody(source, "markCoreRuntimeStarted")
         assertTrue(started.contains("shouldContinueStart(generation)"))
@@ -242,51 +257,20 @@ class IcmpResilienceSourceGuardTest {
     }
 
     @Test
-    fun `SERVICE_RECOVER active path releases Activity binding and schedules delayed restart`() {
+    fun `legacy SERVICE_RECOVER is consumed and never replaces the active service`() {
         val source = sourceFile("BoxService.kt")
         val onStart = functionBody(source, "onStartCommand")
-        val activeStart = onStart.indexOf("if (status.value != Status.Stopped) {")
-        val activeEnd = onStart.indexOf("status.value = Status.Starting")
-        assertTrue(activeStart >= 0)
-        assertTrue(activeEnd > activeStart)
+        val legacyAction = onStart.indexOf("val processRecoveryRequested = intent?.action == Action.SERVICE_RECOVER")
+        val cancel = onStart.indexOf("cancelLegacyProcessRecoveryAlarm()", legacyAction)
+        val activeBranch = onStart.indexOf("if (status.value != Status.Stopped) {")
+        val ignore = onStart.indexOf("ignoring system service restart while service is already active", activeBranch)
 
-        val activeService = onStart.substring(activeStart, activeEnd)
-        val replacementCondition = activeService.indexOf("processRecoveryRequested &&")
-        assertTrue(
-            "SERVICE_RECOVER path should be guarded by processRecovery and replacement request",
-            replacementCondition >= 0,
-        )
-        val replacementStart = activeService.lastIndexOf("if (", replacementCondition)
-        assertTrue(replacementStart >= 0)
-
-        val replacementEnd = activeService.indexOf(
-            "if ((restartedBySystem || processRecoveryRequested) && !connectFromNotification)",
-            replacementCondition,
-        )
-        assertTrue(replacementEnd > replacementStart)
-        val replacement = activeService.substring(replacementStart, replacementEnd)
-
-        assertTrue(replacement.contains("vpnServiceReplacementRequested &&"))
-        assertTrue(replacement.contains("shouldRestoreUserSession"))
-        assertTrue(replacement.contains("releaseActivityServiceBindingForRecovery()"))
-        assertTrue(replacement.contains("scheduleProcessRecovery()"))
-        assertTrue(replacement.contains("service.stopSelf()"))
-
-        val releaseBinding = replacement.indexOf("releaseActivityServiceBindingForRecovery()")
-        val scheduleRecovery = replacement.indexOf("scheduleProcessRecovery()")
-        val stopSelf = replacement.indexOf("service.stopSelf()")
-        assertTrue(releaseBinding >= 0)
-        assertTrue(scheduleRecovery > releaseBinding)
-        assertTrue(stopSelf > scheduleRecovery)
-        assertTrue(
-            "replacement path should launch and then return sticky",
-            replacement.lastIndexOf("return Service.START_STICKY") >
-                maxOf(releaseBinding, scheduleRecovery, stopSelf),
-        )
-        assertTrue(
-            "active SERVICE_RECOVER replacement must not relaunch service in place",
-            replacement.indexOf("startService(nextStartGeneration())") < 0,
-        )
+        assertTrue(legacyAction >= 0)
+        assertTrue("the leftover PendingIntent must be cancelled immediately", cancel > legacyAction)
+        assertTrue("active services only absorb legacy recovery commands", ignore > activeBranch)
+        assertFalse("legacy recovery must not schedule another alarm", source.contains("scheduleProcessRecovery"))
+        assertFalse("legacy recovery must not release an Activity binding", source.contains("releaseActivityServiceBindingForRecovery"))
+        assertFalse("legacy recovery must not perform service replacement", source.contains("replaceVpnServiceAfterCoreCleanupFailure"))
     }
 
     @Test
@@ -303,19 +287,17 @@ class IcmpResilienceSourceGuardTest {
     }
 
     @Test
-    fun `newly accepted start reopens TUN descriptor admission under the descriptor lock`() {
-        val onStart = functionBody(sourceFile("BoxService.kt"), "onStartCommand")
-        val stoppedOwnerBranch = onStart.indexOf("if (status.value != Status.Stopped) {")
-        val admissionLock = onStart.indexOf("synchronized(fileDescriptorLock)", stoppedOwnerBranch)
-        val reopenAdmission = onStart.indexOf("tunDescriptorAdmissionClosed = false", admissionLock)
-        val starting = onStart.indexOf("status.value = Status.Starting", admissionLock)
-        val restore = onStart.indexOf("if (shouldRestoreUserSession)", admissionLock)
+    fun `newly accepted start reopens TUN admission only after the prior close barrier`() {
+        val start = functionBody(sourceFile("BoxService.kt"), "startService")
+        val waitForPriorClose = start.indexOf("MobileCoreCloser.waitForCloseToFinish(\"service start\")")
+        val admissionLock = start.indexOf("synchronized(fileDescriptorLock)", waitForPriorClose)
+        val reopenAdmission = start.indexOf("tunDescriptorAdmissionClosed = false", admissionLock)
+        val setup = start.indexOf("Mobile.setup(", reopenAdmission)
 
-        assertTrue(stoppedOwnerBranch >= 0)
-        assertTrue("accepted start must re-open descriptor admission under fileDescriptorLock", admissionLock > stoppedOwnerBranch)
+        assertTrue("start must wait for any in-flight native close", waitForPriorClose >= 0)
+        assertTrue("accepted start must re-open descriptor admission under fileDescriptorLock", admissionLock > waitForPriorClose)
         assertTrue(reopenAdmission > admissionLock)
-        assertTrue(starting > reopenAdmission)
-        assertTrue("descriptor admission must open before restored/native start work", restore > starting)
+        assertTrue("descriptor admission must open before native setup", setup > reopenAdmission)
     }
 
     @Test
@@ -363,7 +345,10 @@ class IcmpResilienceSourceGuardTest {
         assertTrue("replacement path should clear explicit marker", replaceReset >= 0)
         assertTrue("TUN creation failure should clear explicit marker", creationFailedReset >= 0)
         assertTrue("service stop entry should clear explicit marker", stopReset >= 0)
-        assertTrue("stop entry reset must happen before further cleanup scheduling", stopReset < stopService.indexOf("cancelProcessRecovery()"))
+        assertTrue(
+            "stop entry reset must happen before legacy cleanup cancellation",
+            stopReset < stopService.indexOf("cancelLegacyProcessRecoveryAlarm()"),
+        )
         assertTrue("service alert path should clear explicit marker", stopAndAlertReset >= 0)
         assertTrue("service destroy must clear explicit marker", destroyReset >= 0)
         assertTrue("revoke should clear marker through the shared stop path", revokeStopsService >= 0)
@@ -438,26 +423,11 @@ class IcmpResilienceSourceGuardTest {
     }
 
     @Test
-    fun `SERVICE_RECOVER binding release posts delayed reconnect and retries recovery from stale active service`() {
+    fun `legacy recovery has no Activity binding release or delayed reconnect path`() {
         val source = sourceFile("BoxService.kt")
-        val releaseBinding = functionBody(source, "releaseActivityServiceBindingForRecovery")
-
-        val activityAssignment = releaseBinding.indexOf("val activity = runCatching { MainActivity.instance }.getOrNull() ?: return")
-        val instanceGuard = releaseBinding.indexOf("if (activity.isFinishing || activity.isDestroyed) return")
-        val disconnect = releaseBinding.indexOf("activity.disconnectServiceBinding()")
-        val postDelayed = releaseBinding.indexOf("mainHandler.postDelayed({")
-        val reconnect = releaseBinding.indexOf("activity.reconnect()")
-        val reconnectGuard = releaseBinding.indexOf("currentActivity === activity")
-        val delayMs = releaseBinding.indexOf("PROCESS_RECOVERY_REBIND_DELAY_MS")
-
-        assertTrue(activityAssignment >= 0)
-        assertTrue(instanceGuard > activityAssignment)
-        assertTrue(disconnect > instanceGuard)
-        assertTrue(postDelayed > disconnect)
-        assertTrue(reconnectGuard > postDelayed)
-        assertTrue(reconnect > reconnectGuard)
-        assertTrue(delayMs > postDelayed)
-        assertTrue(reconnect < delayMs)
+        assertFalse(source.contains("releaseActivityServiceBindingForRecovery"))
+        assertFalse(source.contains("PROCESS_RECOVERY_REBIND_DELAY_MS"))
+        assertFalse(source.contains("MainActivity.instance"))
     }
 
     @Test
@@ -484,7 +454,10 @@ class IcmpResilienceSourceGuardTest {
         assertTrue(descriptorClose >= 0)
         assertTrue(coreClose > descriptorClose)
         assertTrue("platform VPN retirement must follow a completed native close", platformRetirement > coreClose)
-        assertTrue("release deadline should be calculated for both framework and TUN release waits", releaseDeadline > coreClose)
+        assertTrue(
+            "release deadline must start before native close so a stuck close cannot add another TUN grace period",
+            releaseDeadline >= 0 && releaseDeadline < descriptorClose,
+        )
         assertTrue("platform retirement must use shared release deadline", platformRetirementCall > platformRetirement)
         assertTrue(
             "platform retirement and TUN release should share same computed deadline",
@@ -495,7 +468,7 @@ class IcmpResilienceSourceGuardTest {
         assertTrue(result > tunWait)
         val closeFailed = functionBody(source, "closeFailedRecoveryRuntime")
         assertTrue(closeFailed.contains("val cleanupResult = closeMobileCoreAndAwaitTunQuiescence(reason)"))
-        assertTrue(Regex("\\n\\s*cleanupResult\\.completed\\s*\\n\\s*}").containsMatchIn(closeFailed))
+        assertTrue(closeFailed.contains("cleanupResult.completed"))
     }
 
     @Test
@@ -557,12 +530,12 @@ class IcmpResilienceSourceGuardTest {
         val stopService = functionBody(source, "stopService")
         val stopQuiescence = stopService.indexOf("closeMobileCoreAndAwaitTunQuiescence")
         val stopGuard = findCleanupFailureGuard(stopService)
-        val stopReplacement = stopService.indexOf("replaceVpnServiceAfterCoreCleanupFailure(", stopGuard)
-        val stopStopped = stopService.indexOf("status.value = Status.Stopped", stopReplacement)
+        val terminalFailure = stopService.indexOf("finishCoreCleanupFailure(", stopGuard)
+        val terminalReturn = stopService.indexOf("return@launch", terminalFailure)
         assertTrue("disconnect/cancel flow must await cleanup before hard kill check", stopQuiescence >= 0)
         assertTrue("disconnect/cancel flow must evaluate termination requirement", stopGuard > stopQuiescence)
-        assertTrue("replacement helper must be checked after cleanup result", stopReplacement > stopGuard)
-        assertTrue("foreground stop should mark Stopped after replacement decision", stopStopped > stopReplacement)
+        assertTrue("failed cleanup must enter the one terminal fail-closed handler", terminalFailure > stopGuard)
+        assertTrue("manual stop must not continue normal cleanup after terminal failure", terminalReturn > terminalFailure)
         assertFalse("disconnect/cancel path must not bypass guard with direct kill", stopService.contains("android.os.Process.killProcess"))
         assertTrue(
             "service stop cleanup must use serviceStopping=true",
@@ -687,18 +660,18 @@ class IcmpResilienceSourceGuardTest {
         val finishCancelledStart = functionBody(source, "finishCancelledStart")
         assertTrue(finishCancelledStart.contains("closeMobileCoreAndAwaitTunQuiescence("))
         assertTrue(finishCancelledStart.contains("serviceStopping = true"))
-        assertTrue(finishCancelledStart.contains("replaceVpnServiceAfterCoreCleanupFailure("))
+        assertTrue(finishCancelledStart.contains("finishCoreCleanupFailure("))
         val stopService = functionBody(source, "stopService")
         assertTrue(stopService.contains("closeMobileCoreAndAwaitTunQuiescence("))
         assertTrue(stopService.contains("\"service stop\""))
         assertTrue(stopService.contains("serviceStopping = true"))
-        assertTrue(stopService.contains("replaceVpnServiceAfterCoreCleanupFailure("))
+        assertTrue(stopService.contains("finishCoreCleanupFailure("))
         assertTrue(stopService.contains("service.stopSelf()"))
         val stopAndAlert = functionBody(source, "stopAndAlert")
         assertTrue(stopAndAlert.contains("closeMobileCoreAndAwaitTunQuiescence("))
         assertTrue(stopAndAlert.contains("\"service alert\""))
         assertTrue(stopAndAlert.contains("serviceStopping = true"))
-        assertTrue(stopAndAlert.contains("replaceVpnServiceAfterCoreCleanupFailure("))
+        assertTrue(stopAndAlert.contains("finishCoreCleanupFailure("))
         assertTrue(stopAndAlert.contains("service.stopSelf()"))
         val onDestroy = functionBody(source, "onDestroy")
         assertTrue(onDestroy.contains("closeMobileCoreAndAwaitTunQuiescence("))
@@ -726,7 +699,10 @@ class IcmpResilienceSourceGuardTest {
             closeFailed.contains("serviceStopping = true"),
         )
         assertTrue(reload.contains("closeMobileCoreAndAwaitTunQuiescence(\"service reload\")"))
-        assertTrue(recover.contains("closeMobileCoreAndAwaitTunQuiescence(\"core watchdog recovery attempt"))
+        assertTrue(
+            recover.contains("closeMobileCoreAndAwaitTunQuiescence(") &&
+                recover.contains("\"core watchdog recovery attempt ${'$'}attempt\""),
+        )
         assertTrue(closeFailed.contains("closeMobileCoreAndAwaitTunQuiescence(reason)"))
     }
 
@@ -757,19 +733,19 @@ class IcmpResilienceSourceGuardTest {
         val cleanupFailure = recovery.indexOf("preparationCleanupFailed = true", cleanup)
         val setupBlocked = recovery.indexOf("return@run false", cleanupFailure)
         val setup = recovery.indexOf("Mobile.setup(", cleanup)
-        val replacement = recovery.indexOf("replaceVpnServiceAfterCoreCleanupFailure(", cleanupFailure)
-        val replacementReturn = recovery.indexOf("return", replacement)
-        val retry = recovery.indexOf("core watchdog recovery retry scheduled", replacement)
+        val terminalFailure = recovery.indexOf("finishCoreCleanupFailure(", cleanupFailure)
+        val terminalReturn = recovery.indexOf("return", terminalFailure)
+        val retry = recovery.indexOf("core watchdog recovery retry scheduled", terminalFailure)
         assertTrue(cleanup >= 0)
         assertTrue(cleanupFailure > cleanup)
         assertTrue(setupBlocked > cleanupFailure)
         assertTrue(setup > setupBlocked)
-        assertTrue(replacement > setup)
-        assertTrue(replacementReturn > replacement)
-        assertTrue(retry > replacementReturn)
+        assertTrue(terminalFailure > setup)
+        assertTrue(terminalReturn > terminalFailure)
+        assertTrue("terminal cleanup failure must return before any later retry branch", retry > terminalReturn)
 
-        assertCleanupFailureTerminatesBeforeStopped(source, "stopService", "return@launch")
-        assertCleanupFailureTerminatesBeforeStopped(source, "stopAndAlert", "return@runNonCancellableServiceCleanup")
+        assertCleanupFailureTerminatesThroughTerminalHandler(source, "stopService", "return@launch")
+        assertCleanupFailureTerminatesThroughTerminalHandler(source, "stopAndAlert", "return@runNonCancellableServiceCleanup")
     }
 
     @Test
@@ -782,7 +758,7 @@ class IcmpResilienceSourceGuardTest {
         )
         assertTrue(
             "service stop should gate duplicate stop requests with serviceStopJob?.isActive",
-            stopService.contains("if (serviceStopJob?.isActive == true && !vpnRevoked)"),
+            stopService.contains("if (serviceStopJob?.isActive == true)"),
         )
         assertTrue(
             "service stop should create a lazy stop coroutine job",
@@ -812,167 +788,61 @@ class IcmpResilienceSourceGuardTest {
     }
 
     @Test
-    fun `manual stop must cancel pending SERVICE_RECOVER alarm before terminal cleanup`() {
+    fun `manual stop cancels the one possible legacy SERVICE_RECOVER PendingIntent`() {
         val source = sourceFile("BoxService.kt")
         val stopService = functionBody(source, "stopService")
+        val cancel = stopService.indexOf("cancelLegacyProcessRecoveryAlarm()")
+        val stopGeneration = stopService.indexOf("val stopGeneration = cancelPendingStarts()")
 
-        val cancelCall = listOf(
-            stopService.indexOf("cancelProcessRecovery("),
-            stopService.indexOf("cancelProcessRecoveryAlarm("),
-            stopService.indexOf("cancelPendingProcessRecovery("),
-            stopService.indexOf("cancelRecoveryAlarm("),
-        ).firstOrNull { it >= 0 } ?: -1
-
-        assertTrue(
-            "manual stop must cancel pending SERVICE_RECOVER alarm before cleanup",
-            cancelCall >= 0 || stopService.contains("cancelServiceRecoveryAlarm("),
-        )
-        assertTrue(
-            "manual stop must invoke cancel for SERVICE_RECOVER path",
-            Regex("alarmManager\\.cancel\\s*\\(").containsMatchIn(source) ||
-                stopService.contains("cancelProcessRecovery(") ||
-                stopService.contains("cancelProcessRecoveryAlarm(") ||
-                stopService.contains("cancelPendingProcessRecovery(") ||
-                stopService.contains("cancelRecoveryAlarm(") ||
-                stopService.contains("cancelServiceRecoveryAlarm("),
-        )
-
-        if (cancelCall >= 0) {
-            assertTrue(
-                "canceling recovery alarm should happen before stop generation is finalized",
-                cancelCall < stopService.indexOf("val stopGeneration = cancelPendingStarts()"),
-            )
-        }
-        assertTrue(
-            "manual stop cancellation path should still move service to terminal cleanup",
-            stopService.contains("serviceScope.launch("),
-        )
+        assertTrue("manual stop must cancel an old leftover alarm", cancel >= 0)
+        assertTrue("legacy cancellation belongs before stop generation teardown", cancel < stopGeneration)
+        assertFalse("manual stop must never schedule recovery alarms", stopService.contains("scheduleProcessRecovery"))
     }
 
     @Test
-    fun `processRecoveryRequested onStartCommand should foreground-ack before early stopSelf branches`() {
+    fun `legacy SERVICE_RECOVER is cancellation-only and cannot cause replacement scheduling`() {
         val source = sourceFile("BoxService.kt")
         val onStart = functionBody(source, "onStartCommand")
-
-        val processRecoveryMarker = onStart.indexOf("if (processRecoveryRequested) {")
-        assertTrue("processRecoveryRequested branch should exist", processRecoveryMarker >= 0)
-        val processRecoveryHeaderEnd = onStart.indexOf(
-            "val restartedBySystem",
-            processRecoveryMarker + 1,
-        )
-        assertTrue("processRecoveryRequested branch should be before command parsing", processRecoveryHeaderEnd >= 0)
-        val activeRecoveryStart = Regex(
-            "if\\s*\\(\\s*processRecoveryRequested\\s*&&\\s*vpnServiceReplacementRequested\\s*&&\\s*shouldRestoreUserSession\\s*\\)",
-        ).find(onStart)?.range?.first ?: -1
-        assertTrue("active replacement path should exist", activeRecoveryStart >= 0)
-        val staleRecoveryStopBranchStart = Regex(
-            "else if\\s*\\(\\(\\s*restartedBySystem\\s*\\|\\|\\s*processRecoveryRequested\\)\\s*&&\\s*!connectFromNotification\\)",
-        ).find(onStart)?.range?.first ?: -1
-        assertTrue("stale restart path should exist", staleRecoveryStopBranchStart >= 0)
-
-        val recoveryAck = processRecoveryMarker + indexOfForegroundAcknowledgement(
-            onStart.substring(processRecoveryMarker, processRecoveryHeaderEnd),
-        )
-        assertTrue(
-            "processRecoveryRequested path should acknowledge foreground before early stopSelf/return",
-            recoveryAck >= processRecoveryMarker,
-        )
-
-        val activeRecoveryBranch = onStart.substring(activeRecoveryStart, staleRecoveryStopBranchStart)
-        val activeStop = activeRecoveryBranch.indexOf("service.stopSelf()")
-        assertTrue("active processRecoveryRequested branch should stop itself", activeStop >= 0)
-        val activeStopAbs = activeRecoveryStart + activeStop
-        val activeReturn = activeRecoveryBranch.indexOf("return Service.START_STICKY", activeStop)
-        assertTrue("active processRecoveryRequested branch should return sticky", activeReturn >= 0)
-        val activeReturnAbs = activeRecoveryStart + activeReturn
-        assertTrue(
-            "active processRecoveryRequested branch must acknowledge foreground before stopSelf/return",
-            recoveryAck >= processRecoveryMarker && recoveryAck < activeStopAbs && recoveryAck < activeReturnAbs,
-        )
-
-        val staleRecoveryBranch = onStart.substring(staleRecoveryStopBranchStart)
-        val staleStop = staleRecoveryBranch.indexOf("service.stopSelf()")
-        assertTrue("stale processRecoveryRequested branch should stop itself", staleStop >= 0)
-        val staleStopAbs = staleRecoveryStopBranchStart + staleStop
-        val staleReturn = staleRecoveryBranch.indexOf("return Service.START_NOT_STICKY", staleStop)
-        assertTrue("stale processRecoveryRequested branch should return not sticky", staleReturn >= 0)
-        val staleReturnAbs = staleRecoveryStopBranchStart + staleReturn
-        assertTrue(
-            "stale processRecoveryRequested branch must foreground-ack before stopSelf/return",
-            recoveryAck >= processRecoveryMarker && recoveryAck < staleStopAbs && recoveryAck < staleReturnAbs,
-        )
+        val marker = onStart.indexOf("if (processRecoveryRequested) {")
+        val cancellation = onStart.indexOf("cancelLegacyProcessRecoveryAlarm()", marker)
+        assertTrue(marker >= 0)
+        assertTrue(cancellation > marker)
+        assertFalse(onStart.contains("scheduleProcessRecovery"))
+        assertFalse(onStart.contains("startActivity("))
+        assertFalse(onStart.contains("disconnectServiceBinding"))
     }
 
     @Test
     fun `releaseStoppedPlatformService must unbind activity before stopping platform service`() {
         val source = File("src/main/kotlin/app/marten/client/MethodHandler.kt").readText()
         val releaseStoppedPlatformService = functionBody(source, "releaseStoppedPlatformService")
-
         val unbindIndex = releaseStoppedPlatformService.indexOf("mainActivity.disconnectServiceBinding()")
         val stopIndex = releaseStoppedPlatformService.indexOf(
             "appContext.stopService(Intent(appContext, Settings.serviceClass()))",
         )
 
-        assertTrue(
-            "releaseStoppedPlatformService must explicitly unbind MainActivity before stopping service",
-            unbindIndex >= 0,
-        )
-        assertTrue(
-            "releaseStoppedPlatformService must stop platform service using Settings.serviceClass intent",
-            stopIndex >= 0,
-        )
-        assertTrue(
-            "Activity binding must be released before stopService to avoid stale Samsung TUN ownership race",
-            stopIndex > unbindIndex,
-        )
+        assertTrue("release must explicitly unbind the activity", unbindIndex >= 0)
+        assertTrue("release must stop the configured platform service", stopIndex >= 0)
+        assertTrue("activity binding must be released before service teardown", unbindIndex < stopIndex)
     }
 
     @Test
-    fun `failed cleanup schedules service recovery before conditional stop and retains sticky fallback`() {
+    fun `failed cleanup enters exactly one fail-closed terminal transition without alarm or process kill`() {
         val source = sourceFile("BoxService.kt")
-        val replacement = functionBody(source, "replaceVpnServiceAfterCoreCleanupFailure")
-        assertFalse(
-            "BoxService must not include a hard process kill fallback",
-            replacement.contains("android.os.Process.killProcess"),
-        )
-        val recoveryScheduled = replacement.indexOf("val recoveryScheduled = restoreSession && scheduleProcessRecovery()")
-        val conditionalStop = replacement.indexOf("if (!restoreSession || recoveryScheduled)")
-        val stopSelf = replacement.indexOf("service.stopSelf()", conditionalStop)
-        val stickyFallback = replacement.indexOf("preserving sticky service ownership", conditionalStop)
-        val scheduler = replacement.indexOf("scheduleProcessRecovery()")
-
-        assertTrue(recoveryScheduled >= 0)
-        assertTrue(conditionalStop > recoveryScheduled)
-        assertTrue(stopSelf > conditionalStop)
-        assertTrue(stopSelf > scheduler)
-        assertTrue(stickyFallback >= 0)
-        assertTrue(stickyFallback > stopSelf)
-        assertTrue(scheduler >= recoveryScheduled)
-        val stickyBranch = replacement.substring(stickyFallback)
-        assertFalse("service stopSelf must stay out of sticky fallback branch", stickyBranch.contains("service.stopSelf()"))
-
-        val schedulerSource = functionBody(source, "scheduleProcessRecovery")
-        val pendingSource = functionBody(source, "processRecoveryPendingIntent")
-        val recoverAction = maxOf(
-            schedulerSource.indexOf("Action.SERVICE_RECOVER"),
-            pendingSource.indexOf("Action.SERVICE_RECOVER"),
-        )
-        val pendingIntentInSchedule = schedulerSource.indexOf("processRecoveryPendingIntent(")
-        val pendingIntent = maxOf(
-            schedulerSource.indexOf("PendingIntent.getForegroundService"),
-            schedulerSource.indexOf("PendingIntent.getService"),
-            pendingSource.indexOf("PendingIntent.getForegroundService"),
-            pendingSource.indexOf("PendingIntent.getService"),
-        )
-        val alarmManager = schedulerSource.indexOf("AlarmManager::class.java")
-        val alarm = schedulerSource.indexOf("alarmManager.setAndAllowWhileIdle")
-
-        assertTrue(recoverAction >= 0)
-        assertTrue("scheduleProcessRecovery should use the shared recovery PendingIntent helper", pendingIntentInSchedule >= 0)
-        assertTrue(pendingIntent >= 0)
-        assertTrue(pendingIntent > pendingIntentInSchedule)
-        assertTrue(alarmManager > pendingIntentInSchedule)
-        assertTrue(alarm > alarmManager)
+        val terminal = functionBody(source, "finishCoreCleanupFailure")
+        assertTrue(terminal.contains("terminalCoreCleanupFailurePublished"))
+        assertTrue(terminal.contains("Settings.startedByUser = false"))
+        assertTrue(terminal.contains("cancelLegacyProcessRecoveryAlarm()"))
+        assertTrue(terminal.contains("MobileCoreCloser.closeAsync(\"terminal core cleanup failure\")"))
+        assertTrue(terminal.contains("status.value = Status.Stopping"))
+        assertTrue(terminal.contains("retirePlatformVpnSessionAfterFailedCoreCleanup"))
+        assertTrue(terminal.contains("status.value = Status.Stopped"))
+        assertTrue(terminal.contains("notification.showStopped(activeProfileName)"))
+        assertTrue(terminal.contains("callback.onServiceAlert(Alert.StartService.ordinal, userMessage)"))
+        assertTrue(terminal.contains("service.stopSelf()"))
+        assertFalse(terminal.contains("scheduleProcessRecovery"))
+        assertFalse(terminal.contains("disconnectServiceBinding"))
+        assertFalse(source.contains("android.os.Process.killProcess"))
     }
 
     @Test
@@ -1030,25 +900,19 @@ class IcmpResilienceSourceGuardTest {
     }
 
     @Test
-    fun `initial startup failures are terminal while runtime recovery sites use request admission`() {
+    fun `route unavailability from every startup signal enters recovery admission rather than terminal Stop Close`() {
         val source = sourceFile("BoxService.kt")
-        val initialStartupSites = listOf(
+        val routeVerificationSignals = listOf(
             "startService",
             "startStoredCoreFromNativeEntryPoint",
+            "verifyAndMarkCoreRuntimeStarted",
+            "acknowledgeVerifiedRouteFromFlutter",
         )
-        initialStartupSites.forEach { name ->
+        routeVerificationSignals.forEach { name ->
             val body = functionBody(source, name)
-            assertTrue(
-                "$name must pass a failed startup data-plane probe into terminal Stop/Close",
+            assertFalse(
+                "$name must not convert transient route unavailability into terminal service stop",
                 body.contains("stopServiceOnRouteFailure = true"),
-            )
-            assertFalse(
-                "$name startup failure must not enter retry recovery",
-                body.contains("requestCoreRecovery("),
-            )
-            assertFalse(
-                "$name must not launch recovery directly",
-                body.contains("launchCoreRecovery("),
             )
         }
 
@@ -1064,6 +928,9 @@ class IcmpResilienceSourceGuardTest {
             assertFalse("$name must not bypass the recovery admission gate", body.contains("launchCoreRecovery("))
         }
 
+        val nativeProof = functionBody(source, "verifyNativeStartupRoute")
+        assertTrue("failed native route proof must use recovery admission", nativeProof.contains("requestCoreRecovery("))
+        assertFalse("native route proof must not bypass recovery admission", nativeProof.contains("launchCoreRecovery("))
         val request = functionBody(source, "requestCoreRecovery")
         assertTrue(request.contains("if (launchCoreRecovery(reason, generation)) return true"))
         assertTrue(request.contains("if (launchCoreRecovery(reason, generation)) {"))
@@ -1095,6 +962,130 @@ class IcmpResilienceSourceGuardTest {
     }
 
     @Test
+    fun `Android teardown has one MobileCoreCloser ownership path with no direct native stop`() {
+        val service = sourceFile("BoxService.kt")
+        val serviceWithoutLineComments = service
+            .lines()
+            .filter { !it.trimStart().startsWith("//") && !it.trimStart().startsWith("*") }
+            .joinToString("\n")
+        val closer = File("src/main/kotlin/app/marten/client/bg/MobileCoreCloser.kt").readText()
+
+        assertFalse(
+            "BoxService cleanup must not issue an uncoordinated Mobile.stop",
+            Regex("\\bMobile\\s*\\.\\s*stop\\s*\\(").containsMatchIn(serviceWithoutLineComments),
+        )
+        assertFalse(
+            "BoxService cleanup must not bypass the shared closer with Mobile.close",
+            Regex("\\bMobile\\s*\\.\\s*close\\s*\\(").containsMatchIn(serviceWithoutLineComments),
+        )
+        assertTrue(
+            "the one native close worker must be lifecycle-exclusive",
+            closer.contains("MobileCoreLifecycle.run") &&
+                closer.contains("Mobile.close(4L)"),
+        )
+        assertTrue(
+            "the close worker must own the blocking lifecycle bridge rather than callers",
+            closer.contains("runBlocking") &&
+                closer.indexOf("runBlocking") < closer.indexOf("MobileCoreLifecycle.run"),
+        )
+
+        listOf(
+            "finishCancelledStart",
+            "serviceReload0",
+            "closeFailedRecoveryRuntime",
+            "stopService",
+            "stopAndAlert",
+            "onDestroy",
+        ).forEach { cleanupPath ->
+            val body = functionBody(service, cleanupPath)
+            assertFalse(
+                "$cleanupPath must not hold MobileCoreLifecycle while awaiting native cleanup",
+                body.contains("MobileCoreLifecycle.run") &&
+                    body.contains("closeMobileCoreAndAwaitTunQuiescence("),
+            )
+        }
+    }
+
+    @Test
+    fun `manual stop seals and closes TUN before duplicate or revoke coalescing`() {
+        val stop = functionBody(sourceFile("BoxService.kt"), "stopService")
+        val seal = stop.indexOf("tunDescriptorAdmissionClosed = true")
+        val closeDescriptor = stop.indexOf("closeTunFileDescriptor()", seal)
+        val duplicateGuard = stop.indexOf("if (serviceStopJob?.isActive == true)")
+        val nativeCloseWait = stop.indexOf("closeMobileCoreAndAwaitTunQuiescence(")
+
+        assertTrue("stop must atomically seal TUN descriptor admission", seal >= 0)
+        assertTrue("manual stop must close the retained Android TUN descriptor eagerly", closeDescriptor > seal)
+        assertTrue("duplicate stop requests must join the service stop job", duplicateGuard > closeDescriptor)
+        assertTrue("TUN teardown must precede the eventual native close wait", nativeCloseWait > duplicateGuard)
+        assertFalse(
+            "VPN revoke must coalesce with the same stop job instead of spawning another teardown",
+            stop.contains("if (serviceStopJob?.isActive == true &&"),
+        )
+
+        val revoke = functionBody(sourceFile("BoxService.kt"), "onRevoke")
+        assertTrue("Android revoke must enter the common stop coordinator", revoke.contains("stopService(vpnRevoked = true)"))
+        assertFalse("revoke must not close native core directly", Regex("\\bMobile\\s*\\.").containsMatchIn(revoke))
+    }
+
+    @Test
+    fun `recovery joins bounded close before setup and never starts a second cleanup`() {
+        val service = sourceFile("BoxService.kt")
+        val recovery = functionBody(service, "recoverMobileCore")
+        val cleanupHelper = functionBody(service, "closeMobileCoreAndAwaitTunQuiescence")
+        val cleanup = recovery.indexOf("closeMobileCoreAndAwaitTunQuiescence(")
+        val closeWait = cleanupHelper.indexOf("MobileCoreCloser.closeBlocking")
+        val setup = recovery.indexOf("Mobile.setup(", cleanup)
+        val blockedSetup = recovery.indexOf("return@run false", cleanup)
+
+        assertTrue("recovery must wait on the shared close before starting setup", cleanup >= 0)
+        assertTrue("recovery cleanup must use the shared MobileCoreCloser", closeWait >= 0)
+        assertTrue("a failed or timed-out cleanup must block setup", blockedSetup > cleanup)
+        assertTrue("setup must remain after its cleanup admission gate", setup > blockedSetup)
+        assertEquals(
+            "one recovery attempt must have one ordered close/TUN cleanup barrier",
+            cleanup,
+            recovery.lastIndexOf("closeMobileCoreAndAwaitTunQuiescence(", setup),
+        )
+    }
+
+    @Test
+    fun `start close timeout publishes still stopping failure without a second close wait`() {
+        val start = functionBody(sourceFile("BoxService.kt"), "startService")
+        val wait = start.indexOf("MobileCoreCloser.waitForCloseToFinish(\"service start\")")
+        val failure = start.indexOf("finishCoreCleanupFailure(", wait)
+        val stillStopping = start.indexOf("R.string.error_connection_still_stopping", failure)
+        val returnAfterFailure = start.indexOf("return", stillStopping)
+
+        assertTrue("Connect must make one bounded wait for a prior native close", wait >= 0)
+        assertTrue("timeout must enter the terminal cleanup failure owner", failure > wait)
+        assertTrue("timeout must report that the connection is still stopping", stillStopping > failure)
+        assertTrue("timeout branch must return immediately after reporting failure", returnAfterFailure > stillStopping)
+
+        val timeoutBranch = start.substring(wait, returnAfterFailure)
+        assertFalse("timeout branch must not invoke a second alert cleanup", timeoutBranch.contains("stopAndAlert("))
+        assertFalse("timeout branch must not join another native close", timeoutBranch.contains("MobileCoreCloser.closeBlocking"))
+    }
+
+    @Test
+    fun `pending service cleanup timeout publishes still stopping failure without a second close`() {
+        val start = functionBody(sourceFile("BoxService.kt"), "startService")
+        val wait = start.indexOf("ServiceLifecycleOwnership.awaitPendingCleanup(serviceOwnerToken)")
+        val failure = start.indexOf("finishCoreCleanupFailure(", wait)
+        val stillStopping = start.indexOf("R.string.error_connection_still_stopping", failure)
+        val returnAfterFailure = start.indexOf("return", stillStopping)
+
+        assertTrue("Connect must use the ownership cleanup barrier", wait >= 0)
+        assertTrue("pending cleanup timeout must enter the terminal cleanup failure owner", failure > wait)
+        assertTrue("pending cleanup timeout must report that the connection is still stopping", stillStopping > failure)
+        assertTrue("pending cleanup timeout branch must return after reporting failure", returnAfterFailure > stillStopping)
+
+        val timeoutBranch = start.substring(wait, returnAfterFailure)
+        assertFalse("pending cleanup timeout must not invoke a second alert cleanup", timeoutBranch.contains("stopAndAlert("))
+        assertFalse("pending cleanup timeout must not join another native close", timeoutBranch.contains("MobileCoreCloser.closeBlocking"))
+    }
+
+    @Test
     fun `function body parser ignores braces in Kotlin lexical literals and comments`() {
         val source =
             "fun sample() {\n" +
@@ -1120,34 +1111,14 @@ class IcmpResilienceSourceGuardTest {
         return source.readText()
     }
 
-    private fun assertCleanupFailureTerminatesBeforeStopped(source: String, name: String, returnMarker: String) {
+    private fun assertCleanupFailureTerminatesThroughTerminalHandler(source: String, name: String, returnMarker: String) {
         val body = functionBody(source, name)
         val failureGuard = findCleanupFailureGuard(body)
-        val replacement = body.indexOf("replaceVpnServiceAfterCoreCleanupFailure(", failureGuard)
-        val failedReturn = body.indexOf(returnMarker, replacement)
-        val stopped = body.indexOf("status.value = Status.Stopped", failureGuard)
+        val terminalFailure = body.indexOf("finishCoreCleanupFailure(", failureGuard)
+        val failedReturn = body.indexOf(returnMarker, terminalFailure)
         assertTrue("$name must check close and TUN cleanup", failureGuard >= 0)
-        assertTrue("$name must invoke replacement helper on failed cleanup", replacement > failureGuard)
-        assertTrue("$name must return after failed cleanup", failedReturn > replacement)
-        assertTrue("$name must not publish Stopped before failed cleanup return", stopped > failedReturn)
-    }
-
-    private fun indexOfForegroundAcknowledgement(source: String): Int {
-        val directIndices = listOf(
-            source.indexOf("notification.show("),
-            source.indexOf("notification.showStopped("),
-            source.indexOf("notification.showStarted("),
-            source.indexOf("notification.showReconnecting("),
-            source.indexOf("notification.showRecovering("),
-            source.indexOf("startForeground("),
-            source.indexOf("startForegroundService("),
-        ).filter { it >= 0 }
-
-        if (directIndices.isNotEmpty()) {
-            return directIndices.minOrNull()!!
-        }
-        val helperMatch = Regex("\\b\\w*acknowledge\\w*\\(").find(source)
-        return helperMatch?.range?.first ?: -1
+        assertTrue("$name must invoke terminal fail-closed cleanup", terminalFailure > failureGuard)
+        assertTrue("$name must return after terminal cleanup admission", failedReturn > terminalFailure)
     }
 
     private fun findCleanupFailureGuard(body: String): Int {

@@ -385,6 +385,7 @@ class VpnReliabilitySourceGuardTest {
         val routeCheck = functionBody(service, "checkVpnDataPlaneRoute")
         val acknowledgement = functionBody(service, "acknowledgeVerifiedRouteFromFlutter")
         val retry = functionBody(service, "verifyNativeStartupRoute")
+        val recoveryPolicy = sourceFile("ServiceRecoveryPolicy.kt")
 
         val probe = routeCheck.indexOf("val result = vpnDataPlaneProbe.run(")
         val probeNetwork = routeCheck.indexOf("DefaultNetworkMonitor.defaultNetwork", probe)
@@ -396,14 +397,14 @@ class VpnReliabilitySourceGuardTest {
 
         val nativeRetry = acknowledgement.indexOf("val verified = verifyNativeStartupRoute(")
         val sameGeneration = acknowledgement.indexOf("generation = generation", nativeRetry)
-        val terminalFailure = acknowledgement.indexOf("stopServiceOnFailure = true", nativeRetry)
         val failClosed = acknowledgement.indexOf("if (!verified) return false", nativeRetry)
         val started = acknowledgement.indexOf("markCoreRuntimeStarted", failClosed)
         assertTrue("acknowledgement must use the bounded native VPN-proof retry", nativeRetry >= 0)
         assertTrue("acknowledgement retry must stay in the same lifecycle generation", sameGeneration > nativeRetry)
-        assertTrue("acknowledgement retry must preserve terminal failure cleanup", terminalFailure > sameGeneration)
-        assertTrue("failed retry must return before Started can be published", failClosed > terminalFailure && started > failClosed)
+        assertTrue("failed retry must return before Started can be published", failClosed > sameGeneration && started > failClosed)
         assertFalse("a failed GET must not admit Started directly", acknowledgement.contains("Status.Started"))
+        assertFalse("acknowledgement must not terminally stop a transient route failure", acknowledgement.contains("stopAndAlert(Alert.StartService"))
+        assertFalse("acknowledgement must not retain terminal route-stop control", acknowledgement.contains("stopServiceOnRouteFailure"))
 
         assertTrue("native retry must repeatedly perform the real VPN data-plane check", retry.contains("while (SystemClock.elapsedRealtime() < deadline)"))
         assertTrue(
@@ -414,8 +415,16 @@ class VpnReliabilitySourceGuardTest {
         )
         assertTrue("native retry must use bounded retry delay", retry.contains("delay(minOf(STARTUP_ROUTE_VERIFY_RETRY_MS, remainingMs))"))
         val exhausted = retry.indexOf("native startup route failed")
-        val stopAndAlert = retry.indexOf("stopAndAlert(Alert.StartService", exhausted)
-        assertTrue("retry exhaustion must still terminate the failed startup", exhausted >= 0 && stopAndAlert > exhausted)
+        val retryGate = retry.indexOf("shouldRetryFailedNativeStartup(", exhausted)
+        val recoveryRequest = retry.indexOf("requestCoreRecovery(", retryGate)
+        assertTrue("retry exhaustion must inspect whether this is still the current active session", retryGate > exhausted)
+        assertTrue("only an active current failed route is handed to recovery", recoveryRequest > retryGate)
+        assertTrue("stale or inactive route failure must be discarded", retry.contains("stale or inactive generation"))
+        assertFalse("retry exhaustion must not terminally stop the service", retry.contains("stopAndAlert(Alert.StartService"))
+        assertTrue(
+            "retry eligibility must require both active user intent and current generation",
+            recoveryPolicy.contains("): Boolean = !routeVerified && userSessionActive && startStillCurrent"),
+        )
     }
 
     @Test
@@ -437,21 +446,25 @@ class VpnReliabilitySourceGuardTest {
         val service = sourceFile("BoxService.kt")
         val cleanup = functionBody(service, "closeMobileCoreAndAwaitTunQuiescence")
 
-        val close = cleanup.indexOf("MobileCoreCloser.closeBlocking(reason)")
+        val admissionSealLock = cleanup.indexOf("synchronized(fileDescriptorLock)")
+        val admissionSeal = cleanup.indexOf("tunDescriptorAdmissionClosed = true", admissionSealLock)
         val sharedDeadline = Regex(
             "val\\s+releaseDeadlineElapsedRealtimeMs\\s*=\\s*SystemClock\\.elapsedRealtime\\s*\\(\\s*\\)\\s*\\+\\s*TUN_RELEASE_TIMEOUT_MS",
         ).find(cleanup)?.range?.first ?: -1
+        val descriptorClose = cleanup.indexOf("closeTunFileDescriptor()", sharedDeadline)
+        val close = cleanup.indexOf("MobileCoreCloser.closeBlocking(reason)")
         val nonStoppingGate = cleanup.indexOf("!serviceStopping")
         val retirement = cleanup.indexOf("retirePlatformVpnSessionAfterCoreStop", nonStoppingGate)
         val retirementDeadline = cleanup.indexOf("releaseDeadlineElapsedRealtimeMs", retirement + 1)
         val quiescence = Regex(
             "awaitTunRuntimeQuiescence\\s*\\(\\s*reason\\s*,\\s*serviceStopping\\s*,\\s*releaseDeadlineElapsedRealtimeMs\\s*,?\\s*\\)",
         ).find(cleanup)?.range?.first ?: -1
-        assertTrue("native close must finish before retirement", close >= 0 && nonStoppingGate > close)
+        assertTrue("cleanup must seal TUN admission before its shared release deadline", admissionSealLock >= 0 && admissionSeal > admissionSealLock)
         assertTrue(
-            "recovery cleanup must create its shared release deadline after native close",
-            sharedDeadline > close,
+            "the shared deadline must begin before descriptor/native close so a stuck close adds no new grace interval",
+            sharedDeadline > admissionSeal && descriptorClose > sharedDeadline && close > descriptorClose,
         )
+        assertTrue("native close must finish before retirement", nonStoppingGate > close)
         assertTrue(
             "framework retirement must receive the shared release deadline before strict quiescence",
             retirement > sharedDeadline && retirementDeadline in (retirement + 1 until quiescence),

@@ -8,15 +8,18 @@ import 'package:flutter/services.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
+import 'package:marten/core/app_info/app_info_provider.dart';
 import 'package:marten/core/localization/locale_extensions.dart';
 import 'package:marten/core/localization/locale_preferences.dart';
 import 'package:marten/core/localization/translations.dart';
 import 'package:marten/core/model/constants.dart';
+import 'package:marten/core/model/environment.dart';
 import 'package:marten/core/router/go_router/go_router_notifier.dart';
 import 'package:marten/core/router/go_router/helper/active_breakpoint_notifier.dart';
 import 'package:marten/core/theme/app_theme.dart';
 import 'package:marten/core/theme/theme_preferences.dart';
 import 'package:marten/features/app_update/notifier/app_update_notifier.dart';
+import 'package:marten/features/app_update/widget/play_in_app_update_listener.dart';
 import 'package:marten/features/captcha/widget/captcha_listener.dart';
 import 'package:marten/features/connection/notifier/connection_notifier.dart';
 import 'package:marten/features/connection/widget/connection_wrapper.dart';
@@ -71,7 +74,9 @@ class App extends HookConsumerWidget with WidgetsBindingObserver, PresLogger {
     final locale = ref.watch(localePreferencesProvider);
     final themeMode = ref.watch(themePreferencesProvider);
     final theme = AppTheme(themeMode, locale.preferredFontFamily);
-    final upgrader = ref.watch(upgraderProvider);
+    final appInfo = ref.watch(appInfoProvider).requireValue;
+    final usePlayInAppUpdate = PlatformUtils.isAndroid && appInfo.release == Release.googlePlay;
+    final upgrader = usePlayInAppUpdate ? null : ref.watch(upgraderProvider);
     final activeBreakpoint = Breakpoint(context).activeBreakpoint;
 
     ref.listen(foregroundProfilesUpdateNotifierProvider, (_, _) {});
@@ -103,13 +108,14 @@ class App extends HookConsumerWidget with WidgetsBindingObserver, PresLogger {
                   title: Constants.appName,
                   builder: (context, child) {
                     final theme = Theme.of(context);
-                    final wrappedChild = CaptchaListener(
-                      child: UpgradeAlert(
-                        upgrader: upgrader,
-                        navigatorKey: router.routerDelegate.navigatorKey,
-                        child: child ?? const SizedBox(),
-                      ),
-                    );
+                    final updateAwareChild = usePlayInAppUpdate
+                        ? PlayInAppUpdateListener(child: child ?? const SizedBox())
+                        : UpgradeAlert(
+                            upgrader: upgrader,
+                            navigatorKey: router.routerDelegate.navigatorKey,
+                            child: child ?? const SizedBox(),
+                          );
+                    final wrappedChild = CaptchaListener(child: updateAwareChild);
                     if (kDebugMode && _debugAccessibility) {
                       return AccessibilityTools(checkFontOverflows: true, child: wrappedChild);
                     }

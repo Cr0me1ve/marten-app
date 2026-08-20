@@ -61,6 +61,46 @@ void main() {
     expect(source, isNot(contains('ref.watch(coreRestartSignalProvider)')));
   });
 
+  test('reports bootstrap setup failures only while the same request remains active', () {
+    final cases = [
+      (requestAbortToken: 4, currentAbortToken: 4, manualDisconnectRequested: false, expected: true),
+      (requestAbortToken: 4, currentAbortToken: 5, manualDisconnectRequested: false, expected: false),
+      (requestAbortToken: 4, currentAbortToken: 4, manualDisconnectRequested: true, expected: false),
+      (requestAbortToken: 4, currentAbortToken: 5, manualDisconnectRequested: true, expected: false),
+    ];
+
+    for (final testCase in cases) {
+      expect(
+        shouldReportBootstrapSetupFailure(
+          requestAbortToken: testCase.requestAbortToken,
+          currentAbortToken: testCase.currentAbortToken,
+          manualDisconnectRequested: testCase.manualDisconnectRequested,
+        ),
+        testCase.expected,
+      );
+    }
+  });
+
+  test('bootstrap setup logs stale failures as context rather than Crashlytics errors', () {
+    final source = File('lib/features/connection/notifier/connection_notifier.dart').readAsStringSync();
+    final buildStart = source.indexOf('Stream<ConnectionStatus> build() async*');
+    final buildEnd = source.indexOf('\n  ConnectionRepository get _connectionRepo', buildStart);
+    expect(buildStart, isNonNegative);
+    expect(buildEnd, greaterThan(buildStart));
+    final build = source.substring(buildStart, buildEnd);
+    final setupStart = build.indexOf('await _connectionRepo.setup()');
+    final setupEnd = build.indexOf('ref.onDispose', setupStart);
+    expect(setupStart, isNonNegative);
+    expect(setupEnd, greaterThan(setupStart));
+    final setup = build.substring(setupStart, setupEnd);
+    final reportGuard = setup.indexOf('shouldReportBootstrapSetupFailure(');
+    final reportError = setup.indexOf('loggy.error("error setting up connection repository", l, stackTrace)');
+
+    expect(reportGuard, isNonNegative);
+    expect(reportError, greaterThan(reportGuard));
+    expect(setup, contains('loggy.info('));
+  });
+
   test('Android-selected-route startup failures are terminal and never delegated to recovery', () async {
     final t = await loadRuTranslations();
     const routeFailure = ConnectionFailure.unexpected('selected route failed startup connectivity check');

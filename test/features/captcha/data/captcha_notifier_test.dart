@@ -71,5 +71,24 @@ void main() {
       // verifies its public state after the ordered sequence.
       expect(notifier, isNotNull);
     });
+
+    test('manual lifecycle reset discards an old log generation but accepts the new generation', () async {
+      final notifier = container.read(captchaNotifierProvider.notifier)..arm(enabled: true);
+
+      await emit('MARTEN_TURNCOAT_CAPTCHA url=http://localhost:8765/captcha?generation=old');
+      expect(container.read(captchaNotifierProvider)?.url, contains('generation=old'));
+
+      // The exact old rolling buffer can be replayed while the previous gRPC
+      // stream is retiring. Reset must move the cursor past it, rather than
+      // letting a stale route re-open CAPTCHA on the replacement lifecycle.
+      notifier.reset();
+      core.runtimeLogController.add(List.unmodifiable(logs));
+      await Future<void>.delayed(Duration.zero);
+      notifier.arm(enabled: true);
+      expect(container.read(captchaNotifierProvider), isNull);
+
+      await emit('MARTEN_TURNCOAT_CAPTCHA url=http://localhost:8765/captcha?generation=current');
+      expect(container.read(captchaNotifierProvider)?.url, contains('generation=current'));
+    });
   });
 }

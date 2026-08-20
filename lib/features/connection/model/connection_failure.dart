@@ -6,6 +6,7 @@ import 'package:marten/features/settings/model/config_option_failure.dart';
 part 'connection_failure.freezed.dart';
 
 const missingProfileConfigFailureMessage = 'marten:profile-config-file-missing';
+const localCoreControlChannelFailureMessage = 'marten:local-core-control-channel-unavailable';
 
 @freezed
 sealed class ConnectionFailure with _$ConnectionFailure, Failure {

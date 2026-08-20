@@ -8,6 +8,7 @@ import 'package:marten/core/device/device_identity.dart';
 import 'package:marten/core/model/directories.dart';
 import 'package:marten/core/utils/exception_handler.dart';
 import 'package:marten/features/captcha/data/captcha_notifier.dart';
+import 'package:marten/features/connection/data/native_resume_config_synchronizer.dart';
 import 'package:marten/features/connection/data/turncoat_liveness_notifier.dart';
 import 'package:marten/features/connection/model/connection_failure.dart';
 import 'package:marten/features/connection/model/connection_status.dart';
@@ -22,7 +23,6 @@ import 'package:marten/singbox/model/singbox_config_option.dart';
 import 'package:marten/utils/utils.dart';
 import 'package:meta/meta.dart';
 import 'package:rxdart/rxdart.dart';
-import 'package:uuid/uuid.dart';
 
 abstract interface class ConnectionRepository {
   SingboxConfigOption? get configOptionsSnapshot;
@@ -32,7 +32,7 @@ abstract interface class ConnectionRepository {
   Future<CoreStatus?> readPlatformServiceStatus();
   Future<int?> tryBeginFlutterRestart();
   Future<void> endFlutterRestart(int token);
-  Future<bool> initializeStoppedPlatformStatus();
+  Future<bool> initializePassivePlatformStatus();
 
   TaskEither<ConnectionFailure, Unit> setup();
   Stream<ConnectionStatus> watchConnectionStatus();
@@ -52,6 +52,7 @@ class ConnectionRepositoryImpl with ExceptionHandler, InfraLogger implements Con
     required this.configOptionRepository,
     required this.profilePathResolver,
     required this.readDeviceIdentity,
+    required this.nativeResumeConfigSynchronizer,
   }) {
     ref.onDispose(_startupRouteReadyController.close);
   }
@@ -64,6 +65,7 @@ class ConnectionRepositoryImpl with ExceptionHandler, InfraLogger implements Con
   final ConfigOptionRepository configOptionRepository;
   final ProfilePathResolver profilePathResolver;
   final Future<DeviceIdentity> Function() readDeviceIdentity;
+  final NativeResumeConfigSynchronizer nativeResumeConfigSynchronizer;
 
   SingboxConfigOption? _configOptionsSnapshot;
   @override
@@ -88,7 +90,7 @@ class ConnectionRepositoryImpl with ExceptionHandler, InfraLogger implements Con
   Future<void> endFlutterRestart(int token) => singbox.endFlutterRestart(token);
 
   @override
-  Future<bool> initializeStoppedPlatformStatus() => singbox.initializeStoppedPlatformStatus();
+  Future<bool> initializePassivePlatformStatus() => singbox.initializePassivePlatformStatus();
 
   bool _initialized = false;
   Future<void> _connectionOperation = Future.value();
@@ -107,27 +109,46 @@ class ConnectionRepositoryImpl with ExceptionHandler, InfraLogger implements Con
 
   @override
   TaskEither<ConnectionFailure, Unit> setup() {
-    if (_initialized || singbox.core.isInitialized()) {
-      _initialized = true;
-      return TaskEither.of(unit);
-    }
-    return exceptionHandler(() {
-      loggy.debug("setting up singbox");
+    return TaskEither(() async {
+      final platformStatus = Platform.isAndroid ? await singbox.readPlatformServiceStatus() : null;
+      if (!shouldRunConnectionRepositorySetup(
+        isAndroid: Platform.isAndroid,
+        repositoryInitialized: _initialized,
+        coreInitialized: singbox.core.isInitialized(),
+        platformStatus: platformStatus,
+      )) {
+        _initialized = true;
+        return right(unit);
+      }
 
-      return singbox
-          .setup()
-          .map((r) {
-            _initialized = true;
-            return r;
-          })
-          .mapLeft(UnexpectedConnectionFailure.new)
-          .run();
-    }, UnexpectedConnectionFailure.new);
+      return exceptionHandler(() {
+        loggy.debug("setting up singbox");
+
+        return singbox
+            .setup()
+            .map((r) {
+              _initialized = true;
+              return r;
+            })
+            .mapLeft(UnexpectedConnectionFailure.new)
+            .run();
+      }, UnexpectedConnectionFailure.new).run();
+    });
   }
 
   @override
   Stream<ConnectionStatus> watchConnectionStatus() {
-    final coreStatus = singbox.watchStatus().doOnData((event) {
+    final runtimeStatus = singbox.watchStatus();
+    final resilientRuntimeStatus = Platform.isAndroid
+        ? runtimeStatus.handleError((Object error, StackTrace stackTrace) {
+            // Android's VpnService owns lifecycle and recovery. Its status
+            // stream remains authoritative while the local gRPC shell is
+            // being stopped/recreated, so a transient runtime-stream failure
+            // must not terminate the user-visible connection stream.
+            loggy.warning('ignoring Android runtime status stream error while platform service owns lifecycle', error);
+          })
+        : runtimeStatus;
+    final coreStatus = resilientRuntimeStatus.doOnData((event) {
       if (Platform.isAndroid) {
         if (androidRouteGateReset(event) case final ready?) _setStartupRouteReady(ready);
       } else {
@@ -152,6 +173,12 @@ class ConnectionRepositoryImpl with ExceptionHandler, InfraLogger implements Con
 
     final platformStatus = singbox
         .watchPlatformServiceStatus()
+        .handleError((Object error, StackTrace stackTrace) {
+          // Retain the last service-owned state until EventChannel recovers.
+          // Propagating this transport error would turn an active native
+          // recovery into AsyncError/Disconnected in the Flutter UI.
+          loggy.warning('ignoring transient Android platform status stream error', error);
+        })
         .doOnData((event) {
           final transition = nativeRecoveryRouteGateTransition(
             previous: _lastObservedPlatformStatus,
@@ -169,8 +196,8 @@ class ConnectionRepositoryImpl with ExceptionHandler, InfraLogger implements Con
       coreStatus,
       _startupRouteReadyController.stream,
       platformStatus,
-      (core, routeReady, _) => connectionStatusFromCore(core, routeReady),
-    ).distinct();
+      (_, routeReady, platform) => connectionStatusFromAndroidPlatform(platform, routeReady),
+    );
   }
 
   @override
@@ -247,62 +274,8 @@ class ConnectionRepositoryImpl with ExceptionHandler, InfraLogger implements Con
 
   @override
   TaskEither<ConnectionFailure, Unit> syncNativeResumeConfig(ProfileEntity? activeProfile) {
-    if (!Platform.isAndroid) return TaskEither.of(unit);
-    return TaskEither.tryCatch(() async {
-      final generation = _connectionGeneration;
-
-      if (activeProfile == null) {
-        if (_isConnectionStale(generation)) return unit;
-        final cleared = await singbox.clearNativeResumeConfig();
-        if (!cleared) throw const ConnectionFailure.unexpected('failed to clear native resume config');
-        loggy.info('cleared native resume config because there is no active profile');
-        return unit;
-      }
-
-      final encFile = profilePathResolver.file(activeProfile.id);
-      final decFile = profilePathResolver.tempFile('${activeProfile.id}_native_resume_${const Uuid().v4()}');
-      try {
-        if (!await encFile.exists()) {
-          throw const ConnectionFailure.invalidConfig(missingProfileConfigFailureMessage);
-        }
-        final deviceIdentity = await readDeviceIdentity();
-        if (_isConnectionStale(generation)) return unit;
-        try {
-          await ProfileCrypto.decryptToTemp(encFile, decFile, deviceIdentity.clientSecret);
-        } catch (error) {
-          if (!ProfileCrypto.isMissingFileError(error)) rethrow;
-          throw const ConnectionFailure.invalidConfig(missingProfileConfigFailureMessage);
-        }
-        if (_isConnectionStale(generation)) return unit;
-
-        final rawConfig = await decFile.readAsString();
-        final coreConfig = ProfileParser.stripMartenSubscriptionMetadata(rawConfig);
-        final tags = selectableOutboundTagsFromConfig(coreConfig);
-        final selectedTag = _selectedOutboundTag(activeProfile, tags);
-        final preparedConfig = selectedTag == null
-            ? coreConfig
-            : prepareConfigForSelectedOutbound(coreConfig, selectedTag);
-        await decFile.writeAsString(preparedConfig, flush: true);
-        await _stripNativeStartMetadata(decFile);
-        if (_isConnectionStale(generation)) return unit;
-
-        final stored = await singbox.storeNativeResumeConfig(
-          decFile.path,
-          _notificationDisplayName(activeProfile, selectedTag),
-        );
-        if (!stored) throw const ConnectionFailure.unexpected('failed to store native resume config');
-        loggy.info('synchronized native resume config for the active profile');
-        return unit;
-      } catch (error, stackTrace) {
-        if (!_isConnectionStale(generation)) {
-          final cleared = await singbox.clearNativeResumeConfig();
-          if (!cleared) loggy.warning('failed to clear stale native resume config after sync failure');
-        }
-        Error.throwWithStackTrace(error, stackTrace);
-      } finally {
-        if (await decFile.exists()) await decFile.delete();
-      }
-    }, (err, st) => err is ConnectionFailure ? err : ConnectionFailure.unexpected(err, st));
+    final generation = _connectionGeneration;
+    return nativeResumeConfigSynchronizer.synchronize(activeProfile, isCurrent: () => !_isConnectionStale(generation));
   }
 
   @override
@@ -482,11 +455,17 @@ class ConnectionRepositoryImpl with ExceptionHandler, InfraLogger implements Con
           _resetStaleConnectionFeatures();
           return unit;
         }
+        singbox.beginManualBackgroundLifecycle();
+        _resetTurncoatFeatures();
+        _armTurncoatFeatures(selected.usesTurncoat, selectedTag: selected.tag);
         _activeStartupEndpoint = selected.startupEndpoint;
         _setStartupRouteReady(false);
         final startupRoute = selected.tag ?? 'prepared route';
         try {
-          final result = await action(actionConfigFile.path, _notificationDisplayName(profile, selected.tag)).run();
+          final result = await action(
+            actionConfigFile.path,
+            notificationDisplayNameForSelectedOutbound(profile, selected.tag),
+          ).run();
           if (_isConnectionStale(generation)) {
             await _stopStaleConnectionOperation(generation);
             return unit;
@@ -655,11 +634,6 @@ class ConnectionRepositoryImpl with ExceptionHandler, InfraLogger implements Con
     await preparedConfig.writeAsString(stripped, flush: true);
   }
 
-  String _notificationDisplayName(ProfileEntity profile, String? selectedTag) {
-    final selectedName = selectedTag == null ? '' : stripTagMetadata(selectedTag).trim();
-    return selectedName.isEmpty ? profile.name : selectedName;
-  }
-
   String? _selectedOutboundTag(ProfileEntity profile, List<String> tags) {
     if (tags.isEmpty) return null;
     return resolveSelectedOutboundTag(
@@ -679,7 +653,6 @@ class ConnectionRepositoryImpl with ExceptionHandler, InfraLogger implements Con
   ) async {
     if (selectedTag == null) {
       await decFile.writeAsString(coreRaw);
-      _armTurncoatFeatures(false, selectedTag: null);
       return (tag: null, usesTurncoat: false, startupEndpoint: null);
     }
 
@@ -687,7 +660,6 @@ class ConnectionRepositoryImpl with ExceptionHandler, InfraLogger implements Con
     await decFile.writeAsString(prepared);
     final usesTurncoat = selectedOutboundUsesTurncoat(prepared, selectedTag);
     final startupEndpoint = selectedStartupEndpointProbe(rawWithMetadata, selectedTag);
-    _armTurncoatFeatures(usesTurncoat, selectedTag: selectedTag);
     await ref.read(selectedProxyByProfileProvider.notifier).select(profile.id, selectedTag, availableTags: tags);
     ref.read(pendingProxySelectionProvider.notifier).selected = selectedTag;
     return (tag: selectedTag, usesTurncoat: usesTurncoat, startupEndpoint: startupEndpoint);
@@ -922,7 +894,12 @@ class CoalescedFuture<T> {
 
 @visibleForTesting
 T requireCoreOperationSuccess<T>(Either<String, T> result, {required String operation}) {
-  return result.match((error) => throw ConnectionFailure.unexpected('$operation failed: $error'), (value) => value);
+  return result.match(
+    (error) => throw error == localCoreControlChannelFailureMessage
+        ? const ConnectionFailure.backgroundCoreNotAvailable()
+        : ConnectionFailure.unexpected('$operation failed: $error'),
+    (value) => value,
+  );
 }
 
 enum _ConnectionIntent { start, stop }
@@ -1058,6 +1035,19 @@ ConnectionStatus connectionStatusFromCore(CoreStatus event, bool startupRouteRea
   };
 }
 
+/// Android's service status is the lifecycle authority. `Started` is still
+/// held behind Flutter's current-generation route gate for cold attach, but a
+/// stale or unavailable local gRPC snapshot can never contradict the service.
+@visibleForTesting
+ConnectionStatus connectionStatusFromAndroidPlatform(CoreStatus platform, bool startupRouteReady) {
+  return switch (platform) {
+    CoreStopped() => Disconnected(platform.getCoreAlert()),
+    CoreStarting() => const Connecting(),
+    CoreStarted() => startupRouteReady ? const Connected() : const Connecting(),
+    CoreStopping() => const Disconnecting(),
+  };
+}
+
 /// Android's runtime core stream describes lifecycle, not route admission, so
 /// it may only close this gate. Native recovery reopens it separately when the
 /// platform service publishes Started after its explicit VPN Network proof.
@@ -1067,6 +1057,20 @@ bool? androidRouteGateReset(CoreStatus current) {
     CoreStarting() || CoreStopping() || CoreStopped() => false,
     CoreStarted() => null,
   };
+}
+
+@visibleForTesting
+bool shouldRunConnectionRepositorySetup({
+  required bool isAndroid,
+  required bool repositoryInitialized,
+  required bool coreInitialized,
+  required CoreStatus? platformStatus,
+}) {
+  // A service-owned Android Stop closes the process-wide mobile core and its
+  // foreground gRPC control shell. Dart client objects remain initialized,
+  // but they point at closed ports and cannot be reused by the next Connect.
+  if (isAndroid && platformStatus is CoreStopped) return true;
+  return !repositoryInitialized && !coreInitialized;
 }
 
 @visibleForTesting

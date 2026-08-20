@@ -1,3 +1,4 @@
+import 'package:dio/dio.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:marten/features/profile/data/profile_data_providers.dart';
 import 'package:marten/features/profile/data/profile_parser.dart';
@@ -24,6 +25,7 @@ class ProfileAutoUpdateService with AppLogger {
     bool force = false,
     DateTime? now,
     bool validate = true,
+    CancelToken? cancelToken,
   }) async {
     final profilesRepo = await _ref.read(profileRepositoryProvider.future);
     final remoteProfiles = await profilesRepo
@@ -41,7 +43,14 @@ class ProfileAutoUpdateService with AppLogger {
 
     final results = <ProfileAutoUpdateResult>[];
     await for (final profile in Stream.fromIterable(remoteProfiles)) {
-      final result = await updateProfile(profile.id, force: force, now: now, validate: validate);
+      if (cancelToken?.isCancelled ?? false) break;
+      final result = cancelToken == null
+          ? await updateProfile(profile.id, force: force, now: now, validate: validate)
+          : await _performProfileUpdate(profile.id, (
+              force: force,
+              now: now,
+              validate: validate,
+            ), cancelToken: cancelToken);
       if (result != null) results.add(result);
     }
     return results;
@@ -78,7 +87,11 @@ class ProfileAutoUpdateService with AppLogger {
     }
   }
 
-  Future<ProfileAutoUpdateResult?> _performProfileUpdate(String id, ProfileRefreshRequest request) async {
+  Future<ProfileAutoUpdateResult?> _performProfileUpdate(
+    String id,
+    ProfileRefreshRequest request, {
+    CancelToken? cancelToken,
+  }) async {
     final profilesRepo = await _ref.read(profileRepositoryProvider.future);
     final profileResult = await profilesRepo.getById(id).run();
     final profile = profileResult.getOrElse((failure) {
@@ -93,7 +106,9 @@ class ProfileAutoUpdateService with AppLogger {
       return (id: profile.id, name: profile.name, outcome: ProfileAutoUpdateOutcome.skipped, failure: null);
     }
 
-    final result = await profilesRepo.upsertRemote(profile.url, validate: request.validate).run();
+    final result = await profilesRepo
+        .upsertRemote(profile.url, validate: request.validate, cancelToken: cancelToken)
+        .run();
     return result.match(
       (failure) {
         _logRefreshFailure(phase: 'download_or_persist', failure: failure);

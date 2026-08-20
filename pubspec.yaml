@@ -1,7 +1,7 @@
 name: marten
 description: Cross-platform multi-protocol network client.
 publish_to: "none"
-version: 0.7.9+709
+version: 0.7.11+711
 
 environment:
   sdk: ^3.10.4
@@ -81,6 +81,8 @@ dependencies:
   fluentui_system_icons: ^1.1.229
   json_path: ^0.7.1
   in_app_review: ^2.0.10
+  # Official Google Play Core in-app update flow for google-play builds.
+  in_app_update: ^4.2.5
   fixnum: ^1.1.0
   grpc: ^4.0.1
   # # for using protobuf install protoc from this link -> https://github.com/protocolbuffers/protobuf/releases
@@ -114,7 +116,7 @@ dependencies:
   # Web platform not supported
   # platform-specific settings
   humanizer: ^3.0.1
-  workmanager: ^0.9.0+3
+  workmanager: 0.10.7
   firebase_core: ^4.9.0
   firebase_crashlytics: ^5.2.6
   firebase_messaging: ^16.2.2

@@ -1,4 +1,3 @@
-import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/services.dart';
@@ -6,6 +5,25 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:marten/martencore/core_interface/core_interface.dart';
 import 'package:marten/martencore/core_interface/core_interface_mobile.dart';
 import 'package:marten/singbox/model/core_status.dart';
+
+String _functionBlock(String source, String signature) {
+  final start = source.indexOf(signature);
+  if (start < 0) return '';
+  final open = source.indexOf('{', start);
+  if (open < 0) return '';
+
+  var depth = 0;
+  for (var index = open; index < source.length; index++) {
+    final character = source[index];
+    if (character == '{') {
+      depth++;
+    } else if (character == '}') {
+      depth--;
+      if (depth == 0) return source.substring(open + 1, index);
+    }
+  }
+  return '';
+}
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -123,7 +141,18 @@ void main() {
     final setupBackground = start < 0 || end < 0 ? '' : source.substring(start, end);
 
     expect(setupBackground, isNotEmpty);
-    expect(setupBackground, contains('final platformStatus = await readPlatformServiceStatus();'));
+    expect(setupBackground, contains('var platformStatus = await readPlatformServiceStatus();'));
+    final mismatchCleanup = setupBackground.indexOf('if (Platform.isAndroid && !configIdentityMatches) {');
+    final refreshedPlatformStatus = setupBackground.indexOf(
+      'platformStatus = await readPlatformServiceStatus();',
+      mismatchCleanup,
+    );
+    expect(mismatchCleanup, isNonNegative);
+    expect(
+      refreshedPlatformStatus,
+      greaterThan(mismatchCleanup),
+      reason: 'an authoritative config-mismatch stop must not reuse its pre-stop platform snapshot',
+    );
     expect(setupBackground, contains('final shouldProbeExisting = shouldProbeExistingBackgroundCoreForManualStart('));
     expect(setupBackground, contains('backgroundChannelKnownAvailable: _isBgClientAvailable'));
     expect(setupBackground, contains('_BackgroundCoreEndpoint? attachedExisting;'));
@@ -140,6 +169,67 @@ void main() {
     expect(setupBackground, contains('final lateAttached = await _attachExistingBackgroundCore('));
     expect(setupBackground, contains('if (lateAttached != null) {'));
     expect(setupBackground, contains('return BackgroundCoreSetupResult.attached(lateAttached.status);'));
+  });
+
+  test('manual Android attach proves runtime config identity before it reuses a live core', () {
+    final source = File('lib/martencore/core_interface/core_interface_mobile.dart').readAsStringSync();
+    final setup = _functionBlock(source, 'Future<BackgroundCoreSetupResult> setupBackground(');
+    final liveAttach = setup.indexOf('if (attachedExisting?.status case CoreStarting() || CoreStarted()) {');
+    final attachedReturn = setup.indexOf(
+      'return BackgroundCoreSetupResult.attached(attachedExisting.status);',
+      liveAttach,
+    );
+    final identityMatch = RegExp(
+      '(?:matches|match)[A-Za-z]*(?:[Cc]onfig|[Rr]untime|[Ff]ingerprint)|'
+      '(?:[Cc]onfig|[Rr]untime|[Ff]ingerprint)[A-Za-z]*(?:matches|match)',
+    ).firstMatch(setup.substring(liveAttach));
+
+    expect(liveAttach, isNonNegative);
+    expect(attachedReturn, greaterThan(liveAttach));
+    expect(identityMatch, isNotNull, reason: 'a live core must prove its prepared-route identity before reuse');
+    final identityOffset = liveAttach + identityMatch!.start;
+    expect(identityOffset, lessThan(attachedReturn));
+
+    // A core that owns a different prepared route is not attachable. The
+    // authoritative platform stop owns TURNcoat's terminal close; after that
+    // setup may start a fresh generation but must never return Attached first.
+    final replacementStop = setup.indexOf('await stop()', identityOffset);
+    expect(replacementStop, greaterThan(identityOffset));
+    expect(replacementStop, greaterThanOrEqualTo(attachedReturn));
+  });
+
+  test('Android control-session refresh uses the exact current background port without lifecycle side effects', () {
+    final interface = File('lib/martencore/core_interface/core_interface.dart').readAsStringSync();
+    final mobile = File('lib/martencore/core_interface/core_interface_mobile.dart').readAsStringSync();
+    const signature = 'Future<CoreStatus?> refreshBackgroundControlSession(int expectedGeneration)';
+    final refreshStart = mobile.indexOf('$signature async {');
+    final refreshEnd = mobile.indexOf('\n  Future<HelloResponse> _waitForMartenCore', refreshStart + signature.length);
+    final refresh = refreshStart < 0 || refreshEnd < 0 ? '' : mobile.substring(refreshStart, refreshEnd);
+    final platformOwnership = _functionBlock(mobile, 'bool _platformOwnsCurrentBackgroundLifecycle(');
+    final statusOnClient = _functionBlock(mobile, 'Future<CoreStatus?> _coreStatusOnClient(');
+    final replaceObservation = _functionBlock(mobile, 'void _replaceBackgroundObservationClient(');
+
+    expect(interface, contains('int get backgroundLifecycleGeneration'));
+    expect(interface, contains('CoreClient get backgroundControlClient'));
+    expect(interface, contains(signature));
+    expect(refresh, isNotEmpty);
+    expect(platformOwnership, contains('CoreStarting'));
+    expect(platformOwnership, contains('CoreStarted'));
+    expect(refresh, contains('_backgroundLifecycleGeneration'));
+    expect(refresh, contains('_platformOwnsCurrentBackgroundLifecycle'));
+    expect(refresh, contains('_portBack'));
+    expect(refresh, contains('CoreClient('));
+    expect(refresh, contains('_coreStatusOnClient(controlClient)'));
+    expect(statusOnClient, contains('client\n          .coreInfoListener'));
+    expect(refresh, contains('backgroundControlClient'));
+    expect(refresh, contains('_replaceBackgroundObservationClient(observationChannel)'));
+    expect(replaceObservation, contains('bgClient = CoreClient(channel)'));
+    expect(refresh, isNot(contains('Future.delayed')));
+    expect(refresh, isNot(contains('_selectAvailablePort')));
+    expect(refresh, isNot(contains('_invokeBackgroundStart')));
+    expect(refresh, isNot(contains('setupBackground(')));
+    expect(refresh, isNot(contains('await stop(')));
+    expect(refresh, isNot(contains('isPortOpen(')));
   });
 
   group('BackgroundCoreSetupResult.fromStatus', () {
@@ -209,7 +299,7 @@ void main() {
 
     expect(seconds, isNotNull);
     expect(
-      seconds!,
+      seconds,
       greaterThanOrEqualTo(75),
       reason: 'Dart must stay attached for the complete bounded native TURNcoat retry window',
     );
@@ -233,7 +323,7 @@ void main() {
     messenger.setMockMethodCallHandler(CoreInterfaceMobile.methodChannel, (call) async {
       expect(call.method, 'stop');
       stopCalls++;
-      return stopCalls == 1 ? false : true;
+      return stopCalls != 1;
     });
 
     expect(await CoreInterfaceMobile().stop(), isTrue);
@@ -252,7 +342,7 @@ void main() {
     expect(stopCalls, 2);
 
     stopCalls = 0;
-    messenger.setMockMethodCallHandler(CoreInterfaceMobile.methodChannel, (call) async {
+    messenger.setMockMethodCallHandler(CoreInterfaceMobile.methodChannel, (call) {
       stopCalls++;
       return null;
     });
@@ -262,7 +352,7 @@ void main() {
 
   test('a platform stop exception never reconciles or reports a successful disconnect', () async {
     var stopCalls = 0;
-    messenger.setMockMethodCallHandler(CoreInterfaceMobile.methodChannel, (call) async {
+    messenger.setMockMethodCallHandler(CoreInterfaceMobile.methodChannel, (call) {
       stopCalls++;
       throw PlatformException(code: 'stop_failed');
     });

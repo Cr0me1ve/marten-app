@@ -21,7 +21,7 @@ void main() {
   });
 
   test(
-    'Dart Started acknowledgement stays attached for the bounded native TURNcoat retry and final in-flight proof',
+    'Dart Started acknowledgement stays attached for the bounded native TURNcoat retry and hands route unavailability to recovery',
     () async {
       final mobileInterface = await File('lib/martencore/core_interface/core_interface_mobile.dart').readAsString();
       final nativeProbe = await File(
@@ -29,6 +29,9 @@ void main() {
       ).readAsString();
       final probePolicy = await File(
         'android/app/src/main/kotlin/app/marten/client/bg/VpnDataPlaneProbePolicy.kt',
+      ).readAsString();
+      final recoveryPolicy = await File(
+        'android/app/src/main/kotlin/app/marten/client/bg/ServiceRecoveryPolicy.kt',
       ).readAsString();
       final boxService = await File('android/app/src/main/kotlin/app/marten/client/bg/BoxService.kt').readAsString();
       final retry = functionBody(boxService, 'private suspend fun verifyNativeStartupRoute(');
@@ -43,7 +46,16 @@ void main() {
       expect(probePolicy, contains('internal const val STANDARD_VPN_DATA_PLANE_ATTEMPT_TIMEOUT_MS = 4_000L'));
       expect(probePolicy, contains('internal const val TURNCOAT_VPN_DATA_PLANE_ATTEMPT_TIMEOUT_MS = 30_000L'));
       expect(probePolicy, contains('minOf(preferred, remainingBudgetMs.coerceAtLeast(1L))'));
-      expect(retry, contains('stopAndAlert(Alert.StartService'));
+      expect(retry, contains('shouldRetryFailedNativeStartup('));
+      expect(retry, contains('requestCoreRecovery('));
+      expect(retry, contains('discarding failed native startup route for stale or inactive generation'));
+      expect(retry, isNot(contains('stopAndAlert(Alert.StartService')));
+      expect(retry, isNot(contains('stopServiceOnRouteFailure')));
+      expect(
+        recoveryPolicy,
+        contains('): Boolean = !routeVerified && userSessionActive && startStillCurrent'),
+        reason: 'only an unverified current user-owned generation may be handed to retry recovery',
+      );
       expect(
         mobileInterface,
         contains('static const _platformStartedSyncTimeout = Duration(seconds: 115);'),

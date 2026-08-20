@@ -44,6 +44,11 @@ internal fun shouldStreamDynamicNotificationUpdates(
 ): Boolean =
     dynamicNotificationEnabled && notificationPermissionGranted && deviceInteractive
 
+internal fun shouldPublishDynamicNotificationUpdate(
+    platformStatus: Status?,
+    gatePermitsUpdate: Boolean,
+): Boolean = gatePermitsUpdate && platformStatus == Status.Started
+
 internal class NotificationUpdateGate {
     private val streamingGeneration = AtomicLong()
 
@@ -328,7 +333,12 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
             while (currentCoroutineContext().isActive) {
                 val current = source.read() ?: return
                 withContext(Dispatchers.Main.immediate) {
-                    if (notificationUpdateGate.permitsUpdate(streamGeneration)) {
+                    if (
+                        shouldPublishDynamicNotificationUpdate(
+                            platformStatus = status.value,
+                            gatePermitsUpdate = notificationUpdateGate.permitsUpdate(streamGeneration),
+                        )
+                    ) {
                         updateStatus(previous, current)
                     }
                 }

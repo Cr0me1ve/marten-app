@@ -16,7 +16,6 @@ import android.os.SystemClock
 import app.marten.core.libbox.InterfaceUpdateListener
 import app.marten.core.libbox.Notification
 import app.marten.core.libbox.StringIterator
-import app.marten.client.constant.PerAppProxyMode
 import app.marten.client.crashreporting.NativeCrashDiagnostics
 import app.marten.client.ktx.toIpPrefix
 import app.marten.core.libbox.TunOptions
@@ -109,6 +108,29 @@ class VPNService : VpnService(), PlatformInterfaceWrapper {
         releaseDeadlineElapsedRealtimeMs: Long =
             SystemClock.elapsedRealtime() + PLATFORM_VPN_RETIREMENT_TIMEOUT_MS,
         retirementAllowed: () -> Boolean = { true },
+    ): Boolean = retirePlatformVpnSession(
+        releaseDeadlineElapsedRealtimeMs,
+        retirementAllowed,
+    )
+
+    /**
+     * Fail-closed escape hatch for a native cleanup that missed its deadline.
+     * Replacing the framework VPN with the same no-route retirement interface
+     * immediately removes the stale data plane while the one native close
+     * operation is allowed to finish in the background.
+     */
+    internal suspend fun retirePlatformVpnSessionAfterFailedCoreCleanup(
+        releaseDeadlineElapsedRealtimeMs: Long =
+            SystemClock.elapsedRealtime() + PLATFORM_VPN_RETIREMENT_TIMEOUT_MS,
+        retirementAllowed: () -> Boolean = { true },
+    ): Boolean = retirePlatformVpnSession(
+        releaseDeadlineElapsedRealtimeMs,
+        retirementAllowed,
+    )
+
+    private suspend fun retirePlatformVpnSession(
+        releaseDeadlineElapsedRealtimeMs: Long,
+        retirementAllowed: () -> Boolean,
     ): Boolean {
         if (!retirementAllowed()) {
             Log.i(TAG, "skipping framework VPN retirement because Marten no longer owns the VPN slot")
@@ -120,7 +142,7 @@ class VPNService : VpnService(), PlatformInterfaceWrapper {
             return true
         }
 
-        Log.w(TAG, "retiring Android framework VPN session after completed core stop")
+        Log.w(TAG, "retiring Android framework VPN session with a no-route replacement")
         val retirementDescriptor = runCatching {
             Builder()
                 .setSession("marten-stop")
@@ -328,19 +350,21 @@ class VPNService : VpnService(), PlatformInterfaceWrapper {
 
     var systemProxyAvailable = false
     var systemProxyEnabled = false
-    fun addIncludePackage(builder: Builder, packageName: String) {
-        try {     
-            Log.d("VpnService","Including $packageName")
+    private fun addIncludePackage(builder: Builder, packageName: String): Boolean {
+        return try {
             builder.addAllowedApplication(packageName)
+            true
         } catch (e: NameNotFoundException) {
+            false
         }
     }
 
-    fun addExcludePackage(builder: Builder, packageName: String) {
-        try {     
-            Log.d("VpnService","Excluding $packageName")
+    private fun addExcludePackage(builder: Builder, packageName: String): Boolean {
+        return try {
             builder.addDisallowedApplication(packageName)
+            true
         } catch (e: NameNotFoundException) {
+            false
         }
     }
 
@@ -397,6 +421,7 @@ class VPNService : VpnService(), PlatformInterfaceWrapper {
         var routeExcludeCount = 0
         var includePackageCount = 0
         var excludePackageCount = 0
+        var appRoutingMode = "not_applicable"
         if (options.autoRoute) {
             builder.addDnsServer(options.dnsServerAddress.value)
 
@@ -456,33 +481,44 @@ class VPNService : VpnService(), PlatformInterfaceWrapper {
 
             val optionIncludePackages = collectPackages(options.includePackage)
             val optionExcludePackages = collectPackages(options.excludePackage)
-            includePackageCount = optionIncludePackages.size
-            excludePackageCount = optionExcludePackages.size
+            val appRoutingPlan = resolveVpnAppRoutingPlan(
+                ownPackageName = packageName,
+                perAppProxyMode = Settings.perAppProxyMode,
+                perAppProxyPackages = Settings.perAppProxyList,
+                optionIncludePackages = optionIncludePackages,
+                optionExcludePackages = optionExcludePackages,
+            )
+            when (appRoutingPlan) {
+                is VpnAppRoutingPlan.IncludeOnly -> {
+                    appRoutingMode = "include_only"
+                    var installedExternalApplications = 0
+                    appRoutingPlan.packages.forEach { routedPackage ->
+                        if (addIncludePackage(builder, routedPackage)) {
+                            includePackageCount += 1
+                            if (routedPackage != packageName) {
+                                installedExternalApplications += 1
+                            }
+                        }
+                    }
+                    if (installedExternalApplications == 0) {
+                        Log.w(
+                            TAG,
+                            "openTun routing rejected mode=include_only installed_external_applications=0",
+                        )
+                    }
+                    check(installedExternalApplications > 0) {
+                        "android: include-only VPN routing has no installed external applications"
+                    }
+                }
 
-            if (Settings.perAppProxyEnabled) {
-                val appList = Settings.perAppProxyList
-                if (Settings.perAppProxyMode == PerAppProxyMode.INCLUDE) {
-                    val bypassPackages = optionExcludePackages.filter { it != packageName }.toSet()
-                    (appList + packageName).distinct().filter { !bypassPackages.contains(it) }.forEach {
-                        addIncludePackage(builder, it)
-                    }
-                } else {
-                    (appList + optionExcludePackages).distinct().filter { it != packageName }.forEach {
-                        addExcludePackage(builder, it)
+                is VpnAppRoutingPlan.Exclude -> {
+                    appRoutingMode = "exclude"
+                    appRoutingPlan.packages.forEach { bypassedPackage ->
+                        if (addExcludePackage(builder, bypassedPackage)) {
+                            excludePackageCount += 1
+                        }
                     }
                 }
-            } else {
-                if (optionIncludePackages.isNotEmpty()) {
-                    val bypassPackages = optionExcludePackages.filter { it != packageName }.toSet()
-                    (optionIncludePackages + packageName).distinct().filter { !bypassPackages.contains(it) }.forEach {
-                        addIncludePackage(builder, it)
-                    }
-                } else {
-                    optionExcludePackages.distinct().filter { it != packageName }.forEach {
-                        addExcludePackage(builder, it)
-                    }
-                }
-                
             }
         }
 
@@ -513,7 +549,8 @@ class VPNService : VpnService(), PlatformInterfaceWrapper {
             "openTun platform state permission=delegated_to_establish addresses_v4=$inet4AddressCount " +
             "addresses_v6=$inet6AddressCount routes_v4=$inet4RouteCount " +
             "routes_v6=$inet6RouteCount route_excludes=$routeExcludeCount " +
-                "include_packages=$includePackageCount exclude_packages=$excludePackageCount " +
+                "app_routing=$appRoutingMode include_packages=$includePackageCount " +
+                "exclude_packages=$excludePackageCount " +
                 "underlying_network_declared=${initialUnderlyingNetwork != null}",
         )
         service.requireTunCreationPrecondition()
