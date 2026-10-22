@@ -14,7 +14,7 @@ class Db extends _$Db with InfraLogger {
   Db([QueryExecutor? executor]) : super(executor ?? _openConnection());
 
   @override
-  int get schemaVersion => 6;
+  int get schemaVersion => 7;
 
   static QueryExecutor _openConnection() {
     return LazyDatabase(
@@ -32,78 +32,85 @@ class Db extends _$Db with InfraLogger {
       onCreate: (Migrator m) async {
         await m.createAll();
       },
-      onUpgrade: stepByStep(
-        from1To2: (m, schema) async {
-          await m.alterTable(
-            TableMigration(
-              schema.profileEntries,
-              columnTransformer: {schema.profileEntries.type: const Constant<String>("remote")},
-              newColumns: [schema.profileEntries.type],
-            ),
-          );
-        },
-        from2To3: (m, schema) async {
-          await m.createTable(schema.geoAssetEntries);
-        },
-        from3To4: (m, schema) async {
-          final testUrlExists = await _columnExists(
-            schema.profileEntries.actualTableName,
-            schema.profileEntries.testUrl.name,
-          );
-          if (!testUrlExists) {
-            await m.addColumn(schema.profileEntries, schema.profileEntries.testUrl);
-          }
-        },
-        from4To5: (m, schema) async {
-          await m.deleteTable('geo_asset_entries');
-          await m.renameColumn(schema.profileEntries, 'test_url', schema.profileEntries.profileOverride);
-
-          final userOverrideExists = await _columnExists(
-            schema.profileEntries.actualTableName,
-            schema.profileEntries.userOverride.name,
-          );
-          if (!userOverrideExists) {
-            await m.addColumn(schema.profileEntries, schema.profileEntries.userOverride);
-          }
-
-          final populatedHeadersExists = await _columnExists(
-            schema.profileEntries.actualTableName,
-            schema.profileEntries.populatedHeaders.name,
-          );
-          if (!populatedHeadersExists) {
-            await m.addColumn(schema.profileEntries, schema.profileEntries.populatedHeaders);
-          }
-
-          await m.createTable(schema.appProxyEntries);
-        },
-        from5To6: (m, schema) async {
-          final subscriptionEndpointsExists = await _columnExists(
-            schema.profileEntries.actualTableName,
-            schema.profileEntries.subscriptionEndpoints.name,
-          );
-          if (!subscriptionEndpointsExists) {
-            await m.addColumn(schema.profileEntries, schema.profileEntries.subscriptionEndpoints);
-          }
-
-          final currentSubscriptionEndpointExists = await _columnExists(
-            schema.profileEntries.actualTableName,
-            schema.profileEntries.currentSubscriptionEndpoint.name,
-          );
-          if (!currentSubscriptionEndpointExists) {
-            await m.addColumn(schema.profileEntries, schema.profileEntries.currentSubscriptionEndpoint);
-          }
-
-          final unavailableSubscriptionEndpointsExists = await _columnExists(
-            schema.profileEntries.actualTableName,
-            schema.profileEntries.unavailableSubscriptionEndpoints.name,
-          );
-          if (!unavailableSubscriptionEndpointsExists) {
-            await m.addColumn(schema.profileEntries, schema.profileEntries.unavailableSubscriptionEndpoints);
-          }
-        },
-      ),
+      onUpgrade: (m, from, to) async {
+        if (from < 6) await _upgradeThroughV6(m, from, to < 6 ? to : 6);
+        if (from < 7 && to >= 7) {
+          await m.addColumn(profileEntries, profileEntries.revision);
+        }
+      },
     );
   }
+
+  late final _upgradeThroughV6 = stepByStep(
+    from1To2: (m, schema) async {
+      await m.alterTable(
+        TableMigration(
+          schema.profileEntries,
+          columnTransformer: {schema.profileEntries.type: const Constant<String>("remote")},
+          newColumns: [schema.profileEntries.type],
+        ),
+      );
+    },
+    from2To3: (m, schema) async {
+      await m.createTable(schema.geoAssetEntries);
+    },
+    from3To4: (m, schema) async {
+      final testUrlExists = await _columnExists(
+        schema.profileEntries.actualTableName,
+        schema.profileEntries.testUrl.name,
+      );
+      if (!testUrlExists) {
+        await m.addColumn(schema.profileEntries, schema.profileEntries.testUrl);
+      }
+    },
+    from4To5: (m, schema) async {
+      await m.deleteTable('geo_asset_entries');
+      await m.renameColumn(schema.profileEntries, 'test_url', schema.profileEntries.profileOverride);
+
+      final userOverrideExists = await _columnExists(
+        schema.profileEntries.actualTableName,
+        schema.profileEntries.userOverride.name,
+      );
+      if (!userOverrideExists) {
+        await m.addColumn(schema.profileEntries, schema.profileEntries.userOverride);
+      }
+
+      final populatedHeadersExists = await _columnExists(
+        schema.profileEntries.actualTableName,
+        schema.profileEntries.populatedHeaders.name,
+      );
+      if (!populatedHeadersExists) {
+        await m.addColumn(schema.profileEntries, schema.profileEntries.populatedHeaders);
+      }
+
+      await m.createTable(schema.appProxyEntries);
+    },
+    from5To6: (m, schema) async {
+      final subscriptionEndpointsExists = await _columnExists(
+        schema.profileEntries.actualTableName,
+        schema.profileEntries.subscriptionEndpoints.name,
+      );
+      if (!subscriptionEndpointsExists) {
+        await m.addColumn(schema.profileEntries, schema.profileEntries.subscriptionEndpoints);
+      }
+
+      final currentSubscriptionEndpointExists = await _columnExists(
+        schema.profileEntries.actualTableName,
+        schema.profileEntries.currentSubscriptionEndpoint.name,
+      );
+      if (!currentSubscriptionEndpointExists) {
+        await m.addColumn(schema.profileEntries, schema.profileEntries.currentSubscriptionEndpoint);
+      }
+
+      final unavailableSubscriptionEndpointsExists = await _columnExists(
+        schema.profileEntries.actualTableName,
+        schema.profileEntries.unavailableSubscriptionEndpoints.name,
+      );
+      if (!unavailableSubscriptionEndpointsExists) {
+        await m.addColumn(schema.profileEntries, schema.profileEntries.unavailableSubscriptionEndpoints);
+      }
+    },
+  );
 
   Future<bool> _columnExists(String table, String column) async {
     final result = await customSelect('PRAGMA table_info($table);').get();
@@ -114,6 +121,7 @@ class Db extends _$Db with InfraLogger {
 @DataClassName('ProfileEntry')
 class ProfileEntries extends Table {
   TextColumn get id => text()();
+  IntColumn get revision => integer().withDefault(const Constant(0))();
   TextColumn get type => textEnum<ProfileType>()();
   BoolColumn get active => boolean()();
   TextColumn get name => text().withLength(min: 1)();

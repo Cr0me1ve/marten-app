@@ -42,15 +42,42 @@
             android:name="flutter_deeplinking_enabled"
             android:value="true" />
 
-        <!-- Privacy-safe remote diagnostics are enabled by default. A persisted
-             runtime opt-out takes precedence and disables collection. -->
+        <!-- Network-capable Firebase components are initialized explicitly only
+             after Marten's process is bound to its full-route VPN Network. -->
         <meta-data
             android:name="firebase_crashlytics_collection_enabled"
-            android:value="true" />
-
+            android:value="false" />
         <meta-data
-            android:name="android.app.shortcuts"
-            android:resource="@xml/shortcuts" />
+            android:name="firebase_messaging_auto_init_enabled"
+            android:value="false" />
+        <meta-data
+            android:name="firebase_analytics_collection_enabled"
+            android:value="false" />
+
+        <provider
+            android:name="com.google.firebase.provider.FirebaseInitProvider"
+            tools:node="remove" />
+        <provider
+            android:name="io.flutter.plugins.firebase.messaging.FlutterFirebaseMessagingInitProvider"
+            tools:node="remove" />
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            tools:node="merge">
+            <meta-data
+                android:name="androidx.work.WorkManagerInitializer"
+                tools:node="remove" />
+        </provider>
+
+        <!-- Only the replaceable native runtime lives here; VpnService retains TUN. -->
+        <service android:name=".bg.EnergyProfileService"
+            android:process=":diagnostics" android:exported="false" />
+        <service android:name=".bg.CoreProcessService"
+            android:process=":core" android:exported="false" />
+
+        <service
+            android:name="com.google.firebase.messaging.FirebaseMessagingService"
+            android:directBootAware="false"
+            tools:replace="android:directBootAware" />
 
         <activity
             android:name=".MainActivity"
@@ -169,12 +196,12 @@
             android:name=".VpnPermissionActivity"
             android:excludeFromRecents="true"
             android:exported="false"
+            android:launchMode="singleTop"
             android:taskAffinity=""
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
         <service
             android:name=".bg.TileService"
-            android:directBootAware="true"
             android:exported="true"
             android:icon="@drawable/ic_stat_logo_sharp"
             android:permission="android.permission.BIND_QUICK_SETTINGS_TILE"
@@ -182,6 +209,9 @@
             <intent-filter>
                 <action android:name="android.service.quicksettings.action.QS_TILE" />
             </intent-filter>
+            <meta-data
+                android:name="android.service.quicksettings.ACTIVE_TILE"
+                android:value="true" />
             <meta-data
                 android:name="android.service.quicksettings.TOGGLEABLE_TILE"
                 android:value="true" />

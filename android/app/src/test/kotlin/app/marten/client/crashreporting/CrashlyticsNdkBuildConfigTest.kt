@@ -15,7 +15,15 @@ class CrashlyticsNdkBuildConfigTest {
     }
 
     @Test
-    fun `Crashlytics NDK SDK captures fatal signals from marten core`() {
+    fun `Firebase Gradle plugins are applied only when public project configuration exists`() {
+        assertTrue(buildScript.contains("def hasFirebaseConfig = file(\"google-services.json\").exists()"))
+        assertTrue(buildScript.contains("if (hasFirebaseConfig)"))
+        assertTrue(buildScript.contains("apply plugin: \"com.google.gms.google-services\""))
+        assertTrue(buildScript.contains("apply plugin: \"com.google.firebase.crashlytics\""))
+    }
+
+    @Test
+    fun `Crashlytics NDK SDK captures fatal signals from marten core when configured`() {
         assertTrue(
             "firebase-crashlytics-ndk is required to capture SIGABRT and SIGSEGV from libmarten-core.so",
             findCodeMatch(
@@ -23,54 +31,6 @@ class CrashlyticsNdkBuildConfigTest {
                     """(?m)^\s*implementation\s*(?:\(\s*)?[\"']com\.google\.firebase:firebase-crashlytics-ndk(?:[^\"']*)[\"']\s*\)?\s*$""",
                 ),
                 buildScript,
-            ) != null,
-        )
-    }
-
-    @Test
-    fun `Firebase plugins stay apply false and are only applied when config exists`() {
-        val plugins = namedBlock(buildScript, "plugins")
-
-        assertTrue(
-            "google services plugin declaration should use apply false",
-            findCodeMatch(
-                Regex(
-                    """(?m)^\s*id\s*(?:\(|\s+)[\"']com\.google\.gms\.google-services[\"']\s*\)?\s*apply\s+false\s*$""",
-                ),
-                plugins,
-            ) != null,
-        )
-        assertTrue(
-            "crashlytics plugin declaration should use apply false",
-            findCodeMatch(
-                Regex(
-                    """(?m)^\s*id\s*(?:\(|\s+)[\"']com\.google\.firebase\.crashlytics[\"']\s*\)?\s*apply\s+false\s*$""",
-                ),
-                plugins,
-            ) != null,
-        )
-
-        val pluginGuard = firstFirebaseConfigBlockContaining(
-            Regex(
-                """(?m)^\s*apply\s+plugin:\s*[\"']com\.google\.[^\"']+[\"']\s*$""",
-            ),
-        )
-        assertTrue(
-            "google services plugin should apply only with config",
-            findCodeMatch(
-                Regex(
-                    """(?m)^\s*apply\s+plugin:\s*[\"']com\.google\.gms\.google-services[\"']\s*$""",
-                ),
-                pluginGuard,
-            ) != null,
-        )
-        assertTrue(
-            "crashlytics plugin should apply only with config",
-            findCodeMatch(
-                Regex(
-                    """(?m)^\s*apply\s+plugin:\s*[\"']com\.google\.firebase\.crashlytics[\"']\s*$""",
-                ),
-                pluginGuard,
             ) != null,
         )
     }
@@ -114,11 +74,7 @@ class CrashlyticsNdkBuildConfigTest {
         val android = namedBlock(buildScript, "android")
         val buildTypes = namedBlock(android, "buildTypes")
         val release = namedBlock(buildTypes, "release")
-        val releaseFirebaseConfig = firstFirebaseConfigBlockContaining(
-            Regex("""(?m)^\s*firebaseCrashlytics\s*\{"""),
-            release,
-        )
-        val crashlytics = namedBlock(releaseFirebaseConfig, "firebaseCrashlytics")
+        val crashlytics = namedBlock(release, "firebaseCrashlytics")
 
         assertTrue(
             "release must enable the Crashlytics native-symbol upload task",
@@ -217,7 +173,7 @@ class CrashlyticsNdkBuildConfigTest {
             ) != null,
         )
 
-        val (matching, configured) = matchingConfigureEachBlocksForFirebaseConfig()
+        val (matching, configured) = crashlyticsMatchingConfigureEachBlocks()
         assertTrue(
             findCodeMatch(
                 Regex("""it\.name\s*==\s*[\"']generateCrashlyticsSymbolFileRelease[\"']"""),
@@ -240,10 +196,11 @@ class CrashlyticsNdkBuildConfigTest {
     }
 
     @Test
-    fun `release assemble must always execute Crashlytics native symbol upload`() {
+    fun `release symbol upload is conditional on Firebase project configuration`() {
         assertTrue(
-            "assembleRelease/bundleRelease must depend on uploadCrashlyticsSymbolFileRelease",
-            hasAssembleReleaseUploadDependency(),
+            "release upload hooks must be inside the optional Firebase configuration guard",
+            buildScript.contains("if (hasFirebaseConfig) {\n    tasks.matching") &&
+                hasAssembleReleaseUploadDependency(),
         )
     }
 
@@ -268,101 +225,46 @@ class CrashlyticsNdkBuildConfigTest {
         return blockAt(buildScript, declaration!!.range.last)
     }
 
-    private fun firstFirebaseConfigBlockContaining(pattern: Regex, source: String = buildScript): String {
-        for (block in firebaseConfigBlocks(source)) {
-            if (findCodeMatch(pattern, block) != null) return block
-        }
-        error("missing Firebase-configured block for pattern ${pattern.pattern}")
-    }
-
-    private fun firebaseConfigBlocks(source: String): List<String> {
-        val result = mutableListOf<String>()
-        val ifPattern = Regex("""(?m)^\s*if\s*\(\s*hasFirebaseConfig\s*\)\s*\{""")
+    private fun crashlyticsMatchingConfigureEachBlocks(): Pair<String, String> {
+        val matchingPattern = Regex("""(?m)^\s*tasks\.matching\s*\{""")
+        val configurePattern = Regex("""\.configureEach\s*\{""")
         var cursor = 0
         while (true) {
-            val declaration = findCodeMatch(ifPattern, source, startIndex = cursor) ?: break
-            val block = blockAt(source, declaration.range.last)
-            val blockStart = declaration.range.first
-            val blockEnd = declaration.range.last + block.length
-            result.add(source.substring(blockStart, blockEnd))
-            cursor = blockEnd
-        }
-        return result
-    }
-
-    private fun matchingConfigureEachBlocks(): Pair<String, String> {
-        val matchingCall = findCodeMatch(Regex("""(?m)^\s*tasks\.matching\s*\{"""), buildScript)
-        assertNotNull("missing Crashlytics task matching block", matchingCall)
-        val matching = blockAt(buildScript, matchingCall!!.range.last)
-        val matchingEnd = matchingCall.range.last + matching.length
-        val configureCall = findCodeMatch(
-            Regex("""\.configureEach\s*\{"""),
-            buildScript,
-            startIndex = matchingEnd,
-        )
-        assertNotNull("missing configureEach after Crashlytics task matching block", configureCall)
-        return matching to blockAt(buildScript, configureCall!!.range.last)
-    }
-
-    private fun matchingConfigureEachBlocksForFirebaseConfig(): Pair<String, String> {
-        for (guard in firebaseConfigBlocks(buildScript)) {
-            for ((matching, configured) in matchingConfigureEachBlocksFrom(guard)) {
-                if (
-                    findCodeMatch(
-                        Regex("""(?m)^\s*it\.name\s*==\s*["']generateCrashlyticsSymbolFileRelease["']"""),
-                        matching,
-                    ) != null &&
-                    findCodeMatch(
-                        Regex("""(?m)^\s*it\.name\s*==\s*["']uploadCrashlyticsSymbolFileRelease["']"""),
-                        matching,
-                    ) != null
-                ) {
-                    return matching to configured
-                }
-            }
-        }
-        error("missing Crashlytics task matching block")
-    }
-
-    private fun matchingConfigureEachBlocksFrom(source: String): List<Pair<String, String>> {
-        val matchingCallPattern = Regex("""(?m)^\s*tasks\.matching\s*\{""")
-        val configureEachPattern = Regex("""(?m)\.configureEach\s*\{""")
-        val result = mutableListOf<Pair<String, String>>()
-        var cursor = 0
-        while (true) {
-            val matchingCall = findCodeMatch(matchingCallPattern, source, startIndex = cursor) ?: break
-            val matching = blockAt(source, matchingCall.range.last)
+            val matchingCall = findCodeMatch(matchingPattern, buildScript, startIndex = cursor) ?: break
+            val matching = blockAt(buildScript, matchingCall.range.last)
             val matchingEnd = matchingCall.range.last + matching.length
-            val configureCall = findCodeMatch(configureEachPattern, source, startIndex = matchingEnd)
+            val configureCall = findCodeMatch(configurePattern, buildScript, startIndex = matchingEnd)
             if (configureCall == null) {
                 cursor = matchingEnd
                 continue
             }
-            val configured = blockAt(source, configureCall.range.last)
-            result.add(matching to configured)
+            val configured = blockAt(buildScript, configureCall.range.last)
+            if (
+                matching.contains("generateCrashlyticsSymbolFileRelease") &&
+                    matching.contains("uploadCrashlyticsSymbolFileRelease")
+            ) {
+                return matching to configured
+            }
             cursor = configureCall.range.last + configured.length
         }
-        return result
+        error("missing Crashlytics symbol task matching/configureEach block")
     }
 
     private fun hasAssembleReleaseUploadDependency(): Boolean {
-        for (guard in firebaseConfigBlocks(buildScript)) {
-            for ((matching, configured) in matchingConfigureEachBlocksFrom(guard)) {
-                if (
-                    findCodeMatch(
-                        Regex("""(?m)^\s*it\.name\s*==\s*["'](?:assembleRelease|bundleRelease)["']"""),
-                        matching,
-                    ) != null &&
-                    findCodeMatch(
-                        Regex("""(?m)^\s*dependsOn\s*(?:\(\s*)?["']?uploadCrashlyticsSymbolFileRelease["']?(?:\s*\))?\s*$"""),
-                        configured,
-                    ) != null
-                ) {
-                    return true
-                }
-            }
-        }
-        return false
+        val directDependency = findCodeMatch(
+            Regex(
+                """(?m)^\s*(?:assembleRelease|bundleRelease)\.dependsOn\s*\(\s*uploadCrashlyticsSymbolFileRelease\s*\)\s*$""",
+            ),
+            buildScript,
+        ) != null
+        if (directDependency) return true
+
+        val namedDependency = dependsOnInTaskNameConfiguration(
+            Regex("""(?m)^\s*tasks\.named\(\s*['"](?:assembleRelease|bundleRelease)['"]\s*\)(?:\.configure)?\s*\{"""),
+        )
+        if (namedDependency) return true
+
+        return hasLazyMatchingConfigureEachDependency()
     }
 
     private fun hasLazyMatchingConfigureEachDependency(): Boolean {

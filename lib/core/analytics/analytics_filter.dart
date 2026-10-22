@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:dio/dio.dart';
+import 'package:marten/core/logger/crash_diagnostics_redactor.dart';
 import 'package:marten/core/logger/sensitive_data_redactor.dart';
 import 'package:marten/core/model/failures.dart';
 import 'package:marten/features/proxy/model/proxy_failure.dart';
@@ -41,7 +42,7 @@ SanitizedCrashException sanitizeCrashException(Object error) {
 }
 
 StackTrace sanitizeCrashStackTrace(StackTrace stackTrace) {
-  final redacted = SensitiveDataRedactor.redact(stackTrace.toString());
+  final redacted = redactCrashDiagnostics(stackTrace.toString());
   final lines = redacted.split('\n').where((line) => line.isNotEmpty).toList(growable: false);
   final firstExternalFrame = _firstExternalCrashFrame(lines);
   final visibleLines = firstExternalFrame == null ? lines : lines.sublist(firstExternalFrame);
@@ -61,6 +62,26 @@ StackTrace fallbackCrashStackTrace({required String loggerName, required Object 
   return StackTrace.fromString(
     '#0      CrashGroup.$sourceType.logger_$loggerIdentity '
     '(package:marten/crash_group/${sourceType.toLowerCase()}_$loggerIdentity.dart:1:1)',
+  );
+}
+
+/// System exit summaries have no captured stack. Give them a stable diagnostic
+/// group so the SDK cannot attribute them to its own reporting call site.
+StackTrace nativeCrashReportStackTrace({
+  required String stack,
+  required String reason,
+  required SanitizedCrashException error,
+}) {
+  if (stack.trim().isNotEmpty) return StackTrace.fromString(stack);
+  final exit = RegExp(
+    '^android_process_exit_(app|core|diagnostics)_'
+    r'(java_crash|native_crash|anr|low_memory|signaled|excessive_resource|dependency_died|initialization_failure|other)$',
+  ).firstMatch(reason);
+  if (exit == null) return fallbackCrashStackTrace(loggerName: reason, error: error);
+  // Fixed categories have no private input. Short, distinct source paths survive
+  // redaction and SDK grouping, which may ignore differences in function hashes.
+  return StackTrace.fromString(
+    '#0      AndroidExit_${exit[1]}_${exit[2]} (package:marten/exit/${exit[1]}/${exit[2]}.dart:1:1)',
   );
 }
 

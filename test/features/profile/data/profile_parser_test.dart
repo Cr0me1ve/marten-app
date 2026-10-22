@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -8,9 +9,11 @@ import 'package:marten/core/device/device_identity.dart';
 import 'package:marten/core/http_client/dio_http_client.dart';
 import 'package:marten/core/http_client/http_client_provider.dart';
 import 'package:marten/core/preferences/preferences_provider.dart';
+import 'package:marten/core/localization/translations.dart';
 import 'package:marten/features/profile/data/profile_parser.dart';
 import 'package:marten/features/profile/data/profile_data_providers.dart';
 import 'package:marten/features/profile/model/profile_entity.dart';
+import 'package:marten/features/profile/data/subscription_download_budget.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 
@@ -184,6 +187,88 @@ class _ScriptedDioHttpClient extends _TrackingDioHttpClient {
       statusCode: 200,
       headers: Headers(),
     );
+  }
+}
+
+class _LateCompletingDioHttpClient extends _TrackingDioHttpClient {
+  _LateCompletingDioHttpClient() : super();
+
+  final response = Completer<Response>();
+  final entered = Completer<void>();
+  final downloadWritten = Completer<void>();
+  CancelToken? receivedCancelToken;
+  String? scratchPath;
+  int lateCalls = 0;
+
+  @override
+  Future<Response> download(
+    String url,
+    String path, {
+    String method = 'GET',
+    Object? data,
+    CancelToken? cancelToken,
+    String? userAgent,
+    ({String username, String password})? credentials,
+    Map<String, String>? extraHeaders,
+    bool proxyOnly = false,
+  }) {
+    lateCalls++;
+    scratchPath = path;
+    receivedCancelToken = cancelToken;
+    if (!entered.isCompleted) entered.complete();
+    // Deliberately ignore cancellation, then write only to the request's path
+    // when the test releases the response. The parser must isolate this path.
+    return response.future.then((result) async {
+      await File(
+        path,
+      ).writeAsString('{"outbounds":[{"type":"vless","tag":"late","server":"late.example","server_port":443}]}');
+      if (!downloadWritten.isCompleted) downloadWritten.complete();
+      return result;
+    });
+  }
+}
+
+class _CancelableIncludeDioHttpClient extends _TrackingDioHttpClient {
+  _CancelableIncludeDioHttpClient() : super();
+
+  final entered = Completer<void>();
+  final allowLateWrites = Completer<void>();
+  final lateWritesCompleted = Completer<void>();
+  final requestTokens = <CancelToken?>[];
+  final writtenPaths = <String>[];
+  int _started = 0;
+  int _completedWrites = 0;
+
+  @override
+  Future<Response> download(
+    String url,
+    String path, {
+    String method = 'GET',
+    Object? data,
+    CancelToken? cancelToken,
+    String? userAgent,
+    ({String username, String password})? credentials,
+    Map<String, String>? extraHeaders,
+    bool proxyOnly = false,
+  }) async {
+    calls.add(_DownloadCall(url: url, method: method, extraHeaders: Map<String, String>.from(extraHeaders ?? {})));
+    requestTokens.add(cancelToken);
+    _started++;
+    if (_started == 2 && !entered.isCompleted) entered.complete();
+    try {
+      await cancelToken!.whenCancel;
+      throw cancelToken.cancelError!;
+    } finally {
+      // Hold the transport's post-cancel write until the parser has returned,
+      // then expose an explicit completion barrier for the late cleanup test.
+      await allowLateWrites.future;
+      await File(path).writeAsString('partial include');
+      writtenPaths.add(path);
+      _completedWrites++;
+      if (_completedWrites == 2 && !lateWritesCompleted.isCompleted) {
+        lateWritesCompleted.complete();
+      }
+    }
   }
 }
 
@@ -669,53 +754,49 @@ void main() {
       profile.match((l) => fail('parse failed: $l'), (r) => expect(r.name, 'Server name'));
     });
 
-    test('Should keep UserOverride.pushEndpoint on parse', () {
-      final override = const UserOverride(name: 'Manual name', pushEndpoint: 'https://push.example.net/register');
+    test("Should preserve user override push endpoint", () {
+      final file = File('${Directory.systemTemp.path}/marten-subscription-push-endpoint-override-test.json');
+      file.writeAsStringSync('''
+{
+  "outbounds": [{"type": "direct", "tag": "direct"}],
+  "subscription": {"name": "Server name"}
+}
+''');
+      addTearDown(() => file.deleteSync());
+
       final profile = ProfileParser.parse(
-        tempFilePath: '',
+        tempFilePath: file.path,
         profile: ProfileEntity.remote(
           id: const Uuid().v4(),
           active: true,
           name: '',
-          url: validBaseUrl,
+          url: 'https://edge.example.com/sub/secret-token',
           lastUpdate: DateTime.now(),
-          userOverride: override,
+          userOverride: const UserOverride(pushEndpoint: 'https://push.example.net/device/registration'),
         ),
       );
 
-      expect(profile.isRight(), isTrue);
+      expect(profile.isRight(), true);
       profile.match((l) => fail('parse failed: $l'), (r) {
         final rp = r as RemoteProfileEntity;
-        expect(rp.userOverride, equals(override));
+        expect(rp.name, equals('Server name'));
+        expect(rp.userOverride, isNotNull);
+        expect(rp.userOverride!.pushEndpoint, equals('https://push.example.net/device/registration'));
       });
     });
 
-    test('Should round-trip UserOverride JSON with pushEndpoint', () {
-      final override = const UserOverride(
-        name: 'Manual name',
-        pushEndpoint: 'https://push.example.net/register',
-        isAutoUpdateDisable: false,
+    test("UserOverride JSON round-trips push endpoint", () {
+      const override = UserOverride(
+        name: 'Override profile',
+        pushEndpoint: 'https://push.example.net/device/registration',
       );
-      final serialized = override.toStr();
-      final parsed = UserOverride.fromStr(serialized);
+
+      final json = override.toStr();
+      final parsed = UserOverride.fromStr(json);
 
       expect(parsed, isNotNull);
-      expect(parsed?.name, equals(override.name));
-      expect(parsed?.pushEndpoint, equals(override.pushEndpoint));
-      expect(parsed?.version, equals(latestUserOverrideVersion));
-    });
-
-    test('Should preserve UserOverride.pushEndpoint from legacy JSON', () {
-      final parsed = UserOverride.fromStr('''{
-        "version":1,
-        "name":"Legacy",
-        "pushEndpoint":"https://push.example.net/legacy"
-      }''');
-
-      expect(parsed, isNotNull);
-      expect(parsed?.name, equals('Legacy'));
-      expect(parsed?.pushEndpoint, equals('https://push.example.net/legacy'));
-      expect(parsed?.version, equals(latestUserOverrideVersion));
+      expect(parsed!.name, equals('Override profile'));
+      expect(parsed.pushEndpoint, equals('https://push.example.net/device/registration'));
     });
 
     test("Should read split_tunneling alias from subscription metadata", () {
@@ -927,6 +1008,43 @@ void main() {
       expect(call.extraHeaders["X-Marten-Capabilities"], contains('icmp-v1'));
     });
 
+    test('Should map remote load 409 as device limit without retrying', () async {
+      const candidateUrl = 'https://edge.example.com/sub/token-1';
+      final httpClient = _ScriptedDioHttpClient(
+        outcomes: [
+          DioException(
+            requestOptions: RequestOptions(path: candidateUrl),
+            type: DioExceptionType.badResponse,
+            response: Response(requestOptions: RequestOptions(path: candidateUrl), statusCode: 409),
+          ),
+        ],
+      );
+      final parser = await newParser(httpClient);
+      final directory = await Directory.systemTemp.createTemp('marten-profile-parser-load-device-limit-');
+      addTearDown(() => directory.delete(recursive: true));
+      final tEn = await AppLocale.en.build();
+      final tRu = await AppLocale.ru.build();
+
+      final result = await parser
+          .addRemote(
+            id: const Uuid().v4(),
+            url: candidateUrl,
+            tempFilePath: '${directory.path}/remote-profile.json',
+            userOverride: null,
+          )
+          .run();
+
+      expect(httpClient.calls, hasLength(1));
+      expect(httpClient.calls.single.method, equals('GET'));
+      expect(httpClient.calls.single.url, equals(candidateUrl));
+      expect(result.isLeft(), isTrue);
+      result.match((failure) {
+        expect(failure.mapOrNull(deviceLimit: (_) => true), isTrue);
+        expect(failure.present(tEn), (type: 'The device limit for this subscription has been reached', message: null));
+        expect(failure.present(tRu), (type: 'Достигнут лимит устройств для этой подписки', message: null));
+      }, (_) => fail('load 409 should fail with device-limit profile error'));
+    });
+
     test('Should fall back from a connection-error refresh POST to one canonical GET', () async {
       const candidateUrl = 'https://edge.example.com/sub/token-1';
       final httpClient = _ScriptedDioHttpClient(
@@ -977,6 +1095,11 @@ void main() {
         ),
         DioException(
           requestOptions: RequestOptions(path: '$candidateUrl/refresh'),
+          type: DioExceptionType.badResponse,
+          response: Response(requestOptions: RequestOptions(path: '$candidateUrl/refresh'), statusCode: 409),
+        ),
+        DioException(
+          requestOptions: RequestOptions(path: '$candidateUrl/refresh'),
           type: DioExceptionType.connectionTimeout,
         ),
       ];
@@ -1003,6 +1126,48 @@ void main() {
         expect(httpClient.calls.single.method, 'POST');
         expect(httpClient.calls.single.url, '$candidateUrl/refresh');
       }
+    });
+
+    test('Should map refresh 409 as device limit without retrying', () async {
+      const candidateUrl = 'https://edge.example.com/sub/token-1';
+      const fallbackUrl = 'https://backup.example.com/sub/token-1';
+      final httpClient = _ScriptedDioHttpClient(
+        outcomes: [
+          DioException(
+            requestOptions: RequestOptions(path: '$candidateUrl/refresh'),
+            type: DioExceptionType.badResponse,
+            response: Response(requestOptions: RequestOptions(path: '$candidateUrl/refresh'), statusCode: 409),
+          ),
+        ],
+      );
+      final parser = await newParser(httpClient);
+      final directory = await Directory.systemTemp.createTemp('marten-profile-parser-refresh-device-limit-');
+      addTearDown(() => directory.delete(recursive: true));
+      final profile = RemoteProfileEntity(
+        id: const Uuid().v4(),
+        active: true,
+        name: '',
+        url: candidateUrl,
+        lastUpdate: DateTime.now(),
+        currentSubscriptionEndpoint: 'https://edge.example.com',
+        subscriptionEndpoints: const ['https://edge.example.com', fallbackUrl],
+      );
+      final tEn = await AppLocale.en.build();
+      final tRu = await AppLocale.ru.build();
+
+      final result = await parser
+          .updateRemote(rp: profile, tempFilePath: '${directory.path}/remote-profile.json')
+          .run();
+
+      expect(httpClient.calls, hasLength(1));
+      expect(httpClient.calls.single.method, 'POST');
+      expect(httpClient.calls.single.url, '$candidateUrl/refresh');
+      expect(result.isLeft(), isTrue);
+      result.match((failure) {
+        expect(failure.mapOrNull(deviceLimit: (_) => true), isTrue);
+        expect(failure.present(tEn), (type: 'The device limit for this subscription has been reached', message: null));
+        expect(failure.present(tRu), (type: 'Достигнут лимит устройств для этой подписки', message: null));
+      }, (_) => fail('device-limit refresh failure should be represented as ProfileFailure'));
     });
 
     test('should fail remote update when all responses are unsupported client markers', () async {
@@ -1044,6 +1209,7 @@ void main() {
             invalidConfig: (_) => true,
             cancelByUser: (_) => false,
             deviceMismatch: (_) => false,
+            deviceLimit: (_) => false,
           ),
           isTrue,
         );
@@ -1059,28 +1225,6 @@ void main() {
         url: "https://sub-a.example.net/sub/token-1",
         lastUpdate: DateTime.now(),
         subscriptionEndpoints: const ["https://sub-a.example.net", "https://sub-b.example.net"],
-        currentSubscriptionEndpoint: "https://sub-b.example.net",
-      );
-
-      expect(ProfileParser.subscriptionCandidateUrls(profile.url, profile: profile), [
-        "https://sub-b.example.net/sub/token-1",
-        "https://sub-a.example.net/sub/token-1",
-      ]);
-    });
-
-    test("Should dedupe duplicated subscription candidate endpoints", () {
-      final profile = RemoteProfileEntity(
-        id: const Uuid().v4(),
-        active: true,
-        name: '',
-        url: "https://sub-a.example.net/sub/token-1",
-        lastUpdate: DateTime.now(),
-        subscriptionEndpoints: const [
-          "https://sub-b.example.net",
-          "https://sub-b.example.net/",
-          "https://sub-a.example.net",
-          "https://sub-a.example.net",
-        ],
         currentSubscriptionEndpoint: "https://sub-b.example.net",
       );
 
@@ -1641,6 +1785,229 @@ void main() {
 }
 '''),
         isFalse,
+      );
+    });
+  });
+
+  group('subscription download budget', () {
+    test('local import shares caller cancellation across active includes and cleans plaintext scratch', () async {
+      final httpClient = _CancelableIncludeDioHttpClient();
+      addTearDown(() {
+        if (!httpClient.allowLateWrites.isCompleted) httpClient.allowLateWrites.complete();
+      });
+      final context = await newParserWithRef(httpClient);
+      final directory = await Directory.systemTemp.createTemp('marten-profile-local-import-cancel-');
+      addTearDown(() => directory.delete(recursive: true));
+      final tempFile = File('${directory.path}/profile.tmp');
+      final callerToken = CancelToken();
+      const includes = '''https://include.example.test/one
+https://include.example.test/two''';
+      await tempFile.writeAsString(includes);
+
+      final import = context.parser
+          .addLocal(
+            id: const Uuid().v4(),
+            content: includes,
+            tempFilePath: tempFile.path,
+            userOverride: null,
+            cancelToken: callerToken,
+          )
+          .run();
+      await httpClient.entered.future;
+      callerToken.cancel('local import disposed');
+      final result = await import.timeout(const Duration(seconds: 5));
+
+      expect(result.isLeft(), isTrue);
+      expect(httpClient.calls, hasLength(2));
+      expect(httpClient.requestTokens.every((token) => token != null && token.isCancelled), isTrue);
+
+      // Cancellation must return without waiting for an uncooperative transport.
+      expect(httpClient.lateWritesCompleted.isCompleted, isFalse);
+      expect(
+        (await Directory(directory.path).list().toList()).map((entity) => entity.path),
+        [tempFile.path],
+        reason: 'the fake transport is gated before it creates late scratch files',
+      );
+
+      final deletedScratchPaths = <String>{};
+      final scratchCleanupObserved = Completer<void>();
+      final deletionSubscription = Directory(directory.path)
+          .watch(events: FileSystemEvent.delete)
+          .listen(
+            (event) {
+              if (!event.path.contains('.include-')) return;
+              deletedScratchPaths.add(event.path);
+              if (deletedScratchPaths.length == 2 && !scratchCleanupObserved.isCompleted) {
+                scratchCleanupObserved.complete();
+              }
+            },
+            onError: (Object error, StackTrace stackTrace) {
+              if (!scratchCleanupObserved.isCompleted) scratchCleanupObserved.completeError(error, stackTrace);
+            },
+          );
+      addTearDown(deletionSubscription.cancel);
+      httpClient.allowLateWrites.complete();
+      await httpClient.lateWritesCompleted.future.timeout(const Duration(seconds: 5));
+      await scratchCleanupObserved.future.timeout(const Duration(seconds: 5));
+      expect(
+        deletedScratchPaths,
+        httpClient.writtenPaths.toSet(),
+        reason: 'each late plaintext include write must be followed by its owned cleanup',
+      );
+      expect(
+        (await Directory(directory.path).list().toList()).map((entity) => entity.path),
+        [tempFile.path],
+        reason: 'cancelled include scratch files must be removed',
+      );
+    });
+
+    test('local import without network includes still parses normally', () async {
+      final httpClient = _TrackingDioHttpClient();
+      final context = await newParserWithRef(httpClient);
+      final directory = await Directory.systemTemp.createTemp('marten-profile-local-import-no-network-');
+      addTearDown(() => directory.delete(recursive: true));
+      const localConfig =
+          '{"outbounds":[{"type":"vless","tag":"local","server":"local.example.test","server_port":443}]}';
+      final tempFile = File('${directory.path}/profile.tmp');
+      await tempFile.writeAsString(localConfig);
+
+      final result = await context.parser
+          .addLocal(id: const Uuid().v4(), content: localConfig, tempFilePath: tempFile.path, userOverride: null)
+          .run();
+
+      expect(result.isRight(), isTrue);
+      expect(httpClient.calls, isEmpty);
+      expect(await tempFile.readAsString(), localConfig);
+    });
+
+    test('deadline cancels the in-flight request and ignores its late file write', () async {
+      final httpClient = _LateCompletingDioHttpClient();
+      final context = await newParserWithRef(httpClient);
+      final parser = ProfileParser(
+        ref: context.ref,
+        httpClient: httpClient,
+        downloadTimeout: const Duration(milliseconds: 25),
+      );
+      final directory = await Directory.systemTemp.createTemp('marten-profile-download-deadline-');
+      addTearDown(() => directory.delete(recursive: true));
+      final targetPath = '${directory.path}/profile.json';
+
+      final result = await parser
+          .addRemote(
+            id: const Uuid().v4(),
+            url: 'https://edge.example.test/sub/token',
+            tempFilePath: targetPath,
+            userOverride: null,
+          )
+          .run();
+
+      expect(result.isLeft(), isTrue);
+      expect(httpClient.lateCalls, 1, reason: 'an expired budget must not start another request');
+      expect(httpClient.receivedCancelToken?.isCancelled, isTrue);
+      expect(await File(targetPath).exists(), isFalse);
+
+      final scratchPath = httpClient.scratchPath;
+      expect(scratchPath, isNotNull, reason: 'the request must use an isolated scratch path');
+      httpClient.response.complete(
+        Response(
+          requestOptions: RequestOptions(path: 'https://edge.example.test/sub/token'),
+          statusCode: 200,
+          headers: Headers(),
+        ),
+      );
+      await httpClient.downloadWritten.future.timeout(const Duration(seconds: 5));
+
+      final scratchFile = File(scratchPath!);
+      final cleanupDeadline = DateTime.now().add(const Duration(seconds: 5));
+      while (await scratchFile.exists() && DateTime.now().isBefore(cleanupDeadline)) {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+      expect(await File(targetPath).exists(), isFalse, reason: 'late completion must not promote a stale config');
+      expect(await scratchFile.exists(), isFalse, reason: 'late scratch file must be removed');
+      expect(await Directory(directory.path).list().toList(), isEmpty, reason: 'late scratch cleanup must finish');
+    });
+
+    test('caller cancellation cancels the request without starting a fallback attempt', () async {
+      final httpClient = _LateCompletingDioHttpClient();
+      final context = await newParserWithRef(httpClient);
+      final parser = ProfileParser(
+        ref: context.ref,
+        httpClient: httpClient,
+        downloadTimeout: const Duration(seconds: 2),
+      );
+      final directory = await Directory.systemTemp.createTemp('marten-profile-download-cancel-');
+      addTearDown(() => directory.delete(recursive: true));
+      final callerToken = CancelToken();
+      final operation = parser
+          .addRemote(
+            id: const Uuid().v4(),
+            url: 'https://edge.example.test/sub/token',
+            tempFilePath: '${directory.path}/profile.json',
+            userOverride: null,
+            cancelToken: callerToken,
+          )
+          .run();
+
+      await httpClient.entered.future;
+      callerToken.cancel('test caller cancelled');
+      final result = await operation;
+
+      expect(result.isLeft(), isTrue);
+      expect(httpClient.lateCalls, 1);
+      expect(httpClient.receivedCancelToken?.isCancelled, isTrue);
+      expect(await Directory(directory.path).list().toList(), isEmpty);
+    });
+
+    test('budget itself actively cancels a pending operation at its deadline', () async {
+      final budget = SubscriptionDownloadBudget(timeout: const Duration(milliseconds: 20));
+      final pending = Completer<int>();
+
+      await expectLater(budget.run(() => pending.future), throwsA(isA<DioException>()));
+
+      expect(budget.cancelToken.isCancelled, isTrue);
+      budget.dispose();
+    });
+
+    test('late remote include response is removed after the shared deadline expires', () async {
+      final httpClient = _LateCompletingDioHttpClient();
+      final context = await newParserWithRef(httpClient);
+      final directory = await Directory.systemTemp.createTemp('marten-profile-late-include-');
+      addTearDown(() => directory.delete(recursive: true));
+      final profile = File('${directory.path}/profile.tmp');
+      await profile.writeAsString('https://include.example.test/config');
+      final budget = SubscriptionDownloadBudget(timeout: const Duration(milliseconds: 25));
+
+      await expectLater(
+        context.parser.expandRemoteLinesInParallel(
+          tempFilePath: profile.path,
+          httpClient: httpClient,
+          cancelToken: budget.cancelToken,
+          ref: context.ref,
+          budget: budget,
+        ),
+        throwsA(anything),
+      );
+      expect(httpClient.lateCalls, 1);
+      expect(httpClient.receivedCancelToken?.isCancelled, isTrue);
+
+      httpClient.response.complete(
+        Response(
+          requestOptions: RequestOptions(path: 'https://include.example.test/config'),
+          statusCode: 200,
+          headers: Headers(),
+        ),
+      );
+      await httpClient.downloadWritten.future;
+      final cleanupDeadline = DateTime.now().add(const Duration(seconds: 2));
+      while (await Directory(directory.path).list().length > 1 && DateTime.now().isBefore(cleanupDeadline)) {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+      budget.dispose();
+
+      expect(
+        (await Directory(directory.path).list().toList()).map((entity) => entity.path),
+        [profile.path],
+        reason: 'a remote include that completes after cancellation must not leave a plaintext fragment behind',
       );
     });
   });

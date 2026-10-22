@@ -45,6 +45,8 @@ void main() {
       reason: 'fatal error with token',
     );
 
+    await reporter.flush();
+
     await reporter.disable();
 
     expect(backend.loggedMessages.length, greaterThanOrEqualTo(2));
@@ -76,7 +78,10 @@ void main() {
     expect(retainingBackend.deleteUnsentReportsCalls, 0);
     expect(retainingBackend.operations.first, 'collection:true');
 
+    await discardingReporter.flush();
+
     await discardingReporter.disable();
+    await retainingReporter.flush();
     await retainingReporter.disable();
   });
 
@@ -88,6 +93,7 @@ void main() {
     reporter.setContext('environment', 'production');
     reporter.setContext('last_action', 'connect');
     reporter.setContext('account_email', 'person@example.com');
+    await reporter.flush();
     await reporter.disable();
 
     expect(backend.customKeys['environment'], 'production');
@@ -110,6 +116,8 @@ void main() {
     expect(reporter.contextSnapshot.join('\n'), isNot(contains('context-0')));
     expect(reporter.contextSnapshot.first, contains('context-1'));
     expect(reporter.contextSnapshot.last, contains('context-$crashContextRecordLimit'));
+
+    await reporter.flush();
 
     await reporter.disable();
 
@@ -138,6 +146,8 @@ void main() {
 
     expect(backend.customKeys['context_00'], contains('buffered before enable'));
     expect(backend.customKeys['context_01'], contains('buffered warning before enable'));
+
+    await reporter.flush();
 
     await reporter.disable();
   });
@@ -171,6 +181,8 @@ void main() {
     expect(delivered, isNot(contains('192.0.2.10')));
     expect(delivered, contains('[redacted]'));
 
+    await reporter.flush();
+
     await reporter.disable();
   });
 
@@ -182,6 +194,8 @@ void main() {
     reporter.onLog(LogRecord(LogLevel.info, 'connection started', 'connection'));
     reporter.onLog(LogRecord(LogLevel.warning, 'handshake retry', 'connection'));
     reporter.onLog(LogRecord(LogLevel.error, 'connection failed', 'connection', StateError('failure')));
+
+    await reporter.flush();
 
     await reporter.disable();
 
@@ -211,6 +225,8 @@ void main() {
     reporter.didChangeAppLifecycleState(AppLifecycleState.resumed);
     reporter.didChangeAppLifecycleState(AppLifecycleState.paused);
 
+    await reporter.flush();
+
     await reporter.disable();
 
     expect(backend.loggedMessages.where((line) => line.contains('[lifecycle]') && line.contains('app=')).length, 2);
@@ -222,6 +238,8 @@ void main() {
 
     await reporter.enable();
     await reporter.recordError(StateError('manual report failure'), StackTrace.current, reason: 'manual');
+
+    await reporter.flush();
 
     await reporter.disable();
 
@@ -247,6 +265,8 @@ void main() {
       isTrue,
     );
     expect(reporter.contextSnapshot.any((line) => line.contains('context after core error')), isTrue);
+
+    await reporter.flush();
 
     await reporter.disable();
 
@@ -275,6 +295,7 @@ void main() {
         ArgumentError('profile persistence failure for $secret'),
       ),
     );
+    await reporter.flush();
     await reporter.disable();
 
     expect(backend.reports, hasLength(2));
@@ -300,6 +321,7 @@ void main() {
     reporter.onLog(LogRecord(LogLevel.error, 'expected failed', 'connection', expectedError));
     await reporter.recordError(networkError, StackTrace.current, reason: 'network');
     await reporter.recordError(expectedError, StackTrace.current, reason: 'expected');
+    await reporter.flush();
     await reporter.disable();
 
     expect(backend.reports, isEmpty);
@@ -326,6 +348,7 @@ void main() {
         StateError('startup failure'),
       ),
     );
+    await reporter.flush();
     await reporter.disable();
 
     expect(backend.reports, hasLength(2));
@@ -342,6 +365,7 @@ void main() {
     reporter.onLog(
       LogRecord(LogLevel.error, 'PlatformDispatcherError: unhandled callback', 'app', StateError('dispatcher')),
     );
+    await reporter.flush();
     await reporter.disable();
 
     expect(backend.reports, hasLength(2));
@@ -364,6 +388,7 @@ void main() {
     final enabledReporter = CrashlyticsLoggyIntegration(backend: backend);
     await enabledReporter.enable();
     enabledReporter.onLog(LogRecord(LogLevel.info, 'will be cleared', 'test'));
+    await enabledReporter.flush();
     await enabledReporter.disable();
     enabledReporter.onLog(LogRecord(LogLevel.error, 'after disable', 'test', StateError('ignored')));
 

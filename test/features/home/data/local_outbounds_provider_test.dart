@@ -13,6 +13,24 @@ void main() {
   const methodChannel = MethodChannel('app.marten.client/method');
 
   group('local outbound ordering', () {
+    test('LocalPingNotifier only swallows strict egress sealed exceptions and rethrows other ping errors', () {
+      final source = File('lib/features/home/data/local_outbounds_provider.dart').readAsStringSync();
+      final pingAllStart = source.indexOf('Future<void> pingAll(');
+      final pingAllEnd = source.indexOf('Future<void> _pingAllAdmitted(', pingAllStart);
+      expect(pingAllStart, isNonNegative);
+      expect(pingAllEnd, greaterThan(pingAllStart));
+
+      final pingAll = source.substring(pingAllStart, pingAllEnd);
+      final sealedHandler = pingAll.indexOf('if (error is StrictVpnEgressSealedException) return;');
+      final thrownThrough = pingAll.indexOf('Error.throwWithStackTrace(');
+      final onError = pingAll.indexOf('.onError((error, stackTrace) {');
+      expect(onError, isNonNegative);
+      expect(sealedHandler, isPositive);
+      expect(thrownThrough, isPositive);
+      expect(thrownThrough, greaterThan(sealedHandler));
+      expect(pingAll, isNot(contains('catch (error, stackTrace)')));
+    });
+
     test('uses the native ordinary Echo probe for ICMP outbounds', () async {
       MethodCall? captured;
       TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(methodChannel, (

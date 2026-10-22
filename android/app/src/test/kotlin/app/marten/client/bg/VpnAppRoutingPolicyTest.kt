@@ -9,32 +9,47 @@ import org.junit.Test
 
 class VpnAppRoutingPolicyTest {
     @Test
-    fun `include-only routing requires a successfully installed external app before establishing VPN`() {
+    fun `VPN establishment applies resolved split routing without bypass or package-name logs`() {
         val vpnService = vpnServiceSource()
-        val includeOnly = sourceSection(
-            vpnService,
-            "is VpnAppRoutingPlan.IncludeOnly -> {",
-            "is VpnAppRoutingPlan.Exclude -> {",
-        )
+        val openTun = functionBody(vpnService, "openRemoteTun")
+        val codeOnly = vpnService.lines()
+            .filterNot { it.trimStart().startsWith("//") }
+            .joinToString("\n")
 
-        val addIncludedPackage = includeOnly.indexOf("if (addIncludePackage(builder, routedPackage)) {")
-        val successfulIncludeBranch = blockBody(includeOnly, addIncludedPackage)
-        val countInstalledExternal = includeOnly.indexOf("installedExternalApplications += 1")
-        val requireExternalApplication = includeOnly.indexOf("check(installedExternalApplications > 0)")
-        val establishVpn = vpnService.indexOf("builder.establish()")
+        assertTrue("openTun must reduce Settings and core options to one routing plan", openTun.contains("resolveVpnAppRoutingPlan("))
+        assertTrue(openTun.contains("ownPackageName = packageName"))
+        assertTrue(openTun.contains("perAppProxyMode = Settings.perAppProxyMode"))
+        assertTrue(openTun.contains("perAppProxyPackages = Settings.perAppProxyList"))
+        assertTrue(openTun.contains("optionIncludePackages = optionIncludePackages"))
+        assertTrue(openTun.contains("optionExcludePackages = optionExcludePackages"))
+        assertTrue(openTun.contains("val optionIncludePackages = options.includePackage"))
+        assertTrue(openTun.contains("val optionExcludePackages = options.excludePackage"))
 
-        assertTrue("external applications must be counted only after addAllowedApplication succeeds", addIncludedPackage >= 0)
-        assertTrue("include-only routing must count installed external applications", countInstalledExternal >= 0)
-        assertTrue("include-only routing must reject an empty installed-app set", requireExternalApplication >= 0)
-        assertTrue("external applications must be counted inside the successful addIncludePackage branch", addIncludedPackage < countInstalledExternal)
-        assertTrue("only external packages may satisfy include-only routing", successfulIncludeBranch.contains("if (routedPackage != packageName)"))
-        assertTrue("only successfully added external packages may satisfy include-only routing", successfulIncludeBranch.contains("installedExternalApplications += 1"))
-        assertTrue("include-only guard must run before VPN establishment", vpnService.indexOf("check(installedExternalApplications > 0)") < establishVpn)
+        val includeHelper = blockBody(vpnService, vpnService.indexOf("private fun addIncludePackage"))
+        val excludeHelper = blockBody(vpnService, vpnService.indexOf("private fun addExcludePackage"))
+        val includePlan = blockBody(openTun, openTun.indexOf("is VpnAppRoutingPlan.IncludeOnly"))
+        val excludePlan = blockBody(openTun, openTun.indexOf("is VpnAppRoutingPlan.Exclude"))
+        assertTrue("IncludeOnly must apply Android allowed-app routing", includeHelper.contains("builder.addAllowedApplication(packageName)"))
+        assertTrue("IncludeOnly must invoke its allowed-app helper", includePlan.contains("addIncludePackage(builder, routedPackage)"))
+        assertTrue("Exclude must apply Android disallowed-app routing", excludeHelper.contains("builder.addDisallowedApplication(packageName)"))
+        assertTrue("Exclude must invoke its disallowed-app helper", excludePlan.contains("addExcludePackage(builder, bypassedPackage)"))
 
-        val includeHelper = functionBody(vpnService, "addIncludePackage")
-        val excludeHelper = functionBody(vpnService, "addExcludePackage")
-        assertFalse("include helper must not log per-package names", Regex("Log\\.[\\s\\S]*packageName").containsMatchIn(includeHelper))
-        assertFalse("exclude helper must not log per-package names", Regex("Log\\.[\\s\\S]*packageName").containsMatchIn(excludeHelper))
+        assertFalse("VPN routing must never enable physical-network bypass", codeOnly.contains("allowBypass("))
+        assertFalse("split-routing logs must not reveal an allowed package name", openTun.contains("\$routedPackage"))
+        assertFalse("split-routing logs must not reveal an excluded package name", openTun.contains("\$bypassedPackage"))
+
+        assertTrue(includePlan.contains("var installedExternalApplications = 0"))
+        assertTrue("only successfully added non-own apps may satisfy IncludeOnly establishment", includePlan.contains("if (routedPackage != packageName)"))
+        assertTrue(includePlan.contains("installedExternalApplications += 1"))
+        assertTrue(includePlan.contains("check(installedExternalApplications > 0)"))
+
+        assertTrue(openTun.contains("check(hasInet4Address || hasInet6Address)"))
+        assertTrue(openTun.contains("if (!hasInet4Address)"))
+        assertTrue(openTun.contains("builder.addAddress(STRICT_UNSUPPORTED_IPV4_ADDRESS"))
+        assertTrue(openTun.contains("if (!hasInet6Address)"))
+        assertTrue(openTun.contains("builder.addAddress(STRICT_UNSUPPORTED_IPV6_ADDRESS"))
+        assertTrue(openTun.contains("builder.addRoute(\"0.0.0.0\", 0)"))
+        assertTrue(openTun.contains("builder.addRoute(\"::\", 0)"))
     }
 
     @Test

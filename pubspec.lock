@@ -53,10 +53,10 @@ packages:
     dependency: "direct main"
     description:
       name: app_links
-      sha256: "85ed8fc1d25a76475914fff28cc994653bd900bc2c26e4b57a49e097febb54ba"
+      sha256: "3462d9defc61565fde4944858b59bec5be2b9d5b05f20aed190adb3ad08a7abc"
       url: "https://pub.dev"
     source: hosted
-    version: "6.4.0"
+    version: "7.0.0"
   app_links_linux:
     dependency: transitive
     description:
@@ -66,7 +66,7 @@ packages:
     source: hosted
     version: "1.0.3"
   app_links_platform_interface:
-    dependency: transitive
+    dependency: "direct overridden"
     description:
       name: app_links_platform_interface
       sha256: "05f5379577c513b534a29ddea68176a4d4802c46180ee8e2e966257158772a3f"
@@ -82,7 +82,7 @@ packages:
     source: hosted
     version: "1.0.4"
   archive:
-    dependency: transitive
+    dependency: "direct main"
     description:
       name: archive
       sha256: "0c64e928dcbefddecd234205422bcfc2b5e6d31be0b86fef0d0dd48d7b4c9742"
@@ -361,6 +361,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "1.2.0"
+  dbus:
+    dependency: transitive
+    description:
+      name: dbus
+      sha256: d0c98dcd4f5169878b6cf8f6e0a52403a9dff371a3e2f019697accbf6f44a270
+      url: "https://pub.dev"
+    source: hosted
+    version: "0.7.12"
   decimal:
     dependency: transitive
     description:
@@ -492,11 +500,12 @@ packages:
   file_picker:
     dependency: "direct main"
     description:
-      name: file_picker
-      sha256: ab13ae8ef5580a411c458d6207b6774a6c237d77ac37011b13994879f68a8810
-      url: "https://pub.dev"
-    source: hosted
-    version: "8.3.7"
+      path: "."
+      ref: "97e4c8d904be181fc4cf8adc73d1ec889db0f287"
+      resolved-ref: "97e4c8d904be181fc4cf8adc73d1ec889db0f287"
+      url: "https://github.com/miguelpruivo/flutter_file_picker.git"
+    source: git
+    version: "10.3.10"
   firebase_core:
     dependency: "direct main"
     description:
@@ -2003,7 +2012,7 @@ packages:
     source: hosted
     version: "3.0.2"
   vm_service:
-    dependency: transitive
+    dependency: "direct main"
     description:
       name: vm_service
       sha256: ddfa8d30d89985b96407efce8acbdd124701f96741f2d981ca860662f1c0dc02

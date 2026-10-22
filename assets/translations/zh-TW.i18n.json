@@ -589,7 +589,8 @@
       "notFound": "未找到設定檔",
       "invalidConfig": "設定無效",
       "invalidUrl": "URL 無效",
-      "canceledByUser": "使用者已取消"
+      "canceledByUser": "使用者已取消",
+      "deviceLimit": "此訂閱的裝置數量已達上限"
     },
     "connectivity": {
       "unexpected": "意外失敗",

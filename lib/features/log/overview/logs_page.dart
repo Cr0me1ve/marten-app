@@ -14,6 +14,7 @@ import 'package:marten/features/log/data/log_path_resolver.dart';
 import 'package:marten/features/log/model/log_entity.dart';
 import 'package:marten/features/log/model/log_level.dart';
 import 'package:marten/features/log/overview/logs_overview_notifier.dart';
+import 'package:marten/features/log/overview/profiling_report_page.dart';
 import 'package:marten/utils/utils.dart';
 import 'package:sliver_tools/sliver_tools.dart';
 
@@ -36,6 +37,15 @@ class LogsPage extends HookConsumerWidget with PresLogger {
       appBar: AppBar(
         title: Text(t.pages.logs.title),
         actions: [
+          if (const bool.fromEnvironment('energy_profiling'))
+            IconButton(
+              onPressed: () => Navigator.of(
+                context,
+              ).push(MaterialPageRoute<void>(builder: (_) => ProfilingReportPage(resolver: pathResolver))),
+              icon: const Icon(Icons.analytics_outlined),
+              tooltip: Localizations.localeOf(context).languageCode == 'ru' ? 'Профиль нагрузки' : 'Load profile',
+              iconSize: 20,
+            ),
           if (state.paused)
             IconButton(
               onPressed: notifier.resume,
@@ -72,7 +82,7 @@ class LogsPage extends HookConsumerWidget with PresLogger {
                       final opened = await UriUtils.tryShareOrLaunchFile(
                         file.uri,
                         fileOrDir: pathResolver.directory.uri,
-                        mimeType: "text/plain",
+                        mimeType: file.path.endsWith('.zip') ? 'application/zip' : 'text/plain',
                       );
                       if (!opened && context.mounted) {
                         ScaffoldMessenger.of(

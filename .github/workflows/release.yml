@@ -6,7 +6,10 @@ on:
       release_tag:
         description: "Release tag matching the pubspec version"
         required: true
-        default: "v0.7.9"
+        type: string
+      native_runtime:
+        description: "JSON object with the native runtime artifact pins declared in this workflow"
+        required: true
         type: string
 
 permissions:
@@ -20,21 +23,21 @@ env:
   FLUTTER_VERSION: "3.38.5"
   FASTFORGE_VERSION: "0.6.8"
   ANDROID_NDK_VERSION: "28.2.13676358"
-  ANDROID_CORE_RELEASE_TAG: "core-0.7.9"
-  ANDROID_CORE_AAR_SHA256: "c37191aa6bd7953bc73b617be4db38a0dcb1b3e917a0bcaae0de6215170bbe59"
-  ANDROID_CORE_ARM_SHA256: "cc95ba0f6c49b3b657e8312b023505b0cb7d73615c620a77c2d07aa7e7ee6c8b"
-  ANDROID_CORE_ARM64_SHA256: "85d909146f48b69906d5fe955bc9c7161d340cb36ac93d26ab7c6c02b2bb4071"
-  ANDROID_CORE_X64_SHA256: "ebec955d480cb406810d463f8bf5cb2672365251c4300064a4d6ff56c405c9a2"
-  DESKTOP_CORE_RELEASE_TAG: "core-desktop-0.7.8"
-  LINUX_CORE_ARCHIVE: "marten-core-linux-amd64-20260818.tar.gz"
-  LINUX_CORE_SHA256: "ae17263c06cd3d8e64a9d6b4be2c465a3b73881bd51077f99fadb7c052a757fc"
-  WINDOWS_CORE_ARCHIVE: "marten-core-windows-amd64-20260818.tar.gz"
-  WINDOWS_CORE_SHA256: "4de67e0e6b32c571b53092810693e59d9715efc1e4294ac26e6e80ebdba3b317"
-  CORE_REVISION: "edbe0d498ac55e28f822a0b8dc9ac708c86dc8c8"
-  PUBLIC_CORE_REVISION: "777a837f7f3fc2113588d06ed9fa898880227642"
-  SING_BOX_REVISION: "7303baa90f7f55102b621fb34704736011b3e1a1"
-  PUBLIC_SING_BOX_REVISION: "c18a7ec12ab1e204d75d9050ffd1e72f9d09de4d"
-  TURNCOAT_REVISION: "29ba26b97c3c62a9aa7da7f8a4d5bd04a36e1622"
+  ANDROID_CORE_RELEASE_TAG: ${{ fromJSON(inputs.native_runtime).ANDROID_CORE_RELEASE_TAG }}
+  ANDROID_CORE_AAR_SHA256: ${{ fromJSON(inputs.native_runtime).ANDROID_CORE_AAR_SHA256 }}
+  ANDROID_CORE_ARM_SHA256: ${{ fromJSON(inputs.native_runtime).ANDROID_CORE_ARM_SHA256 }}
+  ANDROID_CORE_ARM64_SHA256: ${{ fromJSON(inputs.native_runtime).ANDROID_CORE_ARM64_SHA256 }}
+  ANDROID_CORE_X64_SHA256: ${{ fromJSON(inputs.native_runtime).ANDROID_CORE_X64_SHA256 }}
+  DESKTOP_CORE_RELEASE_TAG: ${{ fromJSON(inputs.native_runtime).DESKTOP_CORE_RELEASE_TAG }}
+  LINUX_CORE_ARCHIVE: ${{ fromJSON(inputs.native_runtime).LINUX_CORE_ARCHIVE }}
+  LINUX_CORE_SHA256: ${{ fromJSON(inputs.native_runtime).LINUX_CORE_SHA256 }}
+  WINDOWS_CORE_ARCHIVE: ${{ fromJSON(inputs.native_runtime).WINDOWS_CORE_ARCHIVE }}
+  WINDOWS_CORE_SHA256: ${{ fromJSON(inputs.native_runtime).WINDOWS_CORE_SHA256 }}
+  CORE_REVISION: ${{ fromJSON(inputs.native_runtime).CORE_REVISION }}
+  PUBLIC_CORE_REVISION: ${{ fromJSON(inputs.native_runtime).PUBLIC_CORE_REVISION }}
+  SING_BOX_REVISION: ${{ fromJSON(inputs.native_runtime).SING_BOX_REVISION }}
+  PUBLIC_SING_BOX_REVISION: ${{ fromJSON(inputs.native_runtime).PUBLIC_SING_BOX_REVISION }}
+  TURNCOAT_REVISION: ${{ fromJSON(inputs.native_runtime).TURNCOAT_REVISION }}
   RELEASE_SIGNER_SHA256: "4acd16e170370e30653cd5be65643e745c6b8e9ee1e00f91a308bc86110b1f5d"
 
 jobs:
@@ -58,7 +61,7 @@ jobs:
       - name: Set up Go for embedded provenance inspection
         uses: actions/setup-go@v5
         with:
-          go-version: "1.26.5"
+          go-version: "1.26.6"
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
@@ -114,7 +117,7 @@ jobs:
         run: |
           test -n "${GOOGLE_SERVICES_JSON}"
           printf '%s' "${GOOGLE_SERVICES_JSON}" > android/app/google-services.json
-          test "$(jq -r '.project_info.project_id' android/app/google-services.json)" = "marten-test-690a1"
+          test -n "$(jq -r '.project_info.project_id // empty' android/app/google-services.json)"
           jq -e '.client[] | select(.client_info.android_client_info.package_name == "app.marten.client")' \
             android/app/google-services.json >/dev/null
 

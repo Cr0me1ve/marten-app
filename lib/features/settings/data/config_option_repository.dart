@@ -1,18 +1,19 @@
+import 'dart:convert';
+
 import 'package:dartx/dartx.dart';
 import 'package:fpdart/fpdart.dart';
+import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:marten/core/model/optional_range.dart';
 import 'package:marten/core/model/region.dart';
 import 'package:marten/core/utils/exception_handler.dart';
 import 'package:marten/core/utils/json_converters.dart';
 import 'package:marten/core/utils/preferences_utils.dart';
 import 'package:marten/features/log/model/log_level.dart';
-import 'package:marten/features/profile/data/profile_parser.dart';
 import 'package:marten/features/settings/model/config_option_failure.dart';
 import 'package:marten/singbox/model/singbox_config_enum.dart';
 import 'package:marten/singbox/model/singbox_config_option.dart';
 import 'package:marten/singbox/model/singbox_rule.dart';
 import 'package:marten/utils/utils.dart';
-import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 abstract class ConfigOptions {
@@ -390,11 +391,65 @@ class ConfigOptionRepository with ExceptionHandler, InfraLogger {
   Either<ConfigOptionFailure, SingboxConfigOption> fullOptions() =>
       Either.tryCatch(() => _getConfigOptions(), ConfigOptionFailure.unexpected);
 
-  Either<ConfigOptionFailure, SingboxConfigOption> fullOptionsOverrided(String? profileOverride) =>
-      Either.tryCatch(() => _getConfigOptions(), ConfigOptionFailure.unexpected).flatMap(
-        (options) => Either.tryCatch(() {
-          final json = ProfileParser.applyProfileOverride(options.toJson(), profileOverride);
-          return SingboxConfigOption.fromJson(json);
-        }, ConfigOptionFailure.unexpected),
-      );
+  Either<ConfigOptionFailure, SingboxConfigOption> fullOptionsOverrided(String? profileOverride) => Either.tryCatch(
+    () => _getConfigOptions(),
+    ConfigOptionFailure.unexpected,
+  ).map((options) => _applyTolerantProfileOverride(options, profileOverride));
+
+  SingboxConfigOption _applyTolerantProfileOverride(SingboxConfigOption base, String? profileOverride) {
+    if (profileOverride == null || !profileOverride.contains('{')) return base;
+
+    late final Map<String, dynamic> override;
+    try {
+      final decoded = jsonDecode(profileOverride);
+      if (decoded is! Map) return base;
+      override = Map<String, dynamic>.from(decoded);
+    } catch (_) {
+      loggy.warning('ignored invalid profile override fields count=1');
+      return base;
+    }
+
+    var current = base;
+    var ignored = 0;
+    for (final entry in override.entries) {
+      final currentJson = current.toJson();
+      if (!currentJson.containsKey(entry.key)) {
+        ignored++;
+        continue;
+      }
+
+      final currentValue = currentJson[entry.key];
+      final overrideValue = entry.value;
+      if (currentValue is Map && overrideValue is Map) {
+        for (final nestedEntry in overrideValue.entries) {
+          final latestJson = current.toJson();
+          final latestNested = latestJson[entry.key];
+          if (latestNested is! Map || !latestNested.containsKey(nestedEntry.key)) {
+            ignored++;
+            continue;
+          }
+          final candidateJson = _copyConfigJson(latestJson);
+          (candidateJson[entry.key] as Map<String, dynamic>)[nestedEntry.key.toString()] = nestedEntry.value;
+          try {
+            current = SingboxConfigOption.fromJson(candidateJson);
+          } catch (_) {
+            ignored++;
+          }
+        }
+        continue;
+      }
+
+      final candidateJson = _copyConfigJson(currentJson)..[entry.key] = overrideValue;
+      try {
+        current = SingboxConfigOption.fromJson(candidateJson);
+      } catch (_) {
+        ignored++;
+      }
+    }
+    if (ignored != 0) loggy.warning('ignored invalid profile override fields count=$ignored');
+    return current;
+  }
+
+  static Map<String, dynamic> _copyConfigJson(Map<String, dynamic> source) =>
+      Map<String, dynamic>.from(jsonDecode(jsonEncode(source)) as Map);
 }

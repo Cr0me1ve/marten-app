@@ -5,6 +5,8 @@
 //  Created by GFWFighter on 7/24/1402 AP.
 //
 
+#include "Flutter/Generated.xcconfig"
+
 BASE_BUNDLE_IDENTIFIER=app.marten.client
 SERVICE_IDENTIFIER=app.marten.client
 DEVELOPMENT_TEAM=

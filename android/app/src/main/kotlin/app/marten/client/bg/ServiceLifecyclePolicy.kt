@@ -2,6 +2,7 @@ package app.marten.client.bg
 
 import app.marten.client.constant.Status
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Deferred
@@ -9,7 +10,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import java.util.ArrayDeque
 import java.util.concurrent.atomic.AtomicLong
 
 internal fun shouldContinueCoreLifecycleOperation(
@@ -52,7 +55,59 @@ internal fun shouldRejectNewVpnGeneration(
 }
 
 /**
- * The no-route replacement session is only a manual Marten-disconnect aid.
+ * A VPN Network owned by Marten is not proof that the current process owns its
+ * generation. Package replacement can kill the process (and its retained PFD)
+ * while ConnectivityManager still publishes the old Network for a short time.
+ * That Network must disappear before a fresh process calls Builder.establish().
+ */
+internal fun shouldDeferVpnStartForUntrackedOwnNetwork(
+    vpnMode: Boolean,
+    retainedDescriptorValid: Boolean,
+    vpnOwnershipKnown: Boolean,
+    ownVpnNetworkActive: Boolean,
+): Boolean =
+    vpnMode &&
+        !retainedDescriptorValid &&
+        vpnOwnershipKnown &&
+        ownVpnNetworkActive
+
+/**
+ * Resolves the asymmetric Android single-VPN-slot policy after owner UIDs are
+ * known. A real foreign network always wins, except for the exact user start
+ * that is still transferring ownership or its short, generation-scoped
+ * overlap with the pre-existing foreign Network while ConnectivityManager
+ * retires the old snapshot.
+ */
+internal fun shouldYieldForExternalVpnOwnership(
+    externalVpnActive: Boolean,
+    explicitUserStartPending: Boolean,
+    vpnOwnershipWasEstablished: Boolean,
+    explicitTakeoverOverlapAllowed: Boolean,
+): Boolean =
+    externalVpnActive &&
+        !(
+            (explicitUserStartPending && !vpnOwnershipWasEstablished) ||
+                explicitTakeoverOverlapAllowed
+            )
+
+internal fun isExplicitVpnTakeoverOverlapAllowed(
+    ownVpnActive: Boolean,
+    currentGeneration: Long,
+    takeoverGeneration: Long,
+    nowElapsedRealtimeMs: Long,
+    takeoverDeadlineElapsedRealtimeMs: Long,
+    externalNetworkHandles: Set<Long>,
+    preexistingExternalNetworkHandles: Set<Long>,
+): Boolean =
+    ownVpnActive &&
+        takeoverGeneration == currentGeneration &&
+        nowElapsedRealtimeMs <= takeoverDeadlineElapsedRealtimeMs &&
+        externalNetworkHandles.isNotEmpty() &&
+        preexistingExternalNetworkHandles.containsAll(externalNetworkHandles)
+
+/**
+ * The full-route blocking replacement session is only a manual
+ * Marten-disconnect aid.
  * Re-establishing it after Android revoked Marten would compete with the VPN
  * that has just taken ownership of the system slot.
  */
@@ -68,7 +123,7 @@ internal fun shouldRetirePlatformVpnAfterCoreStop(
         !externalVpnActive
 
 /**
- * Identifies the no-route VPN network created solely to retire Marten's
+ * Identifies the full-route blocking VPN network created solely to retire Marten's
  * previous framework session.
  *
  * The documentation-only IPv4 marker makes the replacement distinguishable
@@ -93,7 +148,9 @@ internal suspend fun requestAuthoritativePlatformStop(
 ): Boolean {
     requestCoreStop()
     val coreStopped = awaitCoreStop()
-    releaseFrameworkService()
+    if (coreStopped) {
+        releaseFrameworkService()
+    }
     return coreStopped
 }
 
@@ -104,32 +161,27 @@ internal fun isPlatformStopReleaseComplete(
 ): Boolean = coreStopped && cleanupFinished && vpnReleased
 
 /**
- * The user-visible Disconnect operation is complete once the native runtime
- * and its owned descriptors are gone. Some Android builds keep reporting the
- * already inert VPN network agent for a short time after that point. That
- * framework lag is handled by the service and must not surface as an internal
- * Flutter error dialog.
+ * The user-visible Disconnect operation is complete once the service has
+ * sealed new TUN admission and Android no longer exposes Marten's VPN network.
+ * The one exact native close may still finish on its tracked process-wide
+ * owner; every later setup/start remains blocked on that same close barrier.
  */
 internal fun isPlatformStopSafeForUser(
     coreStopped: Boolean,
-    cleanupFinished: Boolean,
-): Boolean = coreStopped && cleanupFinished
+    vpnReleased: Boolean,
+): Boolean = coreStopped && vpnReleased
 
-internal fun shouldStopForLostVpnOwnership(
-    externalVpnActive: Boolean,
-    authorizationRevoked: Boolean,
+internal fun shouldRecoverMissingOwnVpn(
     ownershipKnown: Boolean,
     ownVpnActive: Boolean,
+    serviceOwnedTransitionActive: Boolean,
     consecutiveOwnVpnMisses: Int,
     requiredMisses: Int,
 ): Boolean =
-    externalVpnActive ||
-        authorizationRevoked ||
-        (
-            ownershipKnown &&
-                !ownVpnActive &&
-                consecutiveOwnVpnMisses >= requiredMisses.coerceAtLeast(1)
-            )
+    ownershipKnown &&
+        !ownVpnActive &&
+        !serviceOwnedTransitionActive &&
+        consecutiveOwnVpnMisses >= requiredMisses.coerceAtLeast(1)
 
 internal fun isQuiescentBoundServiceState(
     status: Status,
@@ -213,10 +265,16 @@ internal suspend fun awaitPlatformStopRelease(
  * asynchronous onDestroy cleanup runs. Shared resources must only be changed
  * by the newest owner.
  */
+internal data class TerminalStopEpochClaim(
+    val supersededUserSessionEpoch: Long?,
+    val terminalSessionEpoch: Long,
+)
+
 internal object ServiceLifecycleOwnership {
     private const val FLUTTER_RESTART_LEASE_TIMEOUT_NANOS = 60_000_000_000L
     private const val LIFECYCLE_CLEANUP_TIMEOUT_MS = 15_000L
     private const val CLEANUP_REGISTRATION_POLL_MS = 20L
+    private const val EXPLICIT_USER_STOP_HISTORY_LIMIT = 8
     private val sequence = AtomicLong(0L)
     private val operationSequence = AtomicLong(0L)
     private val operationLock = Any()
@@ -226,13 +284,22 @@ internal object ServiceLifecycleOwnership {
     private var currentOwnerToken = 0L
     private var nativeRecoveryOwnerToken: Long? = null
     private var flutterRestartLeaseToken: Long? = null
+    private var flutterRestartLeaseSessionEpoch = 0L
     private var flutterRestartLeaseStartedAtNanos = 0L
+    private var explicitStartLeaseToken: Long? = null
+    private var explicitStartLeaseSessionEpoch = 0L
+    private var terminalSessionEpoch = 0L
+    private var terminalStopActive = false
+    private var terminalStopSupersededUserSessionEpoch: Long? = null
+    private val explicitlyStoppedUserSessionEpochs = ArrayDeque<Long>()
+    private var operationChanged = CompletableDeferred<Unit>()
     private var pendingCleanup: Deferred<Unit>? = null
     private var lastCleanupOwnerToken = 0L
 
     fun acquire(): Long = synchronized(operationLock) {
         val token = sequence.incrementAndGet()
         currentOwnerToken = token
+        signalOperationChangedLocked()
         token
     }
 
@@ -274,10 +341,108 @@ internal object ServiceLifecycleOwnership {
             }.also {
                 pendingCleanup = it
                 lastCleanupOwnerToken = ownerToken
+                // Wake terminal-release continuations as soon as cleanup is
+                // registered. They must observe this exact owner and wait for
+                // its completion instead of racing through the short gap
+                // between Status.Stopped and VpnService.onDestroy().
+                signalOperationChangedLocked()
+            }
+        }
+        operation.invokeOnCompletion {
+            synchronized(operationLock) {
+                signalOperationChangedLocked()
             }
         }
         operation.start()
         return true
+    }
+
+    fun hasRegisteredCleanup(ownerToken: Long): Boolean = synchronized(operationLock) {
+        lastCleanupOwnerToken == ownerToken
+    }
+
+    fun hasPendingCleanup(): Boolean = synchronized(operationLock) {
+        pendingCleanup?.isCompleted == false
+    }
+
+    /**
+     * Direct/protected diagnostics may reopen for a stopped app only while the
+     * exact terminal epoch still owns lifecycle admission. A newly issued
+     * Connect or restart lease makes an older release attempt stale before it
+     * can touch the native probe gates.
+     */
+    fun ownsTerminalNetworkingRelease(): Boolean = synchronized(operationLock) {
+        terminalStopActive &&
+            explicitStartLeaseToken == null &&
+            flutterRestartLeaseToken == null &&
+            nativeRecoveryOwnerToken == null
+    }
+
+    /**
+     * Runs one terminal networking-release continuation after every exact
+     * lifecycle lease and predecessor cleanup has completed. The coroutine is
+     * dormant between ownership events: there is no stopped-state timer or
+     * polling wakeup. A newer Connect invalidates the terminal epoch and makes
+     * the continuation exit before invoking [action].
+     */
+    fun runWhenTerminalNetworkingReleaseOwned(action: () -> Unit) {
+        cleanupScope.launch {
+            while (true) {
+                val change = synchronized(operationLock) {
+                    expireFlutterRestartLeaseIfNeeded()
+                    if (!terminalStopActive) return@launch
+                    val cleanupPending = pendingCleanup?.isCompleted == false
+                    if (
+                        explicitStartLeaseToken == null &&
+                        flutterRestartLeaseToken == null &&
+                        nativeRecoveryOwnerToken == null &&
+                        !cleanupPending
+                    ) {
+                        null
+                    } else {
+                        operationChanged
+                    }
+                }
+                if (change == null) {
+                    action()
+                    return@launch
+                }
+                change.await()
+            }
+        }
+    }
+
+    /**
+     * Waits without polling until the terminal lifecycle owns networking
+     * release and, when supplied, the exact stopped service has registered and
+     * completed its onDestroy cleanup. A newer Connect invalidates the wait.
+     */
+    suspend fun awaitTerminalNetworkingReleaseOwned(
+        requiredCleanupOwnerToken: Long?,
+    ): Boolean {
+        while (true) {
+            val change = synchronized(operationLock) {
+                expireFlutterRestartLeaseIfNeeded()
+                if (!terminalStopActive) return false
+                val cleanupRegistered =
+                    requiredCleanupOwnerToken == null ||
+                        lastCleanupOwnerToken >= requiredCleanupOwnerToken
+                val cleanupPending = pendingCleanup?.isCompleted == false
+                if (
+                    explicitStartLeaseToken == null &&
+                    flutterRestartLeaseToken == null &&
+                    nativeRecoveryOwnerToken == null &&
+                    cleanupRegistered &&
+                    !cleanupPending
+                ) {
+                    null
+                } else {
+                    operationChanged
+                }
+            }
+            if (change == null) return true
+            change.await()
+        }
     }
 
     suspend fun awaitPendingCleanup(
@@ -306,6 +471,29 @@ internal object ServiceLifecycleOwnership {
             }
         }
         return isCurrent(ownerToken)
+    }
+
+    /** Waits event-first for the exact predecessor cleanup, without a timer. */
+    suspend fun awaitPendingCleanupCompletion(ownerToken: Long): Boolean {
+        val operation = synchronized(operationLock) {
+            if (!isCurrent(ownerToken) || terminalStopActive) return false
+            pendingCleanup
+        }
+        if (operation != null) {
+            try {
+                operation.await()
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Throwable) {
+                // The replacement owns a fresh exact Mobile.close after this
+                // predecessor barrier. A completed predecessor failure must
+                // not strand that safer owner forever; only an unfinished or
+                // cancelled wait remains a barrier.
+            }
+        }
+        return synchronized(operationLock) {
+            isCurrent(ownerToken) && !terminalStopActive
+        }
     }
 
     /**
@@ -360,28 +548,281 @@ internal object ServiceLifecycleOwnership {
         synchronized(operationLock) {
             if (nativeRecoveryOwnerToken == ownerToken) {
                 nativeRecoveryOwnerToken = null
+                signalOperationChangedLocked()
             }
+        }
+    }
+
+    /**
+     * Waits for lifecycle ownership to change, with a sparse timeout only as a
+     * liveness fallback. The caller must re-run exact admission afterwards.
+     * A terminal Stop or service replacement ends the old owner's retry job.
+     */
+    suspend fun awaitNativeRecoveryAdmissionChange(
+        ownerToken: Long,
+        timeoutMs: Long,
+    ): Boolean {
+        val change = synchronized(operationLock) {
+            expireFlutterRestartLeaseIfNeeded()
+            if (!isCurrent(ownerToken) || terminalStopActive) return false
+            operationChanged
+        }
+        withTimeoutOrNull(timeoutMs.coerceAtLeast(1L)) {
+            change.await()
+        }
+        return synchronized(operationLock) {
+            isCurrent(ownerToken) && !terminalStopActive
+        }
+    }
+
+    /** Waits without polling until this service's exact native recovery lease is released. */
+    suspend fun awaitNativeRecoveryRelease(ownerToken: Long): Boolean {
+        while (true) {
+            val change = synchronized(operationLock) {
+                if (!isCurrent(ownerToken) || terminalStopActive) return false
+                if (nativeRecoveryOwnerToken == null) return true
+                operationChanged
+            }
+            change.await()
         }
     }
 
     fun tryAcquireFlutterRestart(): Long? = synchronized(operationLock) {
         expireFlutterRestartLeaseIfNeeded()
-        if (nativeRecoveryOwnerToken != null || flutterRestartLeaseToken != null) {
+        if (terminalStopActive || nativeRecoveryOwnerToken != null || flutterRestartLeaseToken != null) {
             return@synchronized null
         }
         val token = operationSequence.incrementAndGet()
         flutterRestartLeaseToken = token
+        flutterRestartLeaseSessionEpoch = terminalSessionEpoch
         flutterRestartLeaseStartedAtNanos = System.nanoTime()
         token
     }
+
+    suspend fun awaitFlutterRestartLease(timeoutMs: Long): Long? {
+        val token = withTimeoutOrNull(timeoutMs) {
+            while (true) {
+                var token: Long? = null
+                var terminal = false
+                val change = synchronized(operationLock) {
+                    expireFlutterRestartLeaseIfNeeded()
+                    terminal = terminalStopActive
+                    if (!terminal && nativeRecoveryOwnerToken == null && flutterRestartLeaseToken == null) {
+                        token = operationSequence.incrementAndGet()
+                        flutterRestartLeaseToken = token
+                        flutterRestartLeaseSessionEpoch = terminalSessionEpoch
+                        flutterRestartLeaseStartedAtNanos = System.nanoTime()
+                    }
+                    operationChanged
+                }
+                if (terminal) return@withTimeoutOrNull 0L
+                token?.let { return@withTimeoutOrNull it }
+                change.await()
+            }
+
+            @Suppress("UNREACHABLE_CODE")
+            0L
+        }
+        return token?.takeIf { it > 0L }
+    }
+
+    fun isFlutterRestartLeaseCurrent(token: Long): Boolean = synchronized(operationLock) {
+        expireFlutterRestartLeaseIfNeeded()
+        !terminalStopActive &&
+            flutterRestartLeaseToken == token &&
+            flutterRestartLeaseSessionEpoch == terminalSessionEpoch
+    }
+
+    /**
+     * Reserves a native Connect command without clearing the durable Stop
+     * tombstone. The lease is created while the native handoff lock is held;
+     * a later terminal Stop invalidates its session epoch before admission can
+     * publish fresh user intent.
+     */
+    fun issueExplicitStartLease(): Long = synchronized(operationLock) {
+        val token = operationSequence.incrementAndGet()
+        explicitStartLeaseToken = token
+        explicitStartLeaseSessionEpoch = terminalSessionEpoch
+        signalOperationChangedLocked()
+        token
+    }
+
+    fun isExplicitStartLeaseCurrent(token: Long): Boolean = synchronized(operationLock) {
+        explicitStartLeaseToken == token &&
+            explicitStartLeaseSessionEpoch == terminalSessionEpoch
+    }
+
+    fun releaseExplicitStartLease(token: Long) {
+        synchronized(operationLock) {
+            if (explicitStartLeaseToken == token) {
+                explicitStartLeaseToken = null
+                explicitStartLeaseSessionEpoch = terminalSessionEpoch
+                signalOperationChangedLocked()
+            }
+        }
+    }
+
+    /**
+     * Validates the exact native Connect lease and executes the non-suspending
+     * admission transaction under the same lifecycle lock used by Stop. A
+     * token-less call is reserved for a synchronous native user entry; every
+     * Flutter path (including a native handoff completed by Flutter) must
+     * present the exact lease captured before its first asynchronous wait.
+     */
+    fun runExplicitUserSession(
+        explicitStartLease: Long?,
+        action: () -> Unit,
+    ): Boolean = admitExplicitUserSession(explicitStartLease) { action() } != null
+
+    /**
+     * Admits a new user session and returns the exact terminal epoch that every
+     * later Flutter start dispatch must carry. Stop advances this epoch before
+     * persisting its tombstone, so an older prompt/coroutine cannot resurrect
+     * user intent even after a newer Connect has been admitted.
+     */
+    fun admitExplicitUserSession(
+        explicitStartLease: Long?,
+        action: (Long) -> Unit,
+    ): Long? = synchronized(operationLock) {
+        if (
+            explicitStartLease != null &&
+            (
+                explicitStartLeaseToken != explicitStartLease ||
+                    explicitStartLeaseSessionEpoch != terminalSessionEpoch
+            )
+        ) {
+            return@synchronized null
+        }
+        val admittedEpoch = terminalSessionEpoch
+        action(admittedEpoch)
+        terminalStopActive = false
+        terminalStopSupersededUserSessionEpoch = null
+        if (explicitStartLease == null || explicitStartLeaseToken == explicitStartLease) {
+            explicitStartLeaseToken = null
+            explicitStartLeaseSessionEpoch = terminalSessionEpoch
+        }
+        signalOperationChangedLocked()
+        admittedEpoch
+    }
+
+    fun currentUserSessionEpoch(): Long? = synchronized(operationLock) {
+        terminalSessionEpoch.takeUnless { terminalStopActive }
+    }
+
+    fun isUserSessionEpochCurrent(epoch: Long): Boolean = synchronized(operationLock) {
+        !terminalStopActive && terminalSessionEpoch == epoch
+    }
+
+    /**
+     * Reports whether a native user entry point explicitly stopped this exact
+     * admitted Connect session. The small process-local history is sufficient:
+     * a Dart start continuation cannot survive process death, while retaining
+     * several epochs lets multiple delayed continuations resolve without a
+     * newer Connect overwriting their ownership evidence.
+     */
+    fun wasUserSessionExplicitlyStopped(epoch: Long): Boolean = synchronized(operationLock) {
+        explicitlyStoppedUserSessionEpochs.contains(epoch)
+    }
+
+    /** Executes a final non-suspending start dispatch atomically with Stop. */
+    fun runIfUserSessionEpochCurrent(epoch: Long, action: () -> Unit): Boolean =
+        synchronized(operationLock) {
+            if (terminalStopActive || terminalSessionEpoch != epoch) {
+                return@synchronized false
+            }
+            action()
+            true
+        }
+
+    fun invalidateFlutterRestartForTerminalStop(
+        explicitUserStop: Boolean = false,
+    ): TerminalStopEpochClaim = synchronized(operationLock) {
+        invalidateForTerminalStopLocked(explicitUserStop = explicitUserStop)
+    }
+
+    fun invalidateForTerminalStopIfUserSessionEpochCurrent(epoch: Long): TerminalStopEpochClaim? =
+        synchronized(operationLock) {
+            if (terminalStopActive || terminalSessionEpoch != epoch) {
+                null
+            } else {
+                invalidateForTerminalStopLocked(explicitUserStop = false)
+            }
+        }
+
+    fun currentTerminalStopEpoch(): Long? = synchronized(operationLock) {
+        terminalSessionEpoch.takeIf { terminalStopActive }
+    }
+
+    fun isTerminalStopEpochCurrent(epoch: Long): Boolean = synchronized(operationLock) {
+        terminalStopActive && terminalSessionEpoch == epoch
+    }
+
+    /**
+     * Claims one exact terminal continuation. A Connect that wins before this
+     * call makes the old continuation stale; a Connect that wins afterwards
+     * observes every mutation performed by [action] before publishing the new
+     * user session.
+     */
+    fun runIfTerminalStopEpochCurrent(epoch: Long, action: () -> Unit): Boolean =
+        synchronized(operationLock) {
+            if (!terminalStopActive || terminalSessionEpoch != epoch) {
+                return@synchronized false
+            }
+            action()
+            true
+        }
 
     fun releaseFlutterRestart(token: Long) {
         synchronized(operationLock) {
             if (flutterRestartLeaseToken == token) {
                 flutterRestartLeaseToken = null
+                flutterRestartLeaseSessionEpoch = terminalSessionEpoch
                 flutterRestartLeaseStartedAtNanos = 0L
+                signalOperationChangedLocked()
             }
         }
+    }
+
+    private fun signalOperationChangedLocked() {
+        operationChanged.complete(Unit)
+        operationChanged = CompletableDeferred()
+    }
+
+    private fun invalidateForTerminalStopLocked(
+        explicitUserStop: Boolean,
+    ): TerminalStopEpochClaim {
+        val supersededUserSessionEpoch = terminalSessionEpoch.takeUnless { terminalStopActive }
+        if (supersededUserSessionEpoch != null) {
+            terminalStopSupersededUserSessionEpoch = supersededUserSessionEpoch
+        }
+        // A failed-start cleanup can win the terminal claim a few instructions
+        // before the already-issued tile/shortcut Stop reaches this lock. Keep
+        // the exact predecessor on the active terminal transaction so that the
+        // later user command still owns its visible outcome without relabeling
+        // any unrelated or newer Connect generation.
+        val explicitlyStoppedEpoch = if (explicitUserStop) {
+            terminalStopSupersededUserSessionEpoch
+        } else {
+            null
+        }
+        if (explicitlyStoppedEpoch != null && !explicitlyStoppedUserSessionEpochs.contains(explicitlyStoppedEpoch)) {
+            explicitlyStoppedUserSessionEpochs.addLast(explicitlyStoppedEpoch)
+            while (explicitlyStoppedUserSessionEpochs.size > EXPLICIT_USER_STOP_HISTORY_LIMIT) {
+                explicitlyStoppedUserSessionEpochs.removeFirst()
+            }
+        }
+        terminalStopActive = true
+        terminalSessionEpoch++
+        flutterRestartLeaseToken = null
+        flutterRestartLeaseSessionEpoch = terminalSessionEpoch
+        flutterRestartLeaseStartedAtNanos = 0L
+        explicitStartLeaseToken = null
+        explicitStartLeaseSessionEpoch = terminalSessionEpoch
+        signalOperationChangedLocked()
+        return TerminalStopEpochClaim(
+            supersededUserSessionEpoch = supersededUserSessionEpoch,
+            terminalSessionEpoch = terminalSessionEpoch,
+        )
     }
 
     private fun expireFlutterRestartLeaseIfNeeded() {
@@ -391,7 +832,9 @@ internal object ServiceLifecycleOwnership {
             System.nanoTime() - flutterRestartLeaseStartedAtNanos >= FLUTTER_RESTART_LEASE_TIMEOUT_NANOS
         ) {
             flutterRestartLeaseToken = null
+            flutterRestartLeaseSessionEpoch = terminalSessionEpoch
             flutterRestartLeaseStartedAtNanos = 0L
+            signalOperationChangedLocked()
         }
     }
 }

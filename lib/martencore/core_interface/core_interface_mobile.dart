@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:basic_utils/basic_utils.dart';
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:flutter/services.dart';
 import 'package:grpc/grpc.dart';
 import 'package:marten/core/model/directories.dart';
@@ -20,6 +21,21 @@ import 'package:rxdart/rxdart.dart';
 Duration backgroundAttachStoppedGrace({required bool explicitManualStart, bool? platformStartedByUser}) =>
     explicitManualStart || platformStartedByUser == false ? Duration.zero : const Duration(seconds: 1);
 
+const _localGrpcChannelTerminationTimeout = Duration(milliseconds: 500);
+
+@visibleForTesting
+Future<bool> terminateLocalGrpcChannelBoundedly(
+  Future<void> Function() terminate, {
+  Duration timeout = _localGrpcChannelTerminationTimeout,
+}) async {
+  try {
+    await terminate().timeout(timeout);
+    return true;
+  } on TimeoutException {
+    return false;
+  }
+}
+
 bool backgroundStartCancelled({required int startGeneration, required int lifecycleGeneration}) =>
     startGeneration != lifecycleGeneration;
 
@@ -37,7 +53,38 @@ bool shouldJoinAuthoritativeBackgroundStart({required bool isAndroid, required C
     isAndroid && platformStatus is CoreStarting;
 
 bool mayAttachToActiveConfigGeneration({required bool isAndroid, required bool configIdentityMatches}) =>
-    !isAndroid || configIdentityMatches;
+    configIdentityMatches;
+
+/// Permission UI is user-paced; cancellation releases the caller immediately.
+/// Late native permission results can never resume a cancelled start.
+class IosVpnPermissionGate {
+  Completer<bool>? _pending;
+
+  Future<bool> prepare(Future<bool?> Function() request) {
+    cancel();
+    final pending = Completer<bool>();
+    _pending = pending;
+    Future<bool?>.sync(request).then(
+      (allowed) {
+        if (!identical(_pending, pending)) return;
+        _pending = null;
+        pending.complete(allowed == true);
+      },
+      onError: (Object error, StackTrace stack) {
+        if (!identical(_pending, pending)) return;
+        _pending = null;
+        pending.completeError(error, stack);
+      },
+    );
+    return pending.future;
+  }
+
+  void cancel() {
+    final pending = _pending;
+    _pending = null;
+    pending?.complete(false);
+  }
+}
 
 typedef _BackgroundCoreEndpoint = ({int port, CoreStatus status});
 
@@ -52,7 +99,11 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
   // still legitimately in progress.
   static const _platformStopCallTimeout = Duration(seconds: 30);
   static const _platformStopReconcileTimeout = Duration(seconds: 6);
-  static const _platformSetupCallTimeout = Duration(seconds: 8);
+  // Android can legitimately be joining the exact native close from a previous
+  // cancelled generation. The native method coalesces identical setup calls and
+  // bounds that close barrier at 60s, so Dart must stay attached long enough to
+  // receive the one authoritative result instead of leaving orphaned requests.
+  static const _platformSetupCallTimeout = Duration(seconds: 70);
   static const _platformStartCallTimeout = Duration(seconds: 8);
   // A failed real VPN GET can consume the bounded connect + read timeouts.
   // Healthy acknowledgements still return immediately; this only prevents
@@ -61,7 +112,8 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
   // one already-started blocking socket attempt may finish just after that
   // deadline. Keep Dart attached until native returns its terminal result.
   static const _platformStartedSyncTimeout = Duration(seconds: 115);
-  static const _platformSessionStateTimeout = Duration(seconds: 1);
+  static const _platformSessionStateTimeout = Duration(seconds: 65);
+  static const _platformSessionValidationTimeout = Duration(seconds: 1);
   static const _foregroundHelloTimeout = Duration(seconds: 3);
   static const _healthCheckTimeout = Duration(milliseconds: 700);
   static const _portProbeTimeout = Duration(milliseconds: 120);
@@ -83,6 +135,8 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
   bool _isBgClientAvailable = false;
   bool _debug = false;
   int _backgroundLifecycleGeneration = 0;
+  int? _pendingManualStartGeneration;
+  final _iosVpnPermission = IosVpnPermissionGate();
   ChannelCredentials _channelCredentials = const ChannelCredentials.insecure();
   ClientChannel? _backgroundObservationChannel;
   ClientChannel? _backgroundControlChannel;
@@ -99,7 +153,7 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
 
   @override
   void beginBackgroundLifecycle() {
-    _backgroundLifecycleGeneration++;
+    _pendingManualStartGeneration = ++_backgroundLifecycleGeneration;
     _clearBackgroundControlClient();
   }
 
@@ -157,6 +211,38 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
     return "";
   }
 
+  @override
+  Future<int?> claimVpnStartLease() async {
+    if (!Platform.isAndroid) return null;
+    return methodChannel.invokeMethod<int>("claim_vpn_start_lease");
+  }
+
+  @override
+  Future<void> cancelVpnStartLease(int token) async {
+    if (!Platform.isAndroid) return;
+    await methodChannel.invokeMethod<bool>("cancel_vpn_start_lease", token);
+  }
+
+  @override
+  Future<int?> tryJoinVerifiedVpnAdmission() async {
+    if (!Platform.isAndroid) return null;
+    return methodChannel.invokeMethod<int>("try_join_verified_vpn_admission");
+  }
+
+  @override
+  Future<int?> beginVpnStartAdmission({
+    bool resumeSession = false,
+    int? explicitStartLease,
+    bool nativeHandoffClaim = false,
+  }) async {
+    if (!Platform.isAndroid) return null;
+    return methodChannel.invokeMethod<int>("begin_vpn_start_admission", {
+      "resumeSession": resumeSession,
+      if (explicitStartLease != null) "explicitStartLease": explicitStartLease,
+      if (nativeHandoffClaim) "nativeHandoffClaim": true,
+    });
+  }
+
   Future<HelloResponse> _connectOrStartForegroundCore(
     Directories directories,
     bool debug,
@@ -211,6 +297,10 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
   }
 
   Future<void> _invokeForegroundSetup(Directories directories, bool debug, int mode, int grpcPort) async {
+    // One privacy-safe numeric correlation shared by Dart and Android logs.
+    final request = DateTime.now().microsecondsSinceEpoch;
+    final stopwatch = Stopwatch()..start();
+    loggy.info("foreground core setup request=$request phase=invoke");
     try {
       await methodChannel
           .invokeMethod("setup", {
@@ -220,10 +310,19 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
             "grpcPort": grpcPort,
             "mode": mode,
             "debug": debug,
+            "requestId": request,
           })
           .timeout(_platformSetupCallTimeout);
+      loggy.info("foreground core setup request=$request phase=ready elapsed_ms=${stopwatch.elapsedMilliseconds}");
     } on TimeoutException {
+      loggy.warning("foreground core setup request=$request phase=timeout elapsed_ms=${stopwatch.elapsedMilliseconds}");
       throw TimeoutException("foreground core setup timed out on 127.0.0.1:$grpcPort", _platformSetupCallTimeout);
+    } catch (error) {
+      loggy.warning(
+        "foreground core setup request=$request phase=failed error_type=${error.runtimeType} "
+        "elapsed_ms=${stopwatch.elapsedMilliseconds}",
+      );
+      rethrow;
     }
   }
 
@@ -315,7 +414,7 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
     } catch (_) {
       return null;
     } finally {
-      await channel.shutdown();
+      await _terminateChannel(channel, "temporary background status probe");
     }
   }
 
@@ -416,7 +515,10 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
 
   Future<void> _terminateChannel(ClientChannel channel, String role) async {
     try {
-      await channel.terminate();
+      final terminated = await terminateLocalGrpcChannelBoundedly(channel.terminate);
+      if (!terminated) {
+        loggy.warning("$role gRPC channel termination exceeded its local deadline; lifecycle will continue");
+      }
     } catch (error) {
       loggy.debug("failed to terminate $role channel: $error");
     }
@@ -491,7 +593,11 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
     try {
       return await _sayHello(HelloClient(channel), name: name, timeout: timeout);
     } finally {
-      await channel.shutdown();
+      // This channel is disposable and its only RPC has already completed or
+      // reached its own deadline. Graceful shutdown may wait forever for a
+      // half-closed HTTP/2 transport, so force and bound teardown instead of
+      // retaining Connect/Disconnect serialization behind a dead local socket.
+      await _terminateChannel(channel, "temporary foreground health probe");
     }
   }
 
@@ -525,11 +631,17 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
   }
 
   @override
-  Future<BackgroundCoreSetupResult> setupBackground(String path, String name) async {
+  Future<BackgroundCoreSetupResult> setupBackground(String path, String name, {int? androidVpnStartEpoch}) async {
+    final preparedManualAdmission = Platform.isAndroid && androidVpnStartEpoch != null;
+    final admittedManualGeneration = preparedManualAdmission ? _pendingManualStartGeneration : null;
+    if (preparedManualAdmission && admittedManualGeneration != _backgroundLifecycleGeneration) {
+      loggy.info("manual background start was superseded before setup");
+      return const BackgroundCoreSetupResult.failed(CoreStatus.stopped());
+    }
     var platformStatus = await readPlatformServiceStatus();
-    var configIdentityMatches = !Platform.isAndroid || await _matchesActiveConfigGeneration(path);
+    var configIdentityMatches = await _matchesActiveConfigGeneration(path);
     var platformCleanupConfirmed = false;
-    if (Platform.isAndroid && !configIdentityMatches) {
+    if (Platform.isAndroid && !configIdentityMatches && !preparedManualAdmission) {
       loggy.info("active Android runtime does not own the requested configuration; retiring it before start");
       if (!await stop()) {
         return const BackgroundCoreSetupResult.failed(CoreStatus.stopped(alert: CoreAlert.createService));
@@ -537,18 +649,21 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
       platformCleanupConfirmed = true;
       platformStatus = await readPlatformServiceStatus();
     }
-    if (shouldJoinAuthoritativeBackgroundStart(isAndroid: Platform.isAndroid, platformStatus: platformStatus) &&
+    if (!preparedManualAdmission &&
+        shouldJoinAuthoritativeBackgroundStart(isAndroid: Platform.isAndroid, platformStatus: platformStatus) &&
         mayAttachToActiveConfigGeneration(
           isAndroid: Platform.isAndroid,
           configIdentityMatches: configIdentityMatches,
         )) {
       return _joinAuthoritativeBackgroundStart(path);
     }
-    final shouldProbeExisting = shouldProbeExistingBackgroundCoreForManualStart(
-      isAndroid: Platform.isAndroid,
-      platformStatus: platformStatus,
-      backgroundChannelKnownAvailable: _isBgClientAvailable,
-    );
+    final shouldProbeExisting =
+        !preparedManualAdmission &&
+        shouldProbeExistingBackgroundCoreForManualStart(
+          isAndroid: Platform.isAndroid,
+          platformStatus: platformStatus,
+          backgroundChannelKnownAvailable: _isBgClientAvailable,
+        );
     loggy.info(
       "manual background start platform_running=${platformStatus is CoreStarting || platformStatus is CoreStarted} "
       "channel_known=$_isBgClientAvailable probe_existing=$shouldProbeExisting",
@@ -564,7 +679,7 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
       );
     }
     if (attachedExisting?.status case CoreStarting() || CoreStarted()) {
-      configIdentityMatches = !Platform.isAndroid || await _matchesActiveConfigGeneration(path);
+      configIdentityMatches = await _matchesActiveConfigGeneration(path);
       if (mayAttachToActiveConfigGeneration(
         isAndroid: Platform.isAndroid,
         configIdentityMatches: configIdentityMatches,
@@ -589,7 +704,7 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
     if (attachedExisting != null) {
       loggy.info("background core gRPC shell is stopped; starting Android service on existing 127.0.0.1:$_portBack");
     } else {
-      if (!platformCleanupConfirmed && !await stop()) {
+      if (!platformCleanupConfirmed && !preparedManualAdmission && !await stop()) {
         return const BackgroundCoreSetupResult.failed(CoreStatus.stopped(alert: CoreAlert.createService));
       }
       _status.clean();
@@ -602,14 +717,37 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
       _replaceBackgroundObservationClient(_coreChannel(_portBack, _channelCredentials));
     }
     _clearBackgroundControlClient();
-    final startGeneration = ++_backgroundLifecycleGeneration;
-    await _invokeBackgroundStartAndWait(path, name, _portBack);
+    final startGeneration = preparedManualAdmission ? admittedManualGeneration! : ++_backgroundLifecycleGeneration;
+    if (startGeneration != _backgroundLifecycleGeneration) {
+      loggy.info("manual background start was superseded before platform dispatch");
+      return const BackgroundCoreSetupResult.failed(CoreStatus.stopped());
+    }
+    if (preparedManualAdmission && _pendingManualStartGeneration == startGeneration) {
+      _pendingManualStartGeneration = null;
+    }
+    if (Platform.isIOS) {
+      final allowed = await _iosVpnPermission.prepare(() => methodChannel.invokeMethod<bool>("prepare_vpn_permission"));
+      if (!allowed || startGeneration != _backgroundLifecycleGeneration) {
+        return const BackgroundCoreSetupResult.failed(CoreStatus.stopped());
+      }
+    }
+    await _invokeBackgroundStartAndWait(path, name, _portBack, androidVpnStartEpoch: androidVpnStartEpoch);
 
     _isBgClientAvailable = true;
     final startStatus = await _waitForBackgroundServiceReady(
       timeout: _backgroundServiceReadyTimeout,
       startGeneration: startGeneration,
+      androidVpnStartEpoch: androidVpnStartEpoch,
     );
+    if (Platform.isAndroid && androidVpnStartEpoch != null && startStatus is CoreStopped && startStatus.alert == null) {
+      // The service owns the blocker and wakes this exact session on network
+      // arrival or Stop. Offline time must not consume a route/RPC deadline.
+      final networkReady = await methodChannel.invokeMethod<bool>("await_start_network", androidVpnStartEpoch) ?? false;
+      if (!networkReady) {
+        _isBgClientAvailable = false;
+        return const BackgroundCoreSetupResult.failed(CoreStatus.stopped());
+      }
+    }
     if (backgroundStartCancelled(
       startGeneration: startGeneration,
       lifecycleGeneration: _backgroundLifecycleGeneration,
@@ -620,10 +758,10 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
     }
     final setupResult = BackgroundCoreSetupResult.fromStatus(startStatus);
     if (setupResult is! BackgroundCoreSetupFailed) {
-      if (!Platform.isAndroid || await _matchesActiveConfigGeneration(path)) {
+      if (await _matchesActiveConfigGeneration(path)) {
         return setupResult;
       }
-      loggy.warning("Android runtime identity changed while the background service was starting");
+      loggy.warning("runtime identity changed while the background service was starting");
       await stop();
       return const BackgroundCoreSetupResult.failed(CoreStatus.stopped(alert: CoreAlert.startService));
     }
@@ -633,7 +771,7 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
       includeStarting: true,
     );
     if (lateAttached != null) {
-      if (!Platform.isAndroid || await _matchesActiveConfigGeneration(path)) {
+      if (await _matchesActiveConfigGeneration(path)) {
         loggy.warning("background core became healthy during late attach grace");
         return BackgroundCoreSetupResult.attached(lateAttached.status);
       }
@@ -708,9 +846,19 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
     );
   }
 
-  Future<void> _invokeBackgroundStartAndWait(String path, String name, int grpcPort) async {
+  Future<void> _invokeBackgroundStartAndWait(
+    String path,
+    String name,
+    int grpcPort, {
+    int? androidVpnStartEpoch,
+  }) async {
     try {
-      await _invokeBackgroundStart(path, name, grpcPort).timeout(_platformStartCallTimeout);
+      await _invokeBackgroundStart(
+        path,
+        name,
+        grpcPort,
+        androidVpnStartEpoch: androidVpnStartEpoch,
+      ).timeout(_platformStartCallTimeout);
     } on TimeoutException {
       loggy.warning(
         "platform background start call timed out after ${_platformStartCallTimeout.inSeconds} s; waiting for gRPC readiness",
@@ -718,7 +866,11 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
     }
   }
 
-  Future<CoreStatus> _waitForBackgroundServiceReady({required Duration timeout, required int startGeneration}) async {
+  Future<CoreStatus> _waitForBackgroundServiceReady({
+    required Duration timeout,
+    required int startGeneration,
+    int? androidVpnStartEpoch,
+  }) async {
     final deadline = DateTime.now().add(timeout);
     loggy.info("waiting for background service gRPC readiness");
     while (DateTime.now().isBefore(deadline)) {
@@ -727,6 +879,19 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
         lifecycleGeneration: _backgroundLifecycleGeneration,
       )) {
         loggy.info("background service gRPC readiness wait cancelled");
+        return const CoreStatus.stopped();
+      }
+      if (androidVpnStartEpoch != null && !await _isVpnUserSessionCurrent(androidVpnStartEpoch)) {
+        // Quick Settings can stop an admitted start before the background gRPC
+        // endpoint exists. Retire this exact Dart lifecycle generation as soon
+        // as Android invalidates its user-session epoch; waiting for the generic
+        // readiness timeout would let a stale failure clear a newer Connect.
+        if (startGeneration == _backgroundLifecycleGeneration) {
+          _pendingManualStartGeneration = null;
+          _backgroundLifecycleGeneration++;
+          _clearBackgroundControlClient();
+        }
+        loggy.info("background service start cancelled by authoritative Android user-session epoch");
         return const CoreStatus.stopped();
       }
       final coreStatus = await _coreStatusOnPort(_portBack, _channelCredentials);
@@ -759,18 +924,34 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
     return const CoreStatus.stopped(alert: CoreAlert.startService, message: "starting background core timed out");
   }
 
-  Future<void> _invokeBackgroundStart(String path, String name, int grpcPort) async {
+  Future<bool> _isVpnUserSessionCurrent(int epoch) async {
+    if (!Platform.isAndroid) return true;
+    try {
+      return await methodChannel
+              .invokeMethod<bool>("validate_vpn_user_session", epoch)
+              .timeout(_platformSessionValidationTimeout) ??
+          false;
+    } catch (e) {
+      loggy.warning("failed to validate exact Android VPN user session: $e");
+      return false;
+    }
+  }
+
+  Future<void> _invokeBackgroundStart(String path, String name, int grpcPort, {int? androidVpnStartEpoch}) async {
     await methodChannel.invokeMethod("start", {
       "path": path,
       "name": name,
       "grpcPort": grpcPort,
       "startBg": true,
       "debug": _debug,
+      if (androidVpnStartEpoch != null) "userSessionEpoch": androidVpnStartEpoch,
     });
   }
 
   @override
   Future<bool> stop() async {
+    _iosVpnPermission.cancel();
+    _pendingManualStartGeneration = null;
     _backgroundLifecycleGeneration++;
     _clearBackgroundControlClient();
     var platformStopSucceeded = false;
@@ -879,6 +1060,19 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
   }
 
   @override
+  Future<bool?> wasVpnUserSessionExplicitlyStopped(int epoch) async {
+    if (!Platform.isAndroid) return false;
+    try {
+      return await methodChannel
+          .invokeMethod<bool>("was_vpn_user_session_explicitly_stopped", epoch)
+          .timeout(_platformSessionValidationTimeout);
+    } catch (e) {
+      loggy.warning("failed to read exact Android explicit-Stop ownership: $e");
+      return null;
+    }
+  }
+
+  @override
   Future<CoreStatus?> readPlatformServiceStatus() async {
     if (!Platform.isAndroid) return null;
     try {
@@ -893,15 +1087,18 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
     }
   }
 
+  @override
+  Future<bool> matchesActiveConfigGeneration(String path) => _matchesActiveConfigGeneration(path);
+
   Future<bool> _matchesActiveConfigGeneration(String path) async {
-    if (!Platform.isAndroid) return true;
+    if (!Platform.isAndroid && !Platform.isIOS) return true;
     try {
       return await methodChannel
               .invokeMethod<bool>("matches_active_config_generation", {"path": path})
               .timeout(_platformSessionStateTimeout) ??
           false;
     } catch (e) {
-      loggy.warning("failed to verify active Android runtime configuration: $e");
+      loggy.warning("failed to verify active runtime configuration: $e");
       return false;
     }
   }
@@ -914,6 +1111,20 @@ class CoreInterfaceMobile extends CoreInterface with InfraLogger {
     } catch (e) {
       loggy.warning("failed to reserve native lifecycle for Flutter restart: $e");
       return null;
+    }
+  }
+
+  @override
+  Future<bool> validateFlutterRestart(int token) async {
+    if (!Platform.isAndroid) return true;
+    try {
+      return await methodChannel
+              .invokeMethod<bool>("validate_flutter_restart", token)
+              .timeout(_platformSessionValidationTimeout) ??
+          false;
+    } catch (e) {
+      loggy.warning("failed to validate native lifecycle for Flutter restart: $e");
+      return false;
     }
   }
 

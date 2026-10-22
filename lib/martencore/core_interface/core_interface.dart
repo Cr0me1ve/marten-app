@@ -55,9 +55,23 @@ class CoreInterface {
     return "";
   }
 
-  Future<BackgroundCoreSetupResult> setupBackground(String path, String name) async {
+  Future<BackgroundCoreSetupResult> setupBackground(String path, String name, {int? androidVpnStartEpoch}) async {
     return const BackgroundCoreSetupResult.readyToStart();
   }
+
+  /// Establishes the platform fail-closed boundary before a VPN start may do
+  /// any configuration or network-capable work.
+  Future<int?> claimVpnStartLease() async => null;
+
+  Future<void> cancelVpnStartLease(int token) async {}
+
+  Future<int?> tryJoinVerifiedVpnAdmission() async => null;
+
+  Future<int?> beginVpnStartAdmission({
+    bool resumeSession = false,
+    int? explicitStartLease,
+    bool nativeHandoffClaim = false,
+  }) async => null;
 
   Future<bool> restart(String path, String name) async {
     return false;
@@ -78,8 +92,8 @@ class CoreInterface {
   }
 
   bool isSingleChannel() {
-    // return true;
-    return fgClient == bgClient;
+    if (!isInitialized()) return false;
+    return identical(fgClient, bgClient);
   }
 
   Future<bool> resetTunnel() async {
@@ -96,12 +110,22 @@ class CoreInterface {
     return null;
   }
 
+  /// True only when an Android-native user entry point stopped this exact
+  /// admitted VPN session. Null means native ownership could not be queried.
+  Future<bool?> wasVpnUserSessionExplicitlyStopped(int epoch) async => false;
+
   Future<CoreStatus?> readPlatformServiceStatus() async {
     return null;
   }
 
+  Future<bool> matchesActiveConfigGeneration(String path) async => false;
+
   Future<int?> tryBeginFlutterRestart() async {
     return 0;
+  }
+
+  Future<bool> validateFlutterRestart(int token) async {
+    return true;
   }
 
   Future<void> endFlutterRestart(int token) async {}
@@ -119,6 +143,18 @@ class CoreInterface {
   }
 
   bool isInitialized() {
+    return _isForegroundClientInitialized() && _isBackgroundClientInitialized();
+  }
+
+  bool _isForegroundClientInitialized() {
+    try {
+      return _lateFieldInitialized(fgClient);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  bool _isBackgroundClientInitialized() {
     try {
       return _lateFieldInitialized(bgClient);
     } catch (_) {

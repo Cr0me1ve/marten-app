@@ -1,25 +1,32 @@
 import 'dart:async';
+import 'dart:io';
+import 'dart:ui' show FrameTiming;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/scheduler.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_displaymode/flutter_displaymode.dart';
 import 'package:flutter_native_splash/flutter_native_splash.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:marten/core/analytics/analytics_controller.dart';
 import 'package:marten/core/analytics/analytics_logger.dart';
+import 'package:marten/core/analytics/pending_crash_report.dart';
 import 'package:marten/core/app_info/app_info_provider.dart';
+import 'package:marten/core/diagnostics/energy_profiler.dart';
 import 'package:marten/core/directories/directories_provider.dart';
 import 'package:marten/core/localization/translations.dart';
 import 'package:marten/core/logger/logger.dart';
 import 'package:marten/core/logger/logger_controller.dart';
 import 'package:marten/core/model/app_info_entity.dart';
 import 'package:marten/core/model/environment.dart';
+import 'package:marten/core/network/strict_vpn_egress_gate.dart';
 import 'package:marten/core/preferences/general_preferences.dart';
 import 'package:marten/core/preferences/preferences_migration.dart';
 import 'package:marten/core/preferences/preferences_provider.dart';
+import 'package:marten/core/utils/ui_idle_gate.dart';
 import 'package:marten/features/app/widget/app.dart';
 import 'package:marten/features/auto_start/notifier/auto_start_notifier.dart';
+import 'package:marten/features/connection/notifier/connection_notifier.dart';
 
 import 'package:marten/features/log/data/log_data_providers.dart';
 import 'package:marten/features/profile/notifier/background_profiles_update.dart';
@@ -50,6 +57,7 @@ Future<void> lazyBootstrap(WidgetsBinding widgetsBinding, Environment env) async
   final preferencesFuture = _init("preferences", () => container.read(sharedPreferencesProvider.future));
 
   final (_, appInfo, _) = await (directoriesFuture, appInfoFuture, preferencesFuture).wait;
+  DartEnergyProfiler.start((await directoriesFuture).workingDir);
   LoggerController.init(container.read(logPathResolverProvider).appFile().path, debugConsole: !PlatformUtils.isMobile);
   final crashReportingEnabled = readCrashReportingEnabledPreference(
     container.read(sharedPreferencesProvider).requireValue,
@@ -58,12 +66,50 @@ Future<void> lazyBootstrap(WidgetsBinding widgetsBinding, Environment env) async
     ..setContextCollectionEnabled(crashReportingEnabled)
     ..setContext('environment', env.name)
     ..startLifecycleTracking();
+  if (PlatformUtils.isAndroid) {
+    await _safeInit('local crash capture', () async {
+      final path = await const MethodChannel(
+        'app.marten.client/platform',
+      ).invokeMethod<String>('get_local_crash_directory');
+      if (path == null) return;
+      await crashReporter.configureLocalCapture(
+        store: FilePendingCrashReportStore(Directory(path)),
+        enabled: crashReportingEnabled,
+      );
+    });
+  }
   final enableCrashReporting = await _safeInit(
     "crash reporting preference",
     () => container.read(analyticsControllerProvider.future),
   );
-  if (enableCrashReporting == true) {
-    await _safeInit("crash reporting", () => container.read(analyticsControllerProvider.notifier).enableAnalytics());
+  if (enableCrashReporting == true && !PlatformUtils.isAndroid) {
+    await _safeInit("crash reporting", () => container.read(analyticsControllerProvider.notifier).ensureInitialized());
+  }
+  final strictAndroidSessionPending = PlatformUtils.isAndroid && container.read(Preferences.startedByUser);
+  // Android must start with every optional network SDK cold. Process network
+  // binding applies only to future sockets, so Crashlytics/FCM/WorkManager are
+  // initialized later by ConnectionNotifier after a verified VPN route.
+  final networkServicesAdmitted = !PlatformUtils.isAndroid;
+  if (strictAndroidSessionPending) {
+    // A retained route-verified Started generation is already the native
+    // network authority. Inspect it before touching the process-wide probe
+    // gate: sealing first would invalidate the very admission being joined.
+    final retainedAdmission = await _safeInit(
+      "retained Android VPN network admission",
+      () => container.read(martenCoreServiceProvider).tryJoinVerifiedVpnAdmission(),
+    );
+    if (retainedAdmission != null) {
+      Logger.bootstrap.info('joined retained route-verified Android VPN admission');
+    } else {
+      await strictVpnEgressGate.sealForVpnTransition();
+      final admitted = await _safeInit(
+        "strict Android VPN network admission",
+        () => container.read(martenCoreServiceProvider).beginVpnStartAdmission(resumeSession: true),
+      );
+      if (admitted == null) {
+        Logger.bootstrap.error('strict Android VPN network admission failed; optional networking remains disabled');
+      }
+    }
   }
 
   await _init("preferences migration", () async {
@@ -78,13 +124,25 @@ Future<void> lazyBootstrap(WidgetsBinding widgetsBinding, Environment env) async
   });
 
   final debug = container.read(debugModeNotifierProvider) || kDebugMode;
-  registerSubscriptionPushBackgroundHandler();
+  if (networkServicesAdmitted) {
+    registerSubscriptionPushBackgroundHandler();
+  } else {
+    Logger.bootstrap.info('deferring subscription push handler until a VPN-admitted process');
+  }
 
   if (PlatformUtils.isDesktop) {
     await _init("window controller", () => container.read(windowNotifierProvider.future));
   }
 
   await _init("translations", () => container.read(translationsProvider.future));
+
+  if (PlatformUtils.isAndroid) {
+    // Android's VpnService survives Activity and Flutter-engine recreation.
+    // Resolve its authoritative state while the native splash is still held,
+    // so the first rendered Home frame cannot invent an idle/transient state
+    // for an already route-verified session.
+    await _init("authoritative Android VPN status", () => container.read(connectionNotifierProvider.future));
+  }
 
   Logger.bootstrap.info("startup phase=bootstrap_prerequisites_ready elapsed_ms=${stopWatch.elapsedMilliseconds}");
 
@@ -112,11 +170,16 @@ Future<void> lazyBootstrap(WidgetsBinding widgetsBinding, Environment env) async
   WidgetsBinding.instance.addPostFrameCallback((_) {
     Logger.bootstrap.info("startup phase=first_post_frame elapsed_ms=${stopWatch.elapsedMilliseconds}");
     stopWatch.stop();
-    unawaited(_warmUpAfterFirstFrame(container, appInfo, debug));
+    unawaited(_warmUpAfterFirstFrame(container, appInfo, debug, networkServicesAdmitted: networkServicesAdmitted));
   });
 }
 
-Future<void> _warmUpAfterFirstFrame(ProviderContainer container, AppInfoEntity appInfo, bool debug) async {
+Future<void> _warmUpAfterFirstFrame(
+  ProviderContainer container,
+  AppInfoEntity appInfo,
+  bool debug, {
+  required bool networkServicesAdmitted,
+}) async {
   final stopWatch = Stopwatch()..start();
   final martenCoreWarmUp = PlatformUtils.isAndroid
       ? Future<void>.value()
@@ -149,7 +212,11 @@ Future<void> _warmUpAfterFirstFrame(ProviderContainer container, AppInfoEntity a
   Logger.bootstrap.info("post-frame warm-up took [${stopWatch.elapsedMilliseconds}ms]");
   stopWatch.stop();
   unawaited(_warmUpDeferredLogServices(container));
-  unawaited(_warmUpDeferredProfileServices(container, debug));
+  if (networkServicesAdmitted) {
+    unawaited(_warmUpDeferredProfileServices(container, debug));
+  } else {
+    Logger.bootstrap.info('skipping deferred profile networking without strict VPN admission');
+  }
   unawaited(_warmUpDeferredPlatformServices(debug));
 }
 
@@ -177,6 +244,10 @@ Future<void> _warmUpDeferredPlatformServices(bool debug) async {
   // These calls cross the Android main thread. Admit each one only when the
   // frame scheduler is idle so a fixed timer cannot interrupt interaction.
   await Future<void>.delayed(const Duration(seconds: 10));
+  // Registration itself is local scheduler work. The Android worker decides
+  // whether the exact current state admits its networking: a verified Marten
+  // route or a fully released terminal state. Registering here means a stale
+  // saved route cannot prevent the first background subscription refresh.
   await _waitForUiIdle("deferred background subscription refresh");
   await _safeInit("deferred background subscription refresh", () => initializeProfilesBackgroundRefresh(debug: debug));
   if (!kIsWeb && PlatformUtils.isAndroid) {
@@ -185,8 +256,7 @@ Future<void> _warmUpDeferredPlatformServices(bool debug) async {
   }
 }
 
-Future<void> _waitForUiIdle(String debugLabel) =>
-    SchedulerBinding.instance.scheduleTask<void>(() {}, Priority.idle, debugLabel: debugLabel);
+Future<void> _waitForUiIdle(String debugLabel) => UiIdleGate(debugLabel: debugLabel).ready.then((_) {});
 
 Future<T> _init<T>(String name, Future<T> Function() initializer, {int? timeout}) async {
   final stopWatch = Stopwatch()..start();

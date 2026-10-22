@@ -3,32 +3,33 @@ import Flutter
 import MartenCore
 import UserNotifications
 import workmanager_apple
+
+enum AppBadge {
+    static func clear() {
+        if #available(iOS 16.0, *) {
+            UNUserNotificationCenter.current().setBadgeCount(0) { _ in }
+        } else {
+            UIApplication.shared.applicationIconBadgeNumber = 0
+        }
+    }
+}
+
 @main
-@objc class AppDelegate: FlutterAppDelegate {
+@objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
     
     override func application(
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
     ) -> Bool {
         setupFileManager()
-        registerHandlers()
         registerBackgroundRefresh()
-        clearAppIconBadge()
-        GeneratedPluginRegistrant.register(with: self)
+        AppBadge.clear()
         return super.application(application, didFinishLaunchingWithOptions: launchOptions)
     }
 
-    override func applicationDidBecomeActive(_ application: UIApplication) {
-        super.applicationDidBecomeActive(application)
-        clearAppIconBadge()
-    }
-
-    private func clearAppIconBadge() {
-        if #available(iOS 16.0, *) {
-            UNUserNotificationCenter.current().setBadgeCount(0) { _ in }
-        } else {
-            UIApplication.shared.applicationIconBadgeNumber = 0
-        }
+    func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
+        GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
+        registerHandlers(with: engineBridge.pluginRegistry)
     }
     
     func setupFileManager() {
@@ -36,12 +37,12 @@ import workmanager_apple
         FileManager.default.changeCurrentDirectoryPath(FilePath.sharedDirectory.path)
     }
     
-    func registerHandlers() {
-        MethodHandler.register(with: self.registrar(forPlugin: MethodHandler.name)!)
-        PlatformMethodHandler.register(with: self.registrar(forPlugin: PlatformMethodHandler.name)!)
-        FileMethodHandler.register(with: self.registrar(forPlugin: FileMethodHandler.name)!)
-        StatusEventHandler.register(with: self.registrar(forPlugin: StatusEventHandler.name)!)
-        AlertsEventHandler.register(with: self.registrar(forPlugin: AlertsEventHandler.name)!)
+    func registerHandlers(with registry: FlutterPluginRegistry) {
+        MethodHandler.register(with: registry.registrar(forPlugin: MethodHandler.name)!)
+        PlatformMethodHandler.register(with: registry.registrar(forPlugin: PlatformMethodHandler.name)!)
+        FileMethodHandler.register(with: registry.registrar(forPlugin: FileMethodHandler.name)!)
+        StatusEventHandler.register(with: registry.registrar(forPlugin: StatusEventHandler.name)!)
+        AlertsEventHandler.register(with: registry.registrar(forPlugin: AlertsEventHandler.name)!)
 //        LogsEventHandler.register(with: self.registrar(forPlugin: LogsEventHandler.name)!)
 //        GroupsEventHandler.register(with: self.registrar(forPlugin: GroupsEventHandler.name)!)
 //        ActiveGroupsEventHandler.register(with: self.registrar(forPlugin: ActiveGroupsEventHandler.name)!)

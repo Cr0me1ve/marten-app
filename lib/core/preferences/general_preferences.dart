@@ -101,6 +101,11 @@ abstract class Preferences {
 
   static final startedByUser = PreferencesNotifier.create<bool, bool>("started_by_user", false);
 
+  // Native Android sets this only after a current-generation VPN data-plane
+  // proof and clears it before every transition/stop. Headless optional work
+  // must never use startedByUser as a network-admission signal.
+  static final strictVpnRouteVerified = PreferencesNotifier.create<bool, bool>("strict_vpn_route_verified", false);
+
   static final storeReviewedByUser = PreferencesNotifier.create<bool, bool>("store_reviewed_by_user", false);
 
   static final actionAtClose = PreferencesNotifier.create<ActionsAtClosing, String>(

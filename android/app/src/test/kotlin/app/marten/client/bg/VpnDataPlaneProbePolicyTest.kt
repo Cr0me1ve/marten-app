@@ -15,6 +15,67 @@ class VpnDataPlaneProbePolicyTest {
     }
 
     @Test
+    fun `only the first stable periodic proof failure preserves the verified route`() {
+        assertTrue(
+            shouldPreserveVerifiedRouteAfterTransientProbeFailure(
+                platformStarted = true,
+                routeAlreadyDegraded = false,
+                priorFailedChecks = 0,
+                currentProofAvailable = true,
+                tunHealthy = true,
+                tunTrafficAdvanced = true,
+            ),
+        )
+
+        assertFalse(
+            "a repeated failed watchdog check is an escalation candidate, not a retained-route sample",
+            shouldPreserveVerifiedRouteAfterTransientProbeFailure(
+                platformStarted = true,
+                routeAlreadyDegraded = false,
+                priorFailedChecks = 1,
+                currentProofAvailable = true,
+                tunHealthy = true,
+                tunTrafficAdvanced = true,
+            ),
+        )
+        assertFalse(
+            "an already degraded route must not retain an older proof",
+            shouldPreserveVerifiedRouteAfterTransientProbeFailure(
+                platformStarted = true,
+                routeAlreadyDegraded = true,
+                priorFailedChecks = 0,
+                currentProofAvailable = true,
+                tunHealthy = true,
+                tunTrafficAdvanced = true,
+            ),
+        )
+        assertFalse(
+            "startup has no established user-visible route to preserve",
+            shouldPreserveVerifiedRouteAfterTransientProbeFailure(
+                platformStarted = false,
+                routeAlreadyDegraded = false,
+                priorFailedChecks = 0,
+                currentProofAvailable = true,
+                tunHealthy = true,
+                tunTrafficAdvanced = true,
+            ),
+        )
+        assertFalse(
+            "missing proof, unhealthy TUN, or idle TUN traffic remain fail-closed",
+            shouldPreserveVerifiedRouteAfterTransientProbeFailure(true, false, 0, false, true, true) ||
+                shouldPreserveVerifiedRouteAfterTransientProbeFailure(true, false, 0, true, false, true) ||
+                shouldPreserveVerifiedRouteAfterTransientProbeFailure(true, false, 0, true, true, false),
+        )
+    }
+
+    @Test
+    fun `recovery status publishes immediately for hard failures but otherwise waits for confirmation`() {
+        assertFalse(shouldPublishRouteRecoveryStatus(failedChecks = 1, recoveryThreshold = 2, hardFailure = false))
+        assertTrue(shouldPublishRouteRecoveryStatus(failedChecks = 2, recoveryThreshold = 2, hardFailure = false))
+        assertTrue(shouldPublishRouteRecoveryStatus(failedChecks = 1, recoveryThreshold = 3, hardFailure = true))
+    }
+
+    @Test
     fun `VPN route probe attempts prefer 4 seconds for direct route and 30 seconds for TURNcoat`() {
         assertEquals(STANDARD_VPN_DATA_PLANE_ATTEMPT_TIMEOUT_MS, vpnDataPlaneAttemptTimeoutMs(turncoatRoute = false))
         assertEquals(TURNCOAT_VPN_DATA_PLANE_ATTEMPT_TIMEOUT_MS, vpnDataPlaneAttemptTimeoutMs(turncoatRoute = true))
@@ -26,81 +87,59 @@ class VpnDataPlaneProbePolicyTest {
     }
 
     @Test
-    fun `ordinary busy tun waits five minutes before probing`() {
-        assertFalse(shouldProbe(tunTrafficAdvanced = true, lastProofMs = 100L, nowMs = 300_099L))
-        assertTrue(shouldProbe(tunTrafficAdvanced = true, lastProofMs = 100L, nowMs = 300_100L))
+    fun `stable route proof interval is five minutes interactive and thirty minutes screen off`() {
+        assertEquals(5 * 60_000L, stableRouteProbeIntervalMs(deviceInteractive = true))
+        assertEquals(30 * 60_000L, stableRouteProbeIntervalMs(deviceInteractive = false))
+
+        assertEquals(0L, vpnDataPlaneProbeDelayMs(true, lastProofElapsedRealtimeMs = 0L, nowElapsedRealtimeMs = 10_000L))
+        assertEquals(100L, vpnDataPlaneProbeDelayMs(true, lastProofElapsedRealtimeMs = 100L, nowElapsedRealtimeMs = 300_000L))
+        assertEquals(900_000L, vpnDataPlaneProbeDelayMs(false, lastProofElapsedRealtimeMs = 100L, nowElapsedRealtimeMs = 900_100L))
     }
 
     @Test
-    fun `stable tun probe interval follows interactive state`() {
-        assertFalse(shouldProbe(deviceInteractive = true, lastProofMs = 100L, nowMs = 300_099L))
-        assertTrue(shouldProbe(deviceInteractive = true, lastProofMs = 100L, nowMs = 300_100L))
-
-        assertFalse(shouldProbe(deviceInteractive = false, lastProofMs = 100L, nowMs = 1_800_099L))
-        assertTrue(shouldProbe(deviceInteractive = false, lastProofMs = 100L, nowMs = 1_800_100L))
-    }
-
-    @Test
-    fun `TURNcoat always requires a fresh authoritative VPN proof within sixty seconds including background`() {
+    fun `stable proof deadline is shared across protocols and ignores tun byte growth`() {
         for (interactive in listOf(true, false)) {
-            assertFalse(
-                "TURNcoat should not probe before its sixty-second proof deadline",
-                shouldProbe(
-                    turncoatRoute = true,
-                    deviceInteractive = interactive,
-                    lastProofMs = 100L,
-                    nowMs = 60_099L,
-                ),
-            )
-            assertTrue(
-                "TURNcoat must not inherit the ordinary interactive/background interval",
-                shouldProbe(
-                    turncoatRoute = true,
-                    deviceInteractive = interactive,
-                    lastProofMs = 100L,
-                    nowMs = 60_100L,
-                ),
-            )
+            val interval = stableRouteProbeIntervalMs(interactive)
+            assertFalse(shouldProbe(deviceInteractive = interactive, lastProofMs = 100L, nowMs = 100L + interval - 1L))
+            assertTrue(shouldProbe(deviceInteractive = interactive, lastProofMs = 100L, nowMs = 100L + interval))
         }
+        assertFalse(shouldProbe(lastProofMs = 10_000L, nowMs = 9_999L))
     }
 
     @Test
-    fun `TURNcoat watchdog starts at sixty seconds and passes its route type into the full VPN proof policy`() {
-        val source = sourceFile("BoxService.kt")
-        val watchdog = functionBody(source, "runRouteWatchdogCheck")
-        val initialDelay = functionBody(source, "routeWatchdogInitialDelayMs")
+    fun `screen transitions re-arm only the remaining age of the current proof`() {
+        val lastProofMs = 100L
 
-        assertTrue(
-            "TURNcoat must not defer its first watchdog proof beyond one minute",
-            source.contains("private const val ROUTE_WATCHDOG_TURNCOAT_INITIAL_DELAY_MS = 60_000L"),
+        assertEquals(
+            180_000L,
+            vpnDataPlaneProbeDelayMs(
+                deviceInteractive = true,
+                lastProofElapsedRealtimeMs = lastProofMs,
+                nowElapsedRealtimeMs = 120_100L,
+            ),
         )
-        assertTrue(
-            "TURNcoat initial delay must select the dedicated one-minute constant from the live generation owner",
-            initialDelay.contains("currentRuntimeUsesTurncoat() -> ROUTE_WATCHDOG_TURNCOAT_INITIAL_DELAY_MS"),
+        assertEquals(
+            1_680_000L,
+            vpnDataPlaneProbeDelayMs(
+                deviceInteractive = false,
+                lastProofElapsedRealtimeMs = lastProofMs,
+                nowElapsedRealtimeMs = 120_100L,
+            ),
         )
-        val runtimeHelperStart = source.indexOf("private fun currentRuntimeUsesTurncoat(): Boolean")
-        val runtimeHelperEnd = source.indexOf("\n    private fun", runtimeHelperStart + 1)
-        val runtimeUsesTurncoat = if (runtimeHelperStart < 0 || runtimeHelperEnd < 0) {
-            ""
-        } else {
-            source.substring(runtimeHelperStart, runtimeHelperEnd)
-        }
-        assertTrue(
-            "live route policy must read TURNcoat capability from immutable runtime ownership",
-            runtimeUsesTurncoat.contains("runtimeConfigOwnership.usesTurncoat(currentStartGeneration())"),
+        assertEquals(
+            100_000L,
+            vpnDataPlaneProbeDelayMs(
+                deviceInteractive = true,
+                lastProofElapsedRealtimeMs = lastProofMs,
+                nowElapsedRealtimeMs = 200_100L,
+            ),
         )
-        assertFalse(
-            "live route policy must not read future resume intent from Settings",
-            runtimeUsesTurncoat.contains("Settings.activeConfig"),
-        )
-        assertTrue("the watchdog must use the full VPN data-plane proof policy", watchdog.contains("shouldRunVpnDataPlaneProbe("))
-        assertTrue("the full proof policy must know that the selected route is TURNcoat", watchdog.contains("turncoatRoute = usesTurncoat"))
     }
 
     @Test
     fun `clock rollback cannot force a stable or traffic-triggered probe`() {
         assertFalse(shouldProbe(lastProofMs = 10_000L, nowMs = 9_999L))
-        assertFalse(shouldProbe(tunTrafficAdvanced = true, lastProofMs = 10_000L, nowMs = 9_999L))
+        assertFalse(shouldProbe(lastProofMs = 10_000L, nowMs = 9_999L))
     }
 
     @Test
@@ -117,37 +156,103 @@ class VpnDataPlaneProbePolicyTest {
     }
 
     @Test
-    fun `vpn source keeps Marten UID in the VPN and admits started only with current tun proof`() {
-        val openTun = functionBody(sourceFile("VPNService.kt"), "openTun")
-        val routingPolicy = sourceFile("VpnAppRoutingPolicy.kt")
+    fun `vpn source keeps Marten in its resolved TUN plan while allowing selected exclusions and admits started only with current proof`() {
+        val vpnService = sourceFile("VPNService.kt")
+        val openTun = functionBody(vpnService, "openTun")
         assertTrue(
-            "VPNService must resolve routing with its own package name",
-            Regex("resolveVpnAppRoutingPlan\\([\\s\\S]*ownPackageName\\s*=\\s*packageName").containsMatchIn(openTun),
+            "openTun must build the authoritative app-routing plan from Settings and subscription options",
+            openTun.contains("resolveVpnAppRoutingPlan(") &&
+                openTun.contains("ownPackageName = packageName") &&
+                openTun.contains("perAppProxyMode = Settings.perAppProxyMode") &&
+                openTun.contains("perAppProxyPackages = Settings.perAppProxyList") &&
+                openTun.contains("optionIncludePackages = optionIncludePackages") &&
+                openTun.contains("optionExcludePackages = optionExcludePackages"),
         )
         assertTrue(
-            "include-only policy must retain Marten's package",
-            routingPolicy.contains("it == ownPackageName || it !in bypassPackages"),
+            "Marten remains in IncludeOnly while selected subscription/user exclusions use the explicit plan branches",
+            openTun.contains("is VpnAppRoutingPlan.IncludeOnly") &&
+                openTun.contains("addIncludePackage(builder, routedPackage)") &&
+                openTun.contains("if (routedPackage != packageName)") &&
+                openTun.contains("is VpnAppRoutingPlan.Exclude") &&
+                openTun.contains("addExcludePackage(builder, bypassedPackage)") &&
+                vpnService.contains("builder.addAllowedApplication(packageName)") &&
+                vpnService.contains("builder.addDisallowedApplication(packageName)"),
         )
-        assertTrue(
-            "exclude policy must remove Marten's package",
-            routingPolicy.contains(".filter { it != ownPackageName }"),
-        )
+        assertFalse("strict VPN must not enable Android bypass", vpnService.contains("allowBypass("))
+        assertFalse("strict VPN must not exclude an IP route from the TUN", vpnService.contains("excludeRoute("))
+        assertTrue("strict VPN must install IPv4 default route", openTun.contains("builder.addRoute(\"0.0.0.0\", 0)"))
+        assertTrue("strict VPN must install IPv6 default route", openTun.contains("builder.addRoute(\"::\", 0)"))
 
         val serviceSource = sourceFile("BoxService.kt")
         val currentProof = functionBody(serviceSource, "currentVpnDataPlaneProof")
-        val markStarted = functionBody(serviceSource, "markCoreRuntimeStarted")
+        val recordProof = functionBody(serviceSource, "recordVpnDataPlaneProof")
+        val markStartedStart = serviceSource.indexOf("private suspend fun markCoreRuntimeStarted(")
+        val markStartedEnd = serviceSource.indexOf("\n    private suspend fun awaitTunRuntimeHealthForStarted()", markStartedStart)
+        val markStarted = serviceSource.substring(markStartedStart, markStartedEnd)
         assertTrue("data-plane proof must bind to the active TUN generation", currentProof.contains("it.tunGeneration == tunGeneration"))
+        val currentHandleLookup = "val currentVpnNetworkHandle = vpnDataPlaneProbe.currentVpnNetworkHandle()"
+        val currentProofLock = currentProof.indexOf("synchronized(vpnDataPlaneProofLock)")
+        val currentProofHandleComparison = currentProof.indexOf("it.vpnNetworkHandle == currentVpnNetworkHandle", currentProofLock)
+        val recordProofLock = recordProof.indexOf("synchronized(vpnDataPlaneProofLock)")
+        val recordProofHandleComparison = recordProof.indexOf("proofVpnNetworkHandle != currentVpnNetworkHandle", recordProofLock)
         assertTrue(
-            "data-plane proof must bind to the exact active Android VPN Network",
-            currentProof.contains("it.vpnNetworkHandle == vpnDataPlaneProbe.currentVpnNetworkHandle()"),
+            "current-proof lookup must capture the exact Android VPN Network before taking the proof lock",
+            currentProof.indexOf(currentHandleLookup) >= 0 && currentProofLock > currentProof.indexOf(currentHandleLookup),
+        )
+        assertTrue(
+            "current proof must bind its stored handle to the captured exact Android VPN Network",
+            currentProofHandleComparison > currentProofLock,
+        )
+        assertTrue(
+            "proof recording must capture the exact Android VPN Network before taking the proof lock",
+            recordProof.indexOf(currentHandleLookup) >= 0 && recordProofLock > recordProof.indexOf(currentHandleLookup),
+        )
+        assertTrue(
+            "proof recording must compare the supplied handle with the captured exact Android VPN Network",
+            recordProofHandleComparison > recordProofLock,
         )
 
-        val freshProofGuard = markStarted.indexOf("if (!hasReusableVpnDataPlaneProof(generation))")
+        val freshProofGuards = Regex("hasReusableVpnDataPlaneProof\\(generation\\)")
+            .findAll(markStarted)
+            .map { it.range.first }
+            .toList()
+        val freshProofGuard = freshProofGuards.firstOrNull() ?: -1
         val started = markStarted.indexOf("status.value = Status.Started")
-        assertTrue("Started must unconditionally be gated by a fresh VPN data-plane proof", freshProofGuard >= 0)
+        assertEquals("Started must have an initial and final exact current-proof gate", 2, freshProofGuards.size)
         assertFalse("no route-verification caller may bypass the proof gate", markStarted.contains("routeVerified && !hasReusableVpnDataPlaneProof"))
         assertTrue("proof gate must execute before Started", started > freshProofGuard)
         assertTrue("missing proof must leave the service in Starting", markStarted.substring(freshProofGuard, started).contains("status.value = Status.Starting"))
+        assertTrue("publishing Started may stop the deadline supervisor without stopping recovery", markStarted.contains("stopCoreRecoverySupervision()"))
+        assertFalse("publishing Started must not cancel the recovery job", markStarted.contains("stopCoreWatchdog()"))
+        val stopRecoverySupervision = functionBody(serviceSource, "stopCoreRecoverySupervision")
+        assertTrue("Started must cancel only the recovery deadline supervisor", stopRecoverySupervision.contains("coreWatchdogJob?.cancel()"))
+        assertFalse("Started must preserve the admitted recovery job", stopRecoverySupervision.contains("coreRecoveryJob = null"))
+        assertFalse("Started must preserve recovery state and online deadline", stopRecoverySupervision.contains("coreRecoveryInProgress = false") || stopRecoverySupervision.contains("coreRecoveryOnlineStartedAtElapsed = 0L"))
+    }
+
+    @Test
+    fun `route monitor drops stale start network and tun observations before recovery mutations`() {
+        val source = sourceFile("BoxService.kt")
+        val monitorStart = functionBody(source, "startRouteWatchdog")
+        val check = functionBody(source, "runRouteWatchdogCheck")
+
+        assertTrue("the monitor must capture the start generation that owns its checks", monitorStart.contains("val generation = currentStartGeneration()"))
+        assertTrue("the check must receive the captured start generation", monitorStart.contains("runRouteWatchdogCheck(reason, healthClient, routeClient, generation)"))
+        assertTrue("the check must bind observations to network and TUN generations", check.contains("val checkNetworkGeneration = networkGeneration") && check.contains("val checkTunGeneration = tunGeneration"))
+        assertTrue("current-observation validation must include all three live generations", check.contains("shouldWatchCore(generation)") && check.contains("networkGeneration == checkNetworkGeneration") && check.contains("tunGeneration == checkTunGeneration"))
+
+        val staleResult = check.indexOf("if (!isCurrentObservation())", check.indexOf("val result ="))
+        val firstMutationAfterResult = listOf(
+            check.indexOf("routeWatchdogFailures = 0", staleResult),
+            check.indexOf("routeWatchdogDegraded = true", staleResult),
+            check.indexOf("markRouteDegraded(", staleResult),
+        ).filter { it >= 0 }.minOrNull() ?: -1
+        assertTrue("stale route results must be discarded before state changes", staleResult >= 0 && firstMutationAfterResult > staleResult)
+
+        val catchStart = check.indexOf("catch (e: Throwable)")
+        val exceptionGuard = check.indexOf("if (!isCurrentObservation()) return", catchStart)
+        val exceptionMutation = check.indexOf("routeWatchdogFailures += 1", catchStart)
+        assertTrue("cancellation and stale exceptions must be rejected before failure counters change", catchStart >= 0 && exceptionGuard > catchStart && exceptionMutation > exceptionGuard)
     }
 
     @Test
@@ -163,21 +268,19 @@ class VpnDataPlaneProbePolicyTest {
     }
 
     @Test
-    fun `TURNcoat watchdog accepts carrier telemetry only alongside a current Android VPN proof`() {
+    fun `stable VPN supervision never replaces a not due current proof with an outbound probe`() {
         val watchdog = functionBody(sourceFile("BoxService.kt"), "runRouteWatchdogCheck")
+        val requireProof = watchdog.indexOf("val requireVpnDataPlane = Settings.serviceMode == ServiceMode.VPN")
+        val shouldRun = watchdog.indexOf("shouldRunVpnDataPlaneProbe(", requireProof)
+        val currentProof = watchdog.indexOf("else if (Settings.serviceMode == ServiceMode.VPN && currentProof != null)", shouldRun)
+        val genericProbe = watchdog.indexOf("checkSelectedRoute(routeClient)", currentProof)
 
-        val evidence = watchdog.indexOf("val turncoatEvidence")
-        val liveCarrier = watchdog.indexOf("isLiveTurncoatCarrier(", evidence)
-        val requireProof = watchdog.indexOf("val requireVpnDataPlane = scheduledVpnDataPlaneProof || turncoatCarrierNeedsProof")
-        val retainedProof = watchdog.indexOf("usesTurncoat && currentProof != null")
-        val missingProof = watchdog.indexOf("TURNcoat route has no current VPN data-plane proof")
-        assertTrue("carrier telemetry remains diagnostic", evidence >= 0 && liveCarrier > evidence)
-        assertTrue("missing real RX must force an authoritative data-plane GET", requireProof > liveCarrier)
-        assertTrue("a healthy TURNcoat watchdog result may retain only a current native proof", retainedProof > requireProof)
-        assertTrue("telemetry alone must fail closed when no proof exists", missingProof > retainedProof)
-        assertFalse(
-            "health/probe counters may not directly return a successful route",
-            watchdog.substring(evidence, retainedProof).contains("RouteHealth(\n                    true"),
+        assertTrue("the shared schedule must decide when the VPN data-plane proof is due", requireProof >= 0 && shouldRun > requireProof)
+        assertTrue("a not-due VPN proof is retained as the route result", currentProof > shouldRun)
+        assertTrue("the generic selected-route probe belongs after the VPN-specific proof branch", genericProbe > currentProof)
+        assertTrue(
+            "the selected-route monitor must not retain a TURNcoat-specific periodic proof shortcut",
+            !watchdog.contains("turncoatCarrierNeedsProof") && !watchdog.contains("scheduledVpnDataPlaneProof"),
         )
     }
 
@@ -198,13 +301,14 @@ class VpnDataPlaneProbePolicyTest {
     fun `Flutter acknowledgement uses the bounded native TURNcoat retry gate`() {
         val source = sourceFile("BoxService.kt")
         val acknowledgement = functionBody(source, "acknowledgeVerifiedRouteFromFlutter")
-        val retry = acknowledgement.indexOf("verifyNativeStartupRoute(")
-        val turncoatPlan = acknowledgement.indexOf("usesTurncoat = currentRuntimeUsesTurncoat()", retry)
+        val retry = acknowledgement.indexOf("awaitStartupRoutePublication(")
+        val turncoatPlan = acknowledgement.indexOf("val usesTurncoat = currentRuntimeUsesTurncoat()")
         val deadline = source.indexOf("private const val STARTUP_ROUTE_VERIFY_TURNCOAT_TIMEOUT_MS = 75_000L")
         val retryDelay = source.indexOf("private const val STARTUP_ROUTE_VERIFY_RETRY_MS = 700L")
 
-        assertTrue("Flutter acknowledgement must await native data-plane retry", retry >= 0)
-        assertTrue("retry must use the selected TURNcoat configuration", turncoatPlan > retry)
+        assertTrue("Flutter acknowledgement must await bounded route publication", retry >= 0)
+        assertTrue("retry must use the selected TURNcoat configuration", turncoatPlan >= 0 && turncoatPlan < retry)
+        assertTrue("native route verification must share the acknowledgement deadline", acknowledgement.contains("operationDeadlineElapsedMs = deadline"))
         assertTrue("native retry must stay bounded", deadline >= 0 && retryDelay >= 0)
     }
 
@@ -258,6 +362,54 @@ class VpnDataPlaneProbePolicyTest {
         assertTrue(
             "two failed data-plane attempts must request full core/TUN recovery",
             networkRecovery.indexOf("requestCoreRecovery(", coreEscalation) > coreEscalation,
+        )
+    }
+
+    @Test
+    fun `periodic stable proof failure defers user visible recovery while preserving the proof only for that probe`() {
+        val source = sourceFile("BoxService.kt")
+        val watchdog = functionBody(source, "runRouteWatchdogCheck")
+        val routeCheck = functionBody(source, "checkSelectedRoute")
+        val vpnProbe = functionBody(source, "checkVpnDataPlaneRoute")
+
+        val preserveDecision = watchdog.indexOf("shouldPreserveVerifiedRouteAfterTransientProbeFailure(")
+        val dataPlaneCheck = watchdog.indexOf("checkSelectedRoute(", preserveDecision)
+        assertTrue(
+            "a stable periodic watchdog check must decide whether its existing proof is transient before issuing the VPN GET",
+            preserveDecision >= 0 && dataPlaneCheck > preserveDecision,
+        )
+        assertTrue(
+            "only the VPN data-plane path may receive the transient-proof preservation flag",
+            routeCheck.contains("preserveVpnDataPlaneProofOnFailure") &&
+                vpnProbe.contains("preserveProofOnFailure"),
+        )
+        assertTrue(
+            "the periodic VPN GET must forward its transient-proof decision into the route checker",
+            watchdog.substring(preserveDecision, (dataPlaneCheck + 360).coerceAtMost(watchdog.length))
+                .contains("preserveVpnDataPlaneProofOnFailure ="),
+        )
+        assertTrue(
+            "a deliberately preserved transient proof must not be invalidated by the failed GET",
+            vpnProbe.contains("if (preserveProofOnFailure && !result.networkReadinessPending)") &&
+                vpnProbe.indexOf("invalidateVpnDataPlaneProof(result.summary)") >
+                vpnProbe.indexOf("if (preserveProofOnFailure && !result.networkReadinessPending)"),
+        )
+
+        val publishDecision = watchdog.indexOf("shouldPublishRouteRecoveryStatus(")
+        val degrade = watchdog.indexOf("markRouteDegraded(result.summary)", publishDecision)
+        val recover = watchdog.indexOf("recoverRoute(\"selected route unavailable:", publishDecision)
+        assertTrue(
+            "the periodic watchdog must gate its visible recovery transition on the confirmation policy",
+            publishDecision >= 0 && degrade > publishDecision && recover > degrade,
+        )
+
+        val networkChanged = functionBody(source, "onUnderlyingNetworkObserved")
+        val networkRecovery = functionBody(source, "launchNetworkRouteRecovery")
+        assertTrue("network generation changes must still enter their recovery owner", networkChanged.contains("launchNetworkRouteRecovery("))
+        assertTrue(
+            "network recovery remains immediately visible rather than borrowing the periodic transient-probe grace",
+            networkRecovery.contains("status.value = Status.Starting") &&
+                networkRecovery.contains("R.string.status_recovering"),
         )
     }
 
@@ -321,6 +473,49 @@ class VpnDataPlaneProbePolicyTest {
     }
 
     @Test
+    fun `ordinary route watchdog escalation prefers bounded network recovery before core rebuild while TURNcoat failures may still escalate`() {
+        val source = sourceFile("BoxService.kt")
+        val recoverRoute = functionBody(source, "recoverRoute")
+        val recoverNetworkRoute = functionBody(source, "recoverNetworkRoute")
+
+        val launchRouteRecovery = recoverRoute.indexOf("launchNetworkRouteRecovery(")
+        val routeReason = recoverRoute.indexOf("route watchdog recovery:")
+        assertTrue(
+            "route watchdog must still keep TURNcoat/ICMP branch in the same in-place recovery path",
+            launchRouteRecovery >= 0 &&
+                recoverRoute.contains("forceTurncoatCarrierRetirement = currentRuntimeUsesTurncoat()") &&
+                recoverRoute.contains("replaceActive = false") &&
+                routeReason >= 0,
+        )
+        assertTrue(
+            "ordinary non-TURNcoat/non-ICMP escalation must use bounded route recovery rather than direct core request",
+            !recoverRoute.contains("requestCoreRecovery("),
+        )
+
+        val resetFailed = recoverNetworkRoute.indexOf("if (resetResult.isFailure)")
+        val networkResetCore = recoverNetworkRoute.indexOf("Mobile.resetNetworkForRouteRecovery()")
+        val normalReset = recoverNetworkRoute.indexOf("Mobile.resetNetwork()")
+        val resetFailureCoreRecovery = recoverNetworkRoute.indexOf(
+            "requestCoreRecovery(\"native \$resetKind failed during \$reason\")",
+        )
+        assertTrue("forced TURNcoat path still requires a forced native reset", networkResetCore >= 0)
+        assertTrue("non-forced reset still remains the in-place route recovery baseline", normalReset >= 0)
+        assertTrue(
+            "route reset failures must still escape to core recovery when recovery cannot be fixed in-place",
+            resetFailureCoreRecovery > resetFailed,
+        )
+
+        val resultEscalation = recoverNetworkRoute.indexOf(
+            "if (\n                (result.requiresCoreRecovery && routeAttempt >= 2) ||\n                routeAttempt >= NETWORK_ROUTE_RECOVERY_MAX_ATTEMPTS",
+        )
+        val fallbackCoreRecovery = recoverNetworkRoute.indexOf("requestCoreRecovery(", resultEscalation)
+        assertTrue(
+            "bounded network-route attempts must still escalate into core/TUN recovery",
+            resultEscalation >= 0 && fallbackCoreRecovery > resultEscalation,
+        )
+    }
+
+    @Test
     fun `source body scanner ignores braces in Kotlin literals and comments`() {
         val source =
             "fun sample() {\n" +
@@ -341,16 +536,12 @@ class VpnDataPlaneProbePolicyTest {
         forced: Boolean = false,
         degraded: Boolean = false,
         deviceInteractive: Boolean = true,
-        turncoatRoute: Boolean = false,
-        tunTrafficAdvanced: Boolean = false,
         lastProofMs: Long = 1L,
         nowMs: Long = 1L,
     ): Boolean = shouldRunVpnDataPlaneProbe(
         forced = forced,
         degraded = degraded,
-        turncoatRoute = turncoatRoute,
         deviceInteractive = deviceInteractive,
-        tunTrafficAdvanced = tunTrafficAdvanced,
         lastProofElapsedRealtimeMs = lastProofMs,
         nowElapsedRealtimeMs = nowMs,
     )

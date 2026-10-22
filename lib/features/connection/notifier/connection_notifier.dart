@@ -1,12 +1,16 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:flutter/services.dart';
+import 'package:flutter/widgets.dart';
+import 'package:fpdart/fpdart.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:in_app_review/in_app_review.dart';
 import 'package:marten/core/analytics/analytics_controller.dart';
 import 'package:marten/core/analytics/analytics_logger.dart';
 import 'package:marten/core/haptic/haptic_service.dart';
 import 'package:marten/core/localization/translations.dart';
+import 'package:marten/core/network/strict_vpn_egress_gate.dart';
 import 'package:marten/core/preferences/general_preferences.dart';
 import 'package:marten/core/router/dialog/dialog_notifier.dart';
 import 'package:marten/core/utils/preferences_utils.dart';
@@ -19,6 +23,8 @@ import 'package:marten/features/connection/model/connection_status.dart';
 import 'package:marten/features/home/data/local_outbounds_provider.dart';
 import 'package:marten/features/profile/model/profile_entity.dart';
 import 'package:marten/features/profile/notifier/active_profile_notifier.dart';
+import 'package:marten/features/profile/notifier/background_profiles_update.dart';
+import 'package:marten/features/profile/notifier/subscription_push_refresh.dart';
 import 'package:marten/singbox/model/core_status.dart';
 import 'package:marten/utils/utils.dart';
 import 'package:riverpod_annotation/riverpod_annotation.dart';
@@ -55,8 +61,38 @@ bool shouldReportBootstrapSetupFailure({
   required bool manualDisconnectRequested,
 }) => requestAbortToken == currentAbortToken && !manualDisconnectRequested;
 
+bool isCurrentConnectIntent({required int attemptGeneration, required int currentGeneration}) =>
+    attemptGeneration == currentGeneration;
+
+@visibleForTesting
+bool shouldPreserveConnectedSessionAfterProfileChange({
+  required ProfileEntity? previous,
+  required ProfileEntity? next,
+  required bool activeRuntimeConfigMatches,
+}) => _sameRuntimeRelevantProfileFields(previous, next) && activeRuntimeConfigMatches;
+
+bool _sameRuntimeRelevantProfileFields(ProfileEntity? previous, ProfileEntity? next) =>
+    previous != null &&
+    next != null &&
+    previous.runtimeType == next.runtimeType &&
+    previous.id == next.id &&
+    previous.active == next.active &&
+    previous.name == next.name &&
+    previous.profileOverride == next.profileOverride;
+
+enum NativeSatisfiedConnectResolution { satisfied, connectRequired, cancelled, transportFailure }
+
+NativeSatisfiedConnectResolution nativeSatisfiedConnectResolutionFromPlatform(Object? value) => switch (value) {
+  'satisfied' || true => NativeSatisfiedConnectResolution.satisfied,
+  'connect_required' => NativeSatisfiedConnectResolution.connectRequired,
+  'cancelled' || false => NativeSatisfiedConnectResolution.cancelled,
+  _ => NativeSatisfiedConnectResolution.transportFailure,
+};
+
 @Riverpod(keepAlive: true)
 class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
+  static const _nativeConnectRequestsChannel = EventChannel('app.marten.client/connect.requests', JSONMethodCodec());
+  static const _nativeConnectRequestAcksChannel = MethodChannel('app.marten.client/connect.requests.ack');
   static const List<Duration> _autoReconnectDelays = [
     Duration.zero,
     Duration(seconds: 5),
@@ -70,20 +106,20 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
   static const _turncoatRouteWatchdogInitialDelay = TurncoatLivenessNotifier.connectTimeout;
   static const _routeWatchdogInterval = Duration(seconds: 10);
   static const _turncoatRouteWatchdogInterval = Duration(seconds: 60);
+  static const _iosStableRouteWatchdogInterval = Duration(minutes: 5);
+  static const _iosStableBackgroundRouteWatchdogInterval = Duration(minutes: 30);
   static const _routeWatchdogRetryDelay = Duration(seconds: 10);
   static const _turncoatRouteWatchdogRetryDelay = Duration(seconds: 30);
   static const _routeWatchdogResumeDelay = Duration(seconds: 3);
   static const _turncoatRouteWatchdogResumeDelay = Duration(seconds: 15);
   static const _routeWatchdogMaxFailures = 3;
   static const _turncoatRouteWatchdogMaxFailures = 3;
-  static const _androidNativeRecoveryRouteVerificationRetryDelay = Duration(seconds: 2);
   static const _existingTurncoatRouteVerificationRetryDelay = Duration(seconds: 30);
   static const _existingTurncoatRouteVerificationMaxFailures = 6;
 
   Timer? _autoReconnectTimer;
   Timer? _routeWatchdogTimer;
   Timer? _existingStartedRouteVerificationRetryTimer;
-  Timer? _nativeRecoveryReconnectTimer;
   int _autoReconnectAttempt = 0;
   int _routeWatchdogFailures = 0;
   int _existingStartedRouteVerificationFailures = 0;
@@ -93,15 +129,43 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
   bool _autoReconnectRunning = false;
   bool _routeWatchdogRunning = false;
   bool _startupRouteVerificationRunning = false;
+  bool _awaitingAndroidAuthoritativeRecoveryStatus = false;
   bool _manualConnectPending = false;
   bool _manualButtonDisconnectInProgress = false;
   bool _manualDisconnectInputSettling = false;
   bool _showIdleDuringAbort = false;
   ConnectionFailure? _lastSilentAutoReconnectFailure;
   int _abortToken = 0;
+  int _connectIntentGeneration = 0;
+  int _activeProfileChangeRevision = 0;
+  int _androidEgressEpoch = 0;
+  int? _androidPlatformTransitionEgressEpoch;
+  Future<void> _androidEgressPreferenceOperation = Future<void>.value();
+  Future<void>? _androidNetworkServicesStart;
+  bool _androidBackgroundRefreshRegistered = false;
+  StreamSubscription<dynamic>? _nativeConnectRequestsSubscription;
+  bool _nativeConnectRequestPending = false;
+  int? _nativeConnectRequestAttemptHandoffId;
+  int? _nativeConnectRequestHandoffId;
+  int? _nativeConnectRequestIntentGeneration;
+  int? _nativeConnectRequestAckInFlightHandoffId;
 
   @override
   Stream<ConnectionStatus> build() async* {
+    ref.onDispose(() {
+      _cancelAutoReconnect();
+      _stopRouteWatchdog();
+      _cancelExistingStartedRouteVerificationRetry();
+      _nativeConnectRequestPending = false;
+      _nativeConnectRequestAttemptHandoffId = null;
+      _nativeConnectRequestHandoffId = null;
+      _nativeConnectRequestIntentGeneration = null;
+      _nativeConnectRequestAckInFlightHandoffId = null;
+      _androidPlatformTransitionEgressEpoch = null;
+    });
+    _installNativeConnectRequestListener();
+    _adoptBootstrapAndroidEgressSeal();
+
     if (PlatformUtils.isMobile) {
       final platformBootstrapHandled = Platform.isAndroid && await _connectionRepo.initializePassivePlatformStatus();
       if (!platformBootstrapHandled) {
@@ -124,13 +188,6 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
       }
     }
 
-    ref.onDispose(() {
-      _cancelAutoReconnect();
-      _stopRouteWatchdog();
-      _cancelExistingStartedRouteVerificationRetry();
-      _nativeRecoveryReconnectTimer?.cancel();
-    });
-
     listenSelf((previous, next) async {
       if (previous == next) return;
       final previousStatus = previous?.valueOrNull;
@@ -141,7 +198,29 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
       _handleAutoReconnectTransition(previousStatus, nextStatus);
       _handleRouteWatchdogTransition(nextStatus);
       _handleStartupRouteVerification(nextStatus);
+      _tryExecutePendingNativeConnectRequest(nextStatus);
+      if (Platform.isAndroid) {
+        if (nextStatus is Connected) {
+          final egressEpoch = _androidEgressEpoch;
+          unawaited(_admitAndroidOrdinaryNetworking(egressEpoch));
+        } else if (nextStatus is Connecting || (nextStatus is Disconnecting && previousStatus is! Disconnected)) {
+          unawaited(_ensureAndroidOrdinaryNetworkingSealed('platform status ${nextStatus.runtimeType}'));
+        } else if (nextStatus is Disconnecting) {
+          // A terminal Disconnected frame is authoritative. Do not let an old
+          // EventChannel Disconnecting delivery reseal direct networking after
+          // that terminal release; a real new start must publish Connecting.
+          loggy.info('ignoring stale platform Disconnecting after authoritative Disconnected');
+        }
+      }
       if (nextStatus is Disconnected && previousStatus is! Disconnected) {
+        if (Platform.isAndroid) {
+          final platformEgressEpoch = _androidPlatformTransitionEgressEpoch;
+          _androidPlatformTransitionEgressEpoch = null;
+          if (platformEgressEpoch != null) {
+            unawaited(_releaseAndroidOrdinaryNetworkingAfterTerminalDisconnect(expectedEpoch: platformEgressEpoch));
+          }
+          unawaited(_synchronizeAndroidTerminalUserIntent());
+        }
         unawaited(_syncNativeResumeConfigWhenIdle());
       }
       if (shouldResetTransientConnectionFeatures(
@@ -176,7 +255,8 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
       // watches that self-invalidating signal, and in-flight work still keeps
       // an immutable dependency snapshot.
       final connectionRepo = _connectionRepo;
-      unawaited(_handleActiveProfileChange(previous, next, connectionRepo));
+      final revision = ++_activeProfileChangeRevision;
+      unawaited(_handleActiveProfileChange(previous, next, connectionRepo, revision));
     });
     ref.listen(selectedProxyByProfileProvider, (previous, next) {
       if (previous == next) return;
@@ -187,12 +267,6 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
       unawaited(_handleTurncoatConnectTimeout());
     });
     yield* _connectionRepo.watchConnectionStatus().map(_visibleConnectionStatus).doOnData((event) {
-      // Android Starting and route-gated Started are both rendered as
-      // Connecting. Observe the raw lifecycle-derived event before UI
-      // deduplication so the latter can start cold-attach verification.
-      // Otherwise a service that has already proved its VPN data plane can
-      // remain Connecting forever after a Flutter engine/process restart.
-      if (Platform.isAndroid) _handleStartupRouteVerification(event);
       if (event case Disconnected(connectionFailure: final _?) when PlatformUtils.isDesktop) {
         ref.read(Preferences.startedByUser.notifier).update(false);
       }
@@ -201,6 +275,214 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
   }
 
   ConnectionRepository get _connectionRepo => ref.read(connectionRepositoryProvider);
+
+  void _installNativeConnectRequestListener() {
+    if (!Platform.isAndroid || _nativeConnectRequestsSubscription != null) return;
+    final subscription = _nativeConnectRequestsChannel.receiveBroadcastStream().listen(
+      _handleNativeConnectRequest,
+      onError: (Object error, StackTrace stackTrace) {
+        loggy.error('native connect request channel failed', error, stackTrace);
+      },
+    );
+    _nativeConnectRequestsSubscription = subscription;
+    ref.onDispose(() {
+      if (identical(_nativeConnectRequestsSubscription, subscription)) {
+        _nativeConnectRequestsSubscription = null;
+      }
+      unawaited(subscription.cancel());
+    });
+  }
+
+  void _handleNativeConnectRequest(dynamic event) {
+    final request = event is Map ? event : const <Object?, Object?>{};
+    final source = request['source']?.toString() ?? 'native';
+    final requestId = request['requestId'];
+    final handoffId = switch (request['handoffId']) {
+      final int value when value > 0 => value,
+      final num value when value.toInt() > 0 => value.toInt(),
+      _ => null,
+    };
+    if (handoffId == null) {
+      loggy.warning('discarding native connect request without a valid handoff id');
+      return;
+    }
+    if (_nativeConnectRequestHandoffId == handoffId &&
+        (_nativeConnectRequestPending ||
+            _nativeConnectRequestAttemptHandoffId == handoffId ||
+            _nativeConnectRequestAckInFlightHandoffId == handoffId)) {
+      if (_nativeConnectRequestAckInFlightHandoffId == null) {
+        _tryExecutePendingNativeConnectRequest(state.valueOrNull);
+      }
+      return;
+    }
+    _nativeConnectRequestHandoffId = handoffId;
+    _nativeConnectRequestIntentGeneration = null;
+    _nativeConnectRequestPending = true;
+    loggy.info('queued native connect request source=$source requestId=$requestId handoffId=$handoffId');
+    _tryExecutePendingNativeConnectRequest(state.valueOrNull);
+  }
+
+  void _tryExecutePendingNativeConnectRequest(ConnectionStatus? status) {
+    if (!_nativeConnectRequestPending) return;
+    final handoffId = _nativeConnectRequestHandoffId;
+    if (handoffId == null) return;
+    if (_nativeConnectRequestAckInFlightHandoffId == handoffId) return;
+    if (status is Disconnected || state is AsyncError<ConnectionStatus>) {
+      // Reserve the newest user intent even while an older Connect is still
+      // unwinding. Its delayed failure continuation must not issue a terminal
+      // platform Stop that clears this exact retained native handoff.
+      _reserveNativeConnectIntent(handoffId);
+      if (_nativeConnectRequestAttemptHandoffId != null) return;
+      _executePendingNativeConnectRequest(handoffId);
+      return;
+    }
+    if (_nativeConnectRequestAttemptHandoffId == handoffId) return;
+    if (status is Connected || status is Connecting) {
+      if (status is Connecting) {
+        // A platform-originated Connecting update can reach this listener before
+        // its later transition callback. Seal synchronously before acknowledging
+        // that Dart owns the native gesture.
+        unawaited(_ensureAndroidOrdinaryNetworkingSealed('native Connect joined an existing transition'));
+      }
+      unawaited(_resolvePossiblySatisfiedNativeConnectRequest(handoffId, status));
+      loggy.info('checking retained ${status.runtimeType} against the service-owned native lifecycle');
+      return;
+    }
+    // AsyncLoading and Disconnecting retain the one-shot request until the
+    // authoritative service stream reaches an executable terminal state.
+  }
+
+  int _reserveNativeConnectIntent(int handoffId) {
+    if (_nativeConnectRequestHandoffId != handoffId) return _connectIntentGeneration;
+    return _nativeConnectRequestIntentGeneration ??= ++_connectIntentGeneration;
+  }
+
+  void _executePendingNativeConnectRequest(int handoffId, {bool nativeServiceConfirmedInactive = false}) {
+    if (!_nativeConnectRequestPending || _nativeConnectRequestHandoffId != handoffId) return;
+    if (_nativeConnectRequestAttemptHandoffId != null || _nativeConnectRequestAckInFlightHandoffId != null) return;
+    final connectIntentGeneration = _reserveNativeConnectIntent(handoffId);
+    _nativeConnectRequestAttemptHandoffId = handoffId;
+    final execution = executeManualCommand(
+      ManualConnectionCommand.connect,
+      queueConnectAfterCurrentOperation: true,
+      nativeServiceConfirmedInactive: nativeServiceConfirmedInactive,
+      connectIntentGeneration: connectIntentGeneration,
+      onConnectTransitionSealed: () async {
+        if (_nativeConnectRequestHandoffId != handoffId) return null;
+        return _claimNativeConnectRequest(handoffId);
+      },
+    );
+    unawaited(
+      execution.whenComplete(() {
+        if (_nativeConnectRequestAttemptHandoffId == handoffId) {
+          _nativeConnectRequestAttemptHandoffId = null;
+        }
+        if (_nativeConnectRequestHandoffId != handoffId) {
+          if (_nativeConnectRequestPending) {
+            _tryExecutePendingNativeConnectRequest(state.valueOrNull);
+          }
+        }
+        // The same id is intentionally not retried here after a transport
+        // exception. Native redelivery or an authoritative status transition
+        // is the next event-driven trigger; no polling loop is introduced.
+      }),
+    );
+  }
+
+  Future<int?> _claimNativeConnectRequest(int handoffId) async {
+    if (_nativeConnectRequestHandoffId != handoffId || _nativeConnectRequestAckInFlightHandoffId == handoffId) {
+      return null;
+    }
+    _nativeConnectRequestAckInFlightHandoffId = handoffId;
+    int? startLease;
+    var nativeAnswered = false;
+    try {
+      startLease = await _nativeConnectRequestAcksChannel.invokeMethod<int>('claim', {'handoffId': handoffId});
+      nativeAnswered = true;
+    } catch (error, stackTrace) {
+      loggy.warning('failed to claim native connect handoff', error, stackTrace);
+    }
+    if (_nativeConnectRequestAckInFlightHandoffId == handoffId) {
+      _nativeConnectRequestAckInFlightHandoffId = null;
+    }
+    if (_nativeConnectRequestHandoffId != handoffId) return null;
+    if (startLease != null && startLease > 0) {
+      _nativeConnectRequestPending = false;
+      _nativeConnectRequestHandoffId = null;
+      return startLease;
+    }
+    if (nativeAnswered) {
+      // A concrete null means Android no longer owns this exact id: a
+      // terminal Stop cancelled it or a newer gesture replaced it. Discard it
+      // locally so a later Stopped -> Disconnected status cannot replay it.
+      _nativeConnectRequestPending = false;
+      _nativeConnectRequestHandoffId = null;
+      loggy.info('native connect handoff was cancelled or replaced before claim');
+    }
+    // A transport exception has no native ownership answer. Retain the id;
+    // redelivery or an authoritative status transition may retry it without a
+    // timer, wake lock or polling watchdog.
+    return null;
+  }
+
+  Future<NativeSatisfiedConnectResolution> _resolvePossiblySatisfiedNativeConnectRequest(
+    int handoffId,
+    ConnectionStatus? retainedStatus,
+  ) async {
+    if (_nativeConnectRequestHandoffId != handoffId || _nativeConnectRequestAckInFlightHandoffId == handoffId) {
+      return NativeSatisfiedConnectResolution.cancelled;
+    }
+    _nativeConnectRequestAckInFlightHandoffId = handoffId;
+    Object? nativeResolution;
+    try {
+      nativeResolution = await _nativeConnectRequestAcksChannel.invokeMethod<Object?>('ack_satisfied', {
+        'handoffId': handoffId,
+      });
+    } catch (error, stackTrace) {
+      loggy.warning('failed to retire satisfied native connect handoff', error, stackTrace);
+    }
+    if (_nativeConnectRequestAckInFlightHandoffId == handoffId) {
+      _nativeConnectRequestAckInFlightHandoffId = null;
+    }
+    if (_nativeConnectRequestHandoffId != handoffId) return NativeSatisfiedConnectResolution.cancelled;
+    final resolution = nativeSatisfiedConnectResolutionFromPlatform(nativeResolution);
+    switch (resolution) {
+      case NativeSatisfiedConnectResolution.satisfied:
+        _nativeConnectRequestPending = false;
+        _nativeConnectRequestHandoffId = null;
+        loggy.info('native connect request was already satisfied by ${retainedStatus.runtimeType}');
+      case NativeSatisfiedConnectResolution.connectRequired:
+        loggy.info('service lifecycle rejected stale ${retainedStatus.runtimeType}; executing native Connect');
+        _reserveNativeConnectIntent(handoffId);
+        _executePendingNativeConnectRequest(handoffId, nativeServiceConfirmedInactive: true);
+      case NativeSatisfiedConnectResolution.cancelled:
+        _nativeConnectRequestPending = false;
+        _nativeConnectRequestHandoffId = null;
+        loggy.info('satisfied native connect handoff was already cancelled or replaced');
+      case NativeSatisfiedConnectResolution.transportFailure:
+        // Keep the request for exact native redelivery or the next
+        // authoritative lifecycle transition. Never guess after IPC failure.
+        loggy.warning('native lifecycle did not resolve the satisfied Connect handoff');
+    }
+    return resolution;
+  }
+
+  Future<void> _cancelNativeConnectClaim(int startLease) async {
+    try {
+      await _nativeConnectRequestAcksChannel.invokeMethod<bool>('cancel_claim', {'startLease': startLease});
+    } catch (error, stackTrace) {
+      // The authoritative terminal Stop path also invalidates this lease. A
+      // transport failure here retains native ownership for safe redelivery;
+      // it must not be converted into a speculative local start.
+      loggy.warning('failed to cancel unused native connect claim', error, stackTrace);
+    }
+  }
+
+  void _cancelPendingNativeConnectRequestForTerminalStop() {
+    _nativeConnectRequestPending = false;
+    _nativeConnectRequestHandoffId = null;
+    _nativeConnectRequestAckInFlightHandoffId = null;
+  }
 
   bool get _flutterOwnsAutomaticRecovery =>
       automaticConnectionRecoveryOwnerForPlatform(isAndroid: Platform.isAndroid) ==
@@ -226,6 +508,11 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
     }
   }
 
+  void deferRouteWatchdogForBackground() {
+    if (!Platform.isIOS || !_shouldRunRouteWatchdog) return;
+    _scheduleRouteWatchdogCheck(_iosStableBackgroundRouteWatchdogInterval);
+  }
+
   Future<void> mayConnect() async {
     if (state case AsyncData(:final value)) {
       if (value case Disconnected()) await _connect();
@@ -240,11 +527,18 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
     }
   }
 
-  Future<void> executeManualCommand(ManualConnectionCommand command) async {
+  Future<void> executeManualCommand(
+    ManualConnectionCommand command, {
+    bool queueConnectAfterCurrentOperation = false,
+    bool nativeServiceConfirmedInactive = false,
+    int? connectIntentGeneration,
+    Future<int?> Function()? onConnectTransitionSealed,
+  }) async {
     final currentStatus = state.valueOrNull;
     final commandIsValid = currentStatus != null && canExecuteManualConnectionCommand(command, currentStatus);
     final canRecoverFromError = command == ManualConnectionCommand.connect && state is AsyncError<ConnectionStatus>;
-    if (!commandIsValid && !canRecoverFromError) {
+    final serviceOwnedNativeConnect = command == ManualConnectionCommand.connect && nativeServiceConfirmedInactive;
+    if (!commandIsValid && !canRecoverFromError && !serviceOwnedNativeConnect) {
       loggy.debug("stale manual $command ignored for current status $currentStatus");
       return;
     }
@@ -255,7 +549,12 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
     switch (command) {
       case ManualConnectionCommand.connect:
         _sendManualHaptic(haptic.lightImpact());
-        await _connect();
+        await _connect(
+          queueAfterCurrentOperation: queueConnectAfterCurrentOperation,
+          nativeServiceConfirmedInactive: nativeServiceConfirmedInactive,
+          connectIntentGeneration: connectIntentGeneration,
+          onConnectTransitionSealed: onConnectTransitionSealed,
+        );
       case ManualConnectionCommand.disconnect:
         _sendManualHaptic(haptic.mediumImpact());
         await _stopFromManualCommand(currentStatus);
@@ -266,6 +565,12 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
   }
 
   Future<void> _stopFromManualCommand(ConnectionStatus? currentStatus) async {
+    if (currentStatus is Connected || currentStatus is Connecting) {
+      // A captured Stop supersedes every older platform-originated Connect
+      // before the first await. Android cancels the retained bridge owner when
+      // repository cleanup reaches BoxService.stop().
+      _cancelPendingNativeConnectRequestForTerminalStop();
+    }
     switch (currentStatus) {
       case Connecting():
         _abortConnectionImmediately();
@@ -336,10 +641,25 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
     ProfileEntity? previous,
     ProfileEntity? next,
     ConnectionRepository connectionRepo,
+    int revision,
   ) async {
     if (previous != null && previous != next) {
-      await reconnect(next, repository: connectionRepo, waitForCurrent: true, supersedeQueued: true);
+      final candidateMatches = _sameRuntimeRelevantProfileFields(previous, next);
+      final runtimeMatches =
+          candidateMatches && state.valueOrNull is Connected && await connectionRepo.matchesActiveRuntimeConfig(next!);
+      if (revision != _activeProfileChangeRevision) return;
+      if (shouldPreserveConnectedSessionAfterProfileChange(
+        previous: previous,
+        next: next,
+        activeRuntimeConfigMatches: runtimeMatches,
+      )) {
+        loggy.info('active profile metadata updated; keeping the verified connection');
+        return;
+      } else {
+        await reconnect(next, repository: connectionRepo, waitForCurrent: true, supersedeQueued: true);
+      }
     }
+    if (revision != _activeProfileChangeRevision) return;
     await _syncNativeResumeConfigWhenIdle(repository: connectionRepo, activeProfileFuture: Future.value(next));
   }
 
@@ -375,44 +695,65 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
       loggy.info("active profile changed, reconnecting");
       await _singleStart.run(
         () async {
-          final platformStatus = await connectionRepo.readPlatformServiceStatus();
-          if (shouldDeferFlutterReconnect(
-            isAndroid: Platform.isAndroid,
-            nativeRecoveryInProgress: connectionRepo.nativePlatformRecoveryInProgress,
-            platformStatus: platformStatus,
-          )) {
-            loggy.info("deferring Flutter reconnect until Android native recovery completes");
-            _scheduleReconnectAfterNativeRecovery();
-            return;
+          // Unlike a fresh Connect, a profile restart can be rejected before
+          // Flutter receives a restart lease. Retain this exact seal for the
+          // authoritative platform status before awaiting the drain: a native
+          // Stop may publish Disconnected during either await, and that event
+          // must release this epoch rather than an older transition's epoch.
+          final egressSeal = _sealAndroidOrdinaryNetworking('profile reconnect');
+          final egressEpoch = Platform.isAndroid ? _androidEgressEpoch : null;
+          if (Platform.isAndroid) {
+            _androidPlatformTransitionEgressEpoch = egressEpoch;
           }
+          await egressSeal;
           final restartLease = await connectionRepo.tryBeginFlutterRestart();
           if (restartLease == null) {
-            loggy.info("Android native lifecycle is busy; deferring Flutter reconnect");
-            _scheduleReconnectAfterNativeRecovery();
+            loggy.info("Android native lifecycle rejected or terminally cancelled the Flutter restart");
+            await _synchronizeAndroidTerminalUserIntent(repository: connectionRepo);
+            if (Platform.isAndroid &&
+                state.valueOrNull is Disconnected &&
+                _androidPlatformTransitionEgressEpoch == egressEpoch) {
+              _androidPlatformTransitionEgressEpoch = null;
+              await _tryReleaseAndroidOrdinaryNetworkingAfterTerminalDisconnect(expectedEpoch: egressEpoch);
+            }
             return;
           }
           _manualDisconnectRequested = false;
           _showIdleDuringAbort = false;
           _cancelAutoReconnect();
-          _nativeRecoveryReconnectTimer?.cancel();
-          _nativeRecoveryReconnectTimer = null;
+          var releaseAfterRestartLease = false;
           try {
-            await startedByUserNotifier.update(true);
+            if (!await connectionRepo.validateFlutterRestart(restartLease)) {
+              loggy.info("Flutter restart lease was invalidated by terminal native Stop");
+              await _synchronizeAndroidTerminalUserIntent(repository: connectionRepo);
+              releaseAfterRestartLease = state.valueOrNull is Disconnected;
+              return;
+            }
             final result = await connectionRepo.reconnect(profile, disableMemoryLimit).run();
             await result.match((err) async {
               loggy.warning("error reconnecting", err);
               await startedByUserNotifier.update(false);
               final cleanup = await connectionRepo.disconnect().run();
               cleanup.match(
-                (cleanupError) => loggy.warning("error cleaning up failed reconnect", cleanupError),
-                (_) {},
+                (cleanupError) {
+                  loggy.warning("error cleaning up failed reconnect", cleanupError);
+                },
+                (_) {
+                  releaseAfterRestartLease = true;
+                },
               );
               state = AsyncError(err, StackTrace.current);
               final translations = await translationsFuture;
               await dialogNotifier.showCustomAlertFromErr(err.present(translations));
-            }, (_) => Future<void>.value());
+            }, (_) => _admitAndroidOrdinaryNetworking(egressEpoch));
           } finally {
             await connectionRepo.endFlutterRestart(restartLease);
+            if (releaseAfterRestartLease && Platform.isAndroid) {
+              if (_androidPlatformTransitionEgressEpoch == egressEpoch) {
+                _androidPlatformTransitionEgressEpoch = null;
+              }
+              await _tryReleaseAndroidOrdinaryNetworkingAfterTerminalDisconnect(expectedEpoch: egressEpoch);
+            }
           }
         },
         onIgnored: () {
@@ -425,32 +766,21 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
     }
   }
 
-  void _scheduleReconnectAfterNativeRecovery() {
-    if (!Platform.isAndroid || _nativeRecoveryReconnectTimer?.isActive == true) return;
-    _nativeRecoveryReconnectTimer = Timer(const Duration(seconds: 1), () async {
-      _nativeRecoveryReconnectTimer = null;
-      final startedByUser = ref.read(Preferences.startedByUser);
-      final connectionRepo = _connectionRepo;
-      final activeProfileFuture = ref.read(activeProfileProvider.future);
-      if (_manualDisconnectRequested || !startedByUser) return;
-
-      final platformStatus = await connectionRepo.readPlatformServiceStatus();
-      final visibleStatus = state.valueOrNull;
-      if (shouldDeferFlutterReconnect(
-            isAndroid: true,
-            nativeRecoveryInProgress: connectionRepo.nativePlatformRecoveryInProgress,
-            platformStatus: platformStatus,
-          ) ||
-          visibleStatus is Connecting ||
-          visibleStatus is Disconnecting ||
-          visibleStatus is Disconnected) {
-        _scheduleReconnectAfterNativeRecovery();
-        return;
-      }
-
-      final activeProfile = await activeProfileFuture;
-      await reconnect(activeProfile, repository: connectionRepo);
-    });
+  Future<void> _synchronizeAndroidTerminalUserIntent({ConnectionRepository? repository}) async {
+    if (!Platform.isAndroid) return;
+    final terminalEgressEpoch = _androidEgressEpoch;
+    final nativeIntent = await (repository ?? _connectionRepo).readPlatformStartedByUser();
+    if (terminalEgressEpoch != _androidEgressEpoch ||
+        state.valueOrNull is! Disconnected ||
+        _manualConnectPending ||
+        _nativeConnectRequestPending) {
+      loggy.info('discarding terminal native-intent sync superseded by a newer Android lifecycle epoch');
+      return;
+    }
+    if (nativeIntent == false && ref.read(Preferences.startedByUser)) {
+      await ref.read(Preferences.startedByUser.notifier).update(false);
+      loggy.info("synchronized terminal native Stop into the Flutter preference cache");
+    }
   }
 
   Future<void> abortConnection() async {
@@ -487,7 +817,14 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
     );
   }
 
-  Future<bool> _connect({bool silent = false}) {
+  Future<bool> _connect({
+    bool silent = false,
+    bool queueAfterCurrentOperation = false,
+    bool nativeServiceConfirmedInactive = false,
+    int? connectIntentGeneration,
+    Future<int?> Function()? onConnectTransitionSealed,
+  }) async {
+    final attemptIntentGeneration = connectIntentGeneration ?? ++_connectIntentGeneration;
     final connectionRepo = _connectionRepo;
     final activeProfileFuture = ref.read(activeProfileProvider.future);
     final startedByUserNotifier = ref.read(Preferences.startedByUser.notifier);
@@ -496,8 +833,18 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
     final dialogNotifier = ref.read(dialogNotifierProvider.notifier);
     final translationsFuture = ref.read(translationsProvider.future);
     int? requestToken;
-    return _singleStart.run(
+    ConnectionFailure? failureForPresentation;
+    final lifecycleCompleted = await _singleStart.run(
       () async {
+        if (queueAfterCurrentOperation &&
+            !nativeServiceConfirmedInactive &&
+            state.valueOrNull is! Disconnected &&
+            state is! AsyncError<ConnectionStatus>) {
+          // The operation that was active when the native gesture arrived may
+          // already have satisfied it or may still be publishing terminal
+          // status. Let the status listener decide without starting in parallel.
+          return;
+        }
         if (!silent) {
           requestToken = ++_abortToken;
           _showIdleDuringAbort = false;
@@ -508,23 +855,34 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
         }
 
         try {
-          await startedByUserNotifier.update(true);
           final attempted = await _connectThrottled(
             connectionRepo: connectionRepo,
             activeProfileFuture: activeProfileFuture,
             startedByUserNotifier: startedByUserNotifier,
             disableMemoryLimit: disableMemoryLimit,
             analyticsController: analyticsController,
-            dialogNotifier: dialogNotifier,
-            translationsFuture: translationsFuture,
             silent: silent,
             requestToken: requestToken,
+            connectIntentGeneration: attemptIntentGeneration,
+            onConnectTransitionSealed: onConnectTransitionSealed,
+            onUserVisibleFailure: (failure) {
+              failureForPresentation = failure;
+            },
           );
-          if (!attempted && requestToken == _abortToken) {
+          if (!attempted &&
+              requestToken == _abortToken &&
+              isCurrentConnectIntent(
+                attemptGeneration: attemptIntentGeneration,
+                currentGeneration: _connectIntentGeneration,
+              )) {
             state = const AsyncData(Disconnected());
           }
         } finally {
-          if (requestToken == _abortToken) {
+          if (requestToken == _abortToken &&
+              isCurrentConnectIntent(
+                attemptGeneration: attemptIntentGeneration,
+                currentGeneration: _connectIntentGeneration,
+              )) {
             _manualConnectPending = false;
             if (state.valueOrNull is Connecting && !connectionRepo.isCoreStartedSnapshot) {
               loggy.warning("connect operation ended without a running core; publishing terminal disconnected state");
@@ -536,7 +894,28 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
       onIgnored: () {
         loggy.debug("connect called while another connect/disconnect is still running, ignoring");
       },
+      waitForCurrent: queueAfterCurrentOperation,
+      supersedeQueued: queueAfterCurrentOperation,
+      onSuperseded: () {
+        loggy.debug('superseded queued native connect handoff');
+      },
     );
+    final terminalFailure = failureForPresentation;
+    if (terminalFailure != null) {
+      // Error presentation belongs to the UI, not to the process-wide VPN
+      // lifecycle transaction. In particular, a Quick Settings request can
+      // fail while MainActivity is backgrounded: its DialogRoute may remain
+      // open until the user returns, but it must never retain _singleStart or
+      // the exact native handoff attempt that serializes a newer Connect.
+      unawaited(
+        _presentConnectionFailure(
+          terminalFailure,
+          dialogNotifier: dialogNotifier,
+          translationsFuture: translationsFuture,
+        ),
+      );
+    }
+    return lifecycleCompleted;
   }
 
   Future<bool> _connectThrottled({
@@ -545,77 +924,417 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
     required PreferencesNotifier<bool, bool> startedByUserNotifier,
     required bool disableMemoryLimit,
     required AnalyticsController analyticsController,
-    required DialogNotifier dialogNotifier,
-    required Future<Translations> translationsFuture,
     bool silent = false,
     int? requestToken,
+    required int connectIntentGeneration,
+    Future<int?> Function()? onConnectTransitionSealed,
+    required void Function(ConnectionFailure) onUserVisibleFailure,
   }) async {
-    final activeProfile = await activeProfileFuture;
-    if (activeProfile == null) {
-      loggy.info("no active profile, not connecting");
-      await startedByUserNotifier.update(false);
+    bool intentIsCurrent() =>
+        isCurrentConnectIntent(attemptGeneration: connectIntentGeneration, currentGeneration: _connectIntentGeneration);
+    final egressSeal = _sealAndroidOrdinaryNetworking('manual or automatic Connect');
+    // _sealAndroidOrdinaryNetworking closes the process-local gate before its
+    // first await. Only now may native transfer its durable handoff request.
+    final handoffAcceptance = onConnectTransitionSealed?.call();
+    // Every Android Flutter Connect, including a normal UI gesture, captures
+    // native Stop ownership immediately after the synchronous Dart seal. The
+    // profile/config awaits below may not manufacture a fresh session after a
+    // later terminal Stop.
+    final startLeaseFuture = Platform.isAndroid
+        ? handoffAcceptance ?? connectionRepo.claimVpnStartLease()
+        : Future<int?>.value();
+    Future<void> cancelStartLease(int token) =>
+        handoffAcceptance != null ? _cancelNativeConnectClaim(token) : connectionRepo.cancelVpnStartLease(token);
+    int? egressEpoch;
+    int? explicitStartLease;
+    try {
+      egressEpoch = await egressSeal;
+      explicitStartLease = await startLeaseFuture;
+    } catch (_) {
+      try {
+        final unusedLease = await startLeaseFuture;
+        if (unusedLease != null) await cancelStartLease(unusedLease);
+      } catch (error, stackTrace) {
+        loggy.warning('failed to retire unused native Connect lease', error, stackTrace);
+      }
+      rethrow;
+    }
+    if (Platform.isAndroid && explicitStartLease == null) {
+      loggy.info('native Connect lease was cancelled or could not be acquired; start remains rejected');
+      if (state.valueOrNull is Disconnected || state is AsyncError<ConnectionStatus>) {
+        // The native gate independently requires completed VPN/TUN cleanup for
+        // this exact probe-block epoch. A concurrent Stop therefore leaves the
+        // gate sealed until its authoritative release path completes.
+        await _releaseAndroidOrdinaryNetworkingAfterTerminalDisconnect(expectedEpoch: egressEpoch);
+      }
       return false;
     }
-    final result = await connectionRepo.connect(activeProfile, disableMemoryLimit).run();
-    await result.match((ConnectionFailure err) async {
-      if (requestToken != null && requestToken != _abortToken) {
-        loggy.info("ignoring connection failure from a superseded manual connect", err);
-        return;
+    var nativeClaimNeedsCancellation = explicitStartLease != null;
+    try {
+      final activeProfile = await activeProfileFuture;
+      if (!intentIsCurrent()) {
+        loggy.info('retiring a Connect superseded by a newer exact user intent before native VPN admission');
+        return false;
       }
-      if (_manualDisconnectRequested || _showIdleDuringAbort) {
-        loggy.info("ignoring connection failure after manual abort", err);
-        state = AsyncData(
-          visibleStatusDuringManualButtonDisconnect(
-            const Disconnected(),
-            disconnectInProgress: _manualButtonDisconnectInProgress,
-          ),
-        );
-        return;
+      if (_manualDisconnectRequested || _showIdleDuringAbort || (requestToken != null && requestToken != _abortToken)) {
+        // A terminal Stop may win while this Connect is waiting for its
+        // profile. Do not let the stale request consume its lease, clear the
+        // native Stop tombstone, or dispatch VpnService. The finally block
+        // retires the exact still-unconsumed lease; the Stop path owns the
+        // fail-closed egress seal and its eventual release.
+        loggy.info('retiring a superseded Connect before native VPN admission');
+        return false;
       }
-      loggy.warning("error connecting", err);
-      if (err.toString().contains("panic")) {
-        await analyticsController.recordNonFatal(
-          StateError('native core panic reported during connect'),
-          StackTrace.current,
-          reason: 'native_core_panic_connect',
-        );
+      if (activeProfile == null) {
+        loggy.info("no active profile, not connecting");
+        await startedByUserNotifier.update(false);
+        // No platform start was admitted. Retire the exact native lease before
+        // asking the terminal-release gate to prove that no newer Connect or
+        // still-live VPN/TUN owner exists.
+        final leaseToCancel = explicitStartLease;
+        if (leaseToCancel != null) {
+          await cancelStartLease(leaseToCancel);
+          nativeClaimNeedsCancellation = false;
+        }
+        if (Platform.isAndroid) {
+          final cleanup = await connectionRepo.disconnect().run();
+          await cleanup.match((cleanupError) {
+            loggy.warning('failed to prove terminal platform release after empty-profile Connect', cleanupError);
+            return Future<void>.value();
+          }, (_) => _releaseAndroidOrdinaryNetworkingAfterTerminalDisconnect(expectedEpoch: egressEpoch));
+        }
+        return false;
       }
-      // Repository startup failures are reported only after the core and TUN
-      // stop/close path completes. Publish a terminal value before opening the
-      // dialog so a dismissed or failed dialog can never retain Connecting.
-      await startedByUserNotifier.update(false);
-      if (silent) {
-        loggy.warning("auto reconnect attempt failed", err);
-        _lastSilentAutoReconnectFailure = err;
-        state = AsyncData(_visibleStatusDuringAutoReconnect(Disconnected(err)));
-        return;
+      final result = await connectionRepo
+          .beginVpnStartAdmission(explicitStartLease: explicitStartLease, nativeHandoffClaim: handoffAcceptance != null)
+          .map((value) {
+            // A successful native admission consumes the exact lease before
+            // replying. Every earlier exceptional/null-profile exit retains
+            // cancellation ownership in this method's finally block.
+            nativeClaimNeedsCancellation = false;
+            return value;
+          })
+          .flatMap(
+            (admissionEpoch) => TaskEither.tryCatch(() async {
+              final superseded =
+                  _manualDisconnectRequested ||
+                  _showIdleDuringAbort ||
+                  (requestToken != null && requestToken != _abortToken);
+              if (!intentIsCurrent()) {
+                throw StateError('VPN start admission was superseded by a newer exact Connect intent');
+              }
+              if (superseded) {
+                await startedByUserNotifier.update(false);
+                await connectionRepo.disconnect().run();
+                throw StateError('VPN start admission was superseded by disconnect');
+              }
+              // Native persistence and every ordinary Marten socket are now
+              // behind the physical full-route blocker. Only this admitted
+              // point may publish the Flutter-side user-session intent.
+              await startedByUserNotifier.update(true);
+              if (!intentIsCurrent()) {
+                throw StateError('VPN start was superseded while publishing a newer exact Connect intent');
+              }
+              if (_manualDisconnectRequested ||
+                  _showIdleDuringAbort ||
+                  (requestToken != null && requestToken != _abortToken)) {
+                await startedByUserNotifier.update(false);
+                await connectionRepo.disconnect().run();
+                throw StateError('VPN start was superseded while publishing admitted intent');
+              }
+              return admissionEpoch;
+            }, (err, stackTrace) => ConnectionFailure.unexpected(err, stackTrace)),
+          )
+          .flatMap(
+            (admissionEpoch) =>
+                connectionRepo.connect(activeProfile, disableMemoryLimit, androidVpnStartEpoch: admissionEpoch),
+          )
+          .run();
+      await result.match(
+        (ConnectionFailure err) async {
+          if (!intentIsCurrent()) {
+            // The authoritative Stop already owns the previous core/TUN cleanup.
+            // Issuing another terminal disconnect here would cancel the retained
+            // newer native handoff, which is exactly the rapid QS race.
+            loggy.info('discarding rejected Connect cleanup superseded by a newer exact user intent');
+            return;
+          }
+          if (requestToken != null && requestToken != _abortToken) {
+            loggy.info("ignoring connection failure from a superseded manual connect", err);
+            return;
+          }
+          if (_manualDisconnectRequested || _showIdleDuringAbort) {
+            loggy.info("ignoring connection failure after manual abort", err);
+            state = AsyncData(
+              visibleStatusDuringManualButtonDisconnect(
+                const Disconnected(),
+                disconnectInProgress: _manualButtonDisconnectInProgress,
+              ),
+            );
+            return;
+          }
+          final cleanup = await connectionRepo.disconnect().run();
+          await cleanup.match(
+            (cleanupError) {
+              loggy.warning('failed to complete platform cleanup after rejected Connect', cleanupError);
+              return Future<void>.value();
+            },
+            (_) async {
+              loggy.info('platform cleanup completed after rejected Connect');
+              await _releaseAndroidOrdinaryNetworkingAfterTerminalDisconnect(expectedEpoch: egressEpoch);
+            },
+          );
+          loggy.warning("error connecting", err);
+          if (err.toString().contains("panic")) {
+            await analyticsController.recordNonFatal(
+              StateError('native core panic reported during connect'),
+              StackTrace.current,
+              reason: 'native_core_panic_connect',
+            );
+          }
+          // Repository startup failures are reported only after the core and TUN
+          // stop/close path completes. Publish a terminal value before opening the
+          // dialog so a dismissed or failed dialog can never retain Connecting.
+          await startedByUserNotifier.update(false);
+          if (silent) {
+            loggy.warning("auto reconnect attempt failed", err);
+            _lastSilentAutoReconnectFailure = err;
+            state = AsyncData(_visibleStatusDuringAutoReconnect(Disconnected(err)));
+            return;
+          }
+          state = AsyncData(Disconnected(err));
+          // Presentation is captured only after platform cleanup and terminal
+          // state publication. The caller schedules it after _singleStart has
+          // released the exact lifecycle owner.
+          onUserVisibleFailure(err);
+          loggy.warning(err);
+        },
+        (_) {
+          if (!intentIsCurrent()) {
+            loggy.info('discarding successful Connect completion superseded by a newer exact user intent');
+            return Future<void>.value();
+          }
+          return _admitAndroidOrdinaryNetworking(egressEpoch);
+        },
+      );
+      return true;
+    } finally {
+      if (nativeClaimNeedsCancellation && explicitStartLease != null) {
+        await cancelStartLease(explicitStartLease);
       }
-      state = AsyncData(Disconnected(err));
-      // Go errors are string-backed; present their normalized failure only
-      // after the platform cleanup and terminal state publication above.
+    }
+  }
+
+  Future<void> _presentConnectionFailure(
+    ConnectionFailure failure, {
+    required DialogNotifier dialogNotifier,
+    required Future<Translations> translationsFuture,
+  }) async {
+    try {
       final translations = await translationsFuture;
-      await dialogNotifier.showCustomAlertFromErr(err.present(translations));
-      loggy.warning(err);
-    }, (_) => Future<void>.value());
-    return true;
+      await dialogNotifier.showCustomAlertFromErr(failure.present(translations));
+    } catch (error, stackTrace) {
+      // A failed or dismissed presentation can lose only the UI message. The
+      // terminal VPN/core/TUN state and any newer native handoff are already
+      // independent of this future.
+      loggy.warning('failed to present terminal connection error', error, stackTrace);
+    }
   }
 
   Future<bool> _disconnect({bool showError = true, ConnectionRepository? repository}) async {
+    final egressEpoch = await _sealAndroidOrdinaryNetworking('Disconnect');
+    var egressReleased = !Platform.isAndroid;
     final connectionRepo = repository ?? _connectionRepo;
     final dialogNotifier = ref.read(dialogNotifierProvider.notifier);
     final translationsFuture = ref.read(translationsProvider.future);
     final result = await connectionRepo.disconnect().run();
-    result.match((err) {
-      loggy.warning("error disconnecting", err);
-      if (!showError) return;
-      state = AsyncError(err, StackTrace.current);
-      unawaited(
-        translationsFuture.then((translations) {
-          return dialogNotifier.showCustomAlertFromErr(err.present(translations));
-        }),
+    await result.match(
+      (err) {
+        loggy.warning("error disconnecting", err);
+        if (!showError) return Future<void>.value();
+        state = AsyncError(err, StackTrace.current);
+        unawaited(
+          translationsFuture.then((translations) {
+            return dialogNotifier.showCustomAlertFromErr(err.present(translations));
+          }),
+        );
+        return Future<void>.value();
+      },
+      (_) async {
+        egressReleased = await _tryReleaseAndroidOrdinaryNetworkingAfterTerminalDisconnect(expectedEpoch: egressEpoch);
+      },
+    );
+    return result.isRight() && egressReleased;
+  }
+
+  Future<int?> _sealAndroidOrdinaryNetworking(String reason) async {
+    if (!Platform.isAndroid) return null;
+    // Async functions run synchronously until their first await. Seal the
+    // process-local gate before even starting the SharedPreferences write so
+    // an already-scheduled Dio/Firebase callback cannot open a physical socket
+    // during that platform-channel/disk gap.
+    final sealOperation = strictVpnEgressGate.sealForVpnTransition();
+    final epoch = ++_androidEgressEpoch;
+    await _serializeAndroidEgressPreference(() async {
+      await ref.read(Preferences.strictVpnRouteVerified.notifier).update(false);
+    });
+    await sealOperation;
+    loggy.info('ordinary Marten networking quiesced for strict VPN transition: $reason epoch=$epoch');
+    return epoch;
+  }
+
+  Future<void> _ensureAndroidOrdinaryNetworkingSealed(String reason) async {
+    if (!Platform.isAndroid || strictVpnEgressGate.isSealed) return;
+    final sealOperation = _sealAndroidOrdinaryNetworking(reason);
+    // _sealAndroidOrdinaryNetworking advances the epoch synchronously before
+    // its first await. Retain that exact platform-owned epoch so a native-only
+    // Stop can reopen direct networking after authoritative Disconnected.
+    _androidPlatformTransitionEgressEpoch = _androidEgressEpoch;
+    await sealOperation;
+  }
+
+  void _adoptBootstrapAndroidEgressSeal() {
+    if (!Platform.isAndroid || !strictVpnEgressGate.isSealed || _androidPlatformTransitionEgressEpoch != null) {
+      return;
+    }
+    // lazyBootstrap can seal the process before this notifier exists. Adopt
+    // that already-drained transition into the notifier's current epoch so an
+    // early resume failure can release it on authoritative Disconnected. Any
+    // newer Connect advances _androidEgressEpoch and makes that release stale.
+    _androidPlatformTransitionEgressEpoch = _androidEgressEpoch;
+    loggy.info('adopted bootstrap strict-egress seal epoch=$_androidEgressEpoch');
+  }
+
+  Future<void> _releaseAndroidOrdinaryNetworkingAfterTerminalDisconnect({int? expectedEpoch}) async {
+    await _tryReleaseAndroidOrdinaryNetworkingAfterTerminalDisconnect(expectedEpoch: expectedEpoch);
+  }
+
+  Future<bool> _tryReleaseAndroidOrdinaryNetworkingAfterTerminalDisconnect({int? expectedEpoch}) async {
+    if (!Platform.isAndroid) return true;
+    if (expectedEpoch != null && expectedEpoch != _androidEgressEpoch) {
+      loggy.info(
+        'discarding stale terminal ordinary-network release epoch=$expectedEpoch current=$_androidEgressEpoch',
       );
-    }, (_) {});
-    return result.isRight();
+      return false;
+    }
+    // Invalidate every in-flight admit before reopening direct networking for
+    // an authoritative user-visible terminal Disconnect.
+    _androidEgressEpoch += 1;
+    final releaseEpoch = _androidEgressEpoch;
+    final released = await strictVpnEgressGate.releaseAfterTerminalDisconnect();
+    if (!released) {
+      loggy.info('terminal ordinary-network release was rejected by native gate epoch=$releaseEpoch');
+      return false;
+    }
+    if (releaseEpoch != _androidEgressEpoch) {
+      loggy.info('terminal ordinary-network release was superseded epoch=$releaseEpoch current=$_androidEgressEpoch');
+      return false;
+    }
+    loggy.info('ordinary Marten networking released after authoritative terminal Disconnect');
+    return true;
+  }
+
+  bool _ownsCurrentAndroidEgressEpoch(int? epoch) {
+    // On Android, Connected is emitted only from BoxService's Started state.
+    // BoxService publishes Started after the current VPN generation has a real
+    // TUN and verified default routes, and the native gate below revalidates
+    // that proof. The separate runtime-core snapshot can briefly lag behind
+    // the authoritative platform state after an underlying-network recovery;
+    // requiring it here would leave ordinary networking sealed indefinitely.
+    return epoch != null &&
+        epoch == _androidEgressEpoch &&
+        state.valueOrNull is Connected &&
+        !_manualDisconnectRequested &&
+        !_showIdleDuringAbort;
+  }
+
+  Future<void> _admitAndroidOrdinaryNetworking(int? epoch) async {
+    if (!Platform.isAndroid) return;
+    if (!_ownsCurrentAndroidEgressEpoch(epoch)) {
+      loggy.info('discarding stale ordinary-network admission epoch=$epoch current=$_androidEgressEpoch');
+      return;
+    }
+    final turncoatLiveness = ref.read(turncoatLivenessNotifierProvider.notifier);
+    final turncoatLivenessGeneration = turncoatLiveness.generation;
+    // On Android this Connected state is published only after the native
+    // service proves HTTP and DNS through the current VPN Network/TUN. Settle
+    // the exact liveness generation before any async persistence so a warm
+    // carrier restart cannot be stopped by its 75-second startup timer.
+    turncoatLiveness.acceptVerifiedRouteProof(expectedGeneration: turncoatLivenessGeneration);
+    final gateAdmitted = await strictVpnEgressGate.admitVerifiedVpnRoute();
+    if (!gateAdmitted) {
+      loggy.info('ordinary-network admission superseded at native gate epoch=$epoch');
+      return;
+    }
+    var persistedForCurrentOwner = false;
+    await _serializeAndroidEgressPreference(() async {
+      if (!_ownsCurrentAndroidEgressEpoch(epoch) || strictVpnEgressGate.isSealed) {
+        await ref.read(Preferences.strictVpnRouteVerified.notifier).update(false);
+        return;
+      }
+      await ref.read(Preferences.strictVpnRouteVerified.notifier).update(true);
+      if (!_ownsCurrentAndroidEgressEpoch(epoch) || strictVpnEgressGate.isSealed) {
+        // Stop may synchronously advance the epoch while the async preference
+        // write is in flight. Restore the fail-closed value before releasing
+        // this serialized persistence slot to a newer generation.
+        await ref.read(Preferences.strictVpnRouteVerified.notifier).update(false);
+        return;
+      }
+      persistedForCurrentOwner = true;
+    });
+    if (!persistedForCurrentOwner) {
+      loggy.info('ordinary-network admission superseded after persistence epoch=$epoch');
+      return;
+    }
+    if (_androidPlatformTransitionEgressEpoch == epoch) {
+      _androidPlatformTransitionEgressEpoch = null;
+    }
+    loggy.info('ordinary Marten networking admitted through verified Android VPN route epoch=$epoch');
+
+    final activeStart = _androidNetworkServicesStart;
+    if (activeStart != null) return activeStart;
+    final start = _startAndroidNetworkServicesAfterVerifiedRoute();
+    _androidNetworkServicesStart = start;
+    try {
+      await start;
+    } finally {
+      if (identical(_androidNetworkServicesStart, start)) _androidNetworkServicesStart = null;
+    }
+  }
+
+  Future<void> _serializeAndroidEgressPreference(Future<void> Function() operation) {
+    final run = _androidEgressPreferenceOperation.then((_) => operation());
+    _androidEgressPreferenceOperation = run.then<void>((_) {}, onError: (_, _) {});
+    return run;
+  }
+
+  Future<void> _startAndroidNetworkServicesAfterVerifiedRoute() async {
+    // Manifest auto-init is disabled. These SDKs are deliberately constructed
+    // only after the process has been bound to a route-verified VPN Network.
+    try {
+      final crashReportingEnabled = await ref.read(analyticsControllerProvider.future);
+      if (crashReportingEnabled) {
+        await ref.read(analyticsControllerProvider.notifier).ensureInitialized(refreshNativeReports: true);
+      }
+    } catch (error, stackTrace) {
+      loggy.warning('VPN-admitted crash reporting initialization failed', error, stackTrace);
+    }
+
+    try {
+      registerSubscriptionPushBackgroundHandler();
+      await ref.read(subscriptionPushRefreshServiceProvider).initialize(debug: ref.read(debugModeNotifierProvider));
+    } catch (error, stackTrace) {
+      loggy.warning('VPN-admitted subscription push initialization failed', error, stackTrace);
+    }
+
+    try {
+      if (!_androidBackgroundRefreshRegistered) {
+        await initializeProfilesBackgroundRefresh(debug: ref.read(debugModeNotifierProvider));
+        _androidBackgroundRefreshRegistered = true;
+      }
+    } catch (error, stackTrace) {
+      loggy.warning('VPN-admitted background refresh initialization failed', error, stackTrace);
+    }
   }
 
   void _abortConnectionImmediately() {
@@ -632,11 +1351,29 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
   }
 
   Future<void> _disconnectAfterAbort(int token) async {
-    final disconnectSucceeded = await _disconnect(showError: false).onError((error, stackTrace) {
+    var disconnectSucceeded = await _disconnect(showError: false).onError((error, stackTrace) {
       loggy.error("aborted connection cleanup threw; keeping reconnect unavailable", error, stackTrace);
       return false;
     });
+    // SingleCall.cancel invalidates queued starts but cannot interrupt a start
+    // that is already inside the native call. The platform disconnect above
+    // makes that call unwind; wait for its finally block to release the exact
+    // explicit-start lease before asking native admission to reopen egress.
+    await _singleStart.waitForCurrent();
     if (_abortToken != token) return;
+    if (!disconnectSucceeded) {
+      disconnectSucceeded =
+          await _tryReleaseAndroidOrdinaryNetworkingAfterTerminalDisconnect(expectedEpoch: _androidEgressEpoch).onError(
+            (error, stackTrace) {
+              loggy.error(
+                "aborted connection egress release retry threw; keeping reconnect unavailable",
+                error,
+                stackTrace,
+              );
+              return false;
+            },
+          );
+    }
     if (!disconnectSucceeded) {
       loggy.warning("aborted connection cleanup did not complete; keeping reconnect unavailable");
       return;
@@ -705,9 +1442,11 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
 
   void _handleStartupRouteVerification(ConnectionStatus? nextStatus) {
     if (nextStatus is! Connecting) {
+      _awaitingAndroidAuthoritativeRecoveryStatus = false;
       _cancelExistingStartedRouteVerificationRetry();
       return;
     }
+    if (_awaitingAndroidAuthoritativeRecoveryStatus) return;
     if (_existingStartedRouteVerificationRetryTimer?.isActive == true) return;
     if (!shouldVerifyRouteAfterResume(
       nextStatus,
@@ -751,7 +1490,37 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
         ref.read(captchaNotifierProvider.notifier).arm(enabled: true);
         loggy.info("armed captcha watcher for owned existing Android session");
       }
+      if (Platform.isIOS) {
+        final abortToken = _abortToken;
+        final intentGeneration = _connectIntentGeneration;
+        ProfileEntity? profile;
+        try {
+          profile = await ref.read(activeProfileProvider.future).timeout(const Duration(seconds: 8));
+        } catch (_) {
+          loggy.warning('retained iOS profile did not become available within its bounded wait');
+        }
+        final profileRevision = _activeProfileChangeRevision;
+        bool retainedSessionIsCurrent() =>
+            abortToken == _abortToken &&
+            intentGeneration == _connectIntentGeneration &&
+            profileRevision == _activeProfileChangeRevision &&
+            !_manualDisconnectRequested &&
+            ref.read(Preferences.startedByUser);
+        if (!retainedSessionIsCurrent()) return;
+        final restored =
+            profile != null &&
+            await _connectionRepo.restoreActiveRuntimeFeatures(profile, isCurrent: retainedSessionIsCurrent);
+        if (!retainedSessionIsCurrent()) return;
+        if (!restored) {
+          loggy.warning('retained iOS runtime no longer matches the selected profile');
+          await _disconnect(showError: false);
+          state = const AsyncData(Disconnected());
+          return;
+        }
+      }
       loggy.info("verifying existing started route before showing connected");
+      final retainedLiveness = Platform.isIOS ? ref.read(turncoatLivenessNotifierProvider.notifier) : null;
+      final retainedLivenessGeneration = retainedLiveness?.generation;
       final result = await _connectionRepo.verifyConnectedRoute(holdStartupRouteReady: true).run();
       await result.match(
         (err) async {
@@ -759,8 +1528,10 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
           if (!_manualDisconnectRequested && ref.read(Preferences.startedByUser)) {
             if (!_flutterOwnsAutomaticRecovery) {
               _existingStartedRouteVerificationFailures = 0;
-              loggy.info("delegating automatic route recovery to the Android service");
-              _scheduleExistingStartedRouteVerificationRetry(delay: _androidNativeRecoveryRouteVerificationRetryDelay);
+              _existingStartedRouteVerificationRetryTimer?.cancel();
+              _existingStartedRouteVerificationRetryTimer = null;
+              _awaitingAndroidAuthoritativeRecoveryStatus = true;
+              loggy.info("delegating automatic route recovery to Android and awaiting authoritative status");
               return;
             }
             final liveness = ref.read(turncoatLivenessNotifierProvider);
@@ -784,6 +1555,13 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
           }
         },
         (_) {
+          if (retainedLiveness != null &&
+              retainedLivenessGeneration != null &&
+              !_manualDisconnectRequested &&
+              ref.read(Preferences.startedByUser)) {
+            retainedLiveness.acceptVerifiedRouteProof(expectedGeneration: retainedLivenessGeneration);
+          }
+          _awaitingAndroidAuthoritativeRecoveryStatus = false;
           _existingStartedRouteVerificationFailures = 0;
           _cancelExistingStartedRouteVerificationRetry();
           loggy.info("existing started route verified");
@@ -814,6 +1592,7 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
     _existingStartedRouteVerificationRetryTimer?.cancel();
     _existingStartedRouteVerificationRetryTimer = null;
     _existingStartedRouteVerificationFailures = 0;
+    _awaitingAndroidAuthoritativeRecoveryStatus = false;
   }
 
   void _startRouteWatchdog() {
@@ -824,12 +1603,19 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
   }
 
   Duration _routeWatchdogInitialDelayForCurrentRoute() {
+    if (Platform.isIOS) return _iosStableRouteWatchdogIntervalForCurrentLifecycle();
     return _isTurncoatRouteInUse ? _turncoatRouteWatchdogInitialDelay : _routeWatchdogInitialDelay;
   }
 
   Duration _routeWatchdogIntervalForCurrentRoute({bool? turncoatInUse}) {
+    if (Platform.isIOS) return _iosStableRouteWatchdogIntervalForCurrentLifecycle();
     return (turncoatInUse ?? _isTurncoatRouteInUse) ? _turncoatRouteWatchdogInterval : _routeWatchdogInterval;
   }
+
+  Duration _iosStableRouteWatchdogIntervalForCurrentLifecycle() =>
+      WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed
+      ? _iosStableRouteWatchdogInterval
+      : _iosStableBackgroundRouteWatchdogInterval;
 
   Duration _routeWatchdogRetryDelayForCurrentRoute({bool? turncoatInUse}) {
     return (turncoatInUse ?? _isTurncoatRouteInUse) ? _turncoatRouteWatchdogRetryDelay : _routeWatchdogRetryDelay;
@@ -840,6 +1626,7 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
   }
 
   int _routeWatchdogMaxFailuresForCurrentRoute({bool? turncoatInUse}) {
+    if (Platform.isIOS && (turncoatInUse ?? _isTurncoatRouteInUse)) return 2;
     return (turncoatInUse ?? _isTurncoatRouteInUse) ? _turncoatRouteWatchdogMaxFailures : _routeWatchdogMaxFailures;
   }
 
@@ -900,7 +1687,7 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
             maxFailures: maxFailures,
           );
           loggy.warning(
-            turncoatInUse
+            turncoatInUse && !Platform.isIOS
                 ? "route watchdog failed ($_routeWatchdogFailures/$maxFailures, preserving TURNcoat route)"
                 : "route watchdog failed ($_routeWatchdogFailures/$maxFailures)",
             err,
@@ -909,6 +1696,7 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
             _routeWatchdogFailures,
             maxFailures: maxFailures,
             preserveLongLivedRoute: turncoatInUse,
+            isIOS: Platform.isIOS,
           )) {
             final reconnectStarted = await _reconnectAfterRouteWatchdogFailure(err);
             keepChecking = !reconnectStarted;
@@ -997,6 +1785,7 @@ class ConnectionNotifier extends _$ConnectionNotifier with AppLogger {
 
   void _markManualDisconnect() {
     _manualDisconnectRequested = true;
+    _cancelPendingNativeConnectRequestForTerminalStop();
     _cancelExistingStartedRouteVerificationRetry();
     _cancelAutoReconnect();
   }
@@ -1148,7 +1937,8 @@ bool shouldReconnectAfterRouteWatchdogFailures(
   int failures, {
   int maxFailures = ConnectionNotifier._routeWatchdogMaxFailures,
   bool preserveLongLivedRoute = false,
-}) => !preserveLongLivedRoute && failures >= maxFailures;
+  bool isIOS = false,
+}) => preserveLongLivedRoute ? isIOS && failures >= 2 : failures >= maxFailures;
 
 bool shouldRetryExistingTurncoatRouteWithoutRestart({
   required bool turncoatInUse,
@@ -1301,6 +2091,11 @@ class SingleCall {
 
   void cancel() {
     _queuedGeneration++;
+  }
+
+  Future<void> waitForCurrent() async {
+    final current = _runningCompleter;
+    if (current != null) await current.future;
   }
 }
 

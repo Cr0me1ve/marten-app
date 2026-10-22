@@ -264,4 +264,125 @@ class VpnCoexistencePolicyTest {
             "pre-S marker fallback also permits Marten owner when reported",
         )
     }
+
+    @Test
+    fun `only explicit ownership transfer and exact same-generation overlap skip foreign-vpn yield`() {
+        assertFalse(
+            "explicit pre-establish VPN ownership transfer may continue despite foreign activity",
+            shouldYieldForExternalVpnOwnership(
+                externalVpnActive = true,
+                explicitUserStartPending = true,
+                vpnOwnershipWasEstablished = false,
+                explicitTakeoverOverlapAllowed = false,
+            ),
+        )
+
+        assertFalse(
+            "bounded explicit takeover overlap keeps the same Marten generation alive",
+            shouldYieldForExternalVpnOwnership(
+                externalVpnActive = true,
+                explicitUserStartPending = false,
+                vpnOwnershipWasEstablished = true,
+                explicitTakeoverOverlapAllowed = true,
+            ),
+        )
+
+        assertTrue(
+            "foreign VPN must force yield even if stale own activity is still visible",
+            shouldYieldForExternalVpnOwnership(
+                externalVpnActive = true,
+                explicitUserStartPending = false,
+                vpnOwnershipWasEstablished = true,
+                explicitTakeoverOverlapAllowed = false,
+            ),
+        )
+
+        assertTrue(
+            "foreign VPN with no explicit overlap must always force yield",
+            shouldYieldForExternalVpnOwnership(
+                externalVpnActive = true,
+                explicitUserStartPending = false,
+                vpnOwnershipWasEstablished = false,
+                explicitTakeoverOverlapAllowed = false,
+            ),
+        )
+
+        assertFalse(
+            "no foreign VPN must not force yield",
+            shouldYieldForExternalVpnOwnership(
+                externalVpnActive = false,
+                explicitUserStartPending = false,
+                vpnOwnershipWasEstablished = true,
+                explicitTakeoverOverlapAllowed = false,
+            ),
+        )
+    }
+
+    @Test
+    fun `explicit takeover overlap must be generation-bound and preexisting-foreign-only`() {
+        assertTrue(
+            "same-generation preexisting overlap is allowed",
+            isExplicitVpnTakeoverOverlapAllowed(
+                ownVpnActive = true,
+                currentGeneration = 12L,
+                takeoverGeneration = 12L,
+                nowElapsedRealtimeMs = 1_000L,
+                takeoverDeadlineElapsedRealtimeMs = 2_000L,
+                externalNetworkHandles = setOf(3L, 4L),
+                preexistingExternalNetworkHandles = setOf(4L, 3L),
+            ),
+        )
+
+        assertFalse(
+            "wrong-generation overlap is not allowed",
+            isExplicitVpnTakeoverOverlapAllowed(
+                ownVpnActive = true,
+                currentGeneration = 12L,
+                takeoverGeneration = 13L,
+                nowElapsedRealtimeMs = 1_000L,
+                takeoverDeadlineElapsedRealtimeMs = 2_000L,
+                externalNetworkHandles = setOf(3L),
+                preexistingExternalNetworkHandles = setOf(3L),
+            ),
+        )
+
+        assertFalse(
+            "expired overlap is not allowed",
+            isExplicitVpnTakeoverOverlapAllowed(
+                ownVpnActive = true,
+                currentGeneration = 12L,
+                takeoverGeneration = 12L,
+                nowElapsedRealtimeMs = 3_000L,
+                takeoverDeadlineElapsedRealtimeMs = 2_000L,
+                externalNetworkHandles = setOf(3L),
+                preexistingExternalNetworkHandles = setOf(3L),
+            ),
+        )
+
+        assertFalse(
+            "new foreign Network handles beyond preexisting snapshot are not allowed",
+            isExplicitVpnTakeoverOverlapAllowed(
+                ownVpnActive = true,
+                currentGeneration = 12L,
+                takeoverGeneration = 12L,
+                nowElapsedRealtimeMs = 1_000L,
+                takeoverDeadlineElapsedRealtimeMs = 2_000L,
+                externalNetworkHandles = setOf(3L, 4L, 5L),
+                preexistingExternalNetworkHandles = setOf(3L, 4L),
+            ),
+        )
+
+        assertFalse(
+            "non-owned vpn can never use explicit overlap allowance",
+            isExplicitVpnTakeoverOverlapAllowed(
+                ownVpnActive = false,
+                currentGeneration = 12L,
+                takeoverGeneration = 12L,
+                nowElapsedRealtimeMs = 1_000L,
+                takeoverDeadlineElapsedRealtimeMs = 2_000L,
+                externalNetworkHandles = setOf(3L),
+                preexistingExternalNetworkHandles = setOf(3L),
+            ),
+        )
+    }
 }

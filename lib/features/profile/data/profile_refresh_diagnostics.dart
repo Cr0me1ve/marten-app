@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:dio/dio.dart';
+import 'package:marten/core/network/strict_vpn_egress_gate.dart';
 import 'package:marten/features/profile/model/profile_failure.dart';
 
 typedef ProfileRefreshFailureDiagnostic = ({String category, String errorType, String httpStatusClass});
@@ -17,10 +18,14 @@ ProfileRefreshFailureDiagnostic profileRefreshFailureDiagnostic(ProfileFailure f
     ProfileInvalidConfigFailure() => (category: 'validation', errorType: 'invalid_config', httpStatusClass: 'none'),
     ProfileCancelByUserFailure() => (category: 'cancelled', errorType: 'cancelled_by_user', httpStatusClass: 'none'),
     ProfileDeviceMismatchFailure() => (category: 'authorization', errorType: 'device_mismatch', httpStatusClass: '4xx'),
+    ProfileDeviceLimitFailure() => (category: 'authorization', errorType: 'device_limit', httpStatusClass: '4xx'),
   };
 }
 
 ProfileRefreshFailureDiagnostic profileRefreshUnexpectedErrorDiagnostic(Object? error) {
+  if (error is StrictVpnEgressSealedException) {
+    return (category: 'vpn_transition', errorType: 'strict_vpn_egress_sealed', httpStatusClass: 'none');
+  }
   if (error is DioException) {
     final statusClass = _httpStatusClass(error.response?.statusCode);
     return switch (error.type) {

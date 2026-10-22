@@ -13,6 +13,21 @@ internal object NativeCrashDiagnostics {
     private const val MAX_MESSAGE_LENGTH = 160
     private val safeToken = Regex("^[a-z][a-z0-9_]{0,${MAX_TOKEN_LENGTH - 1}}$")
 
+    @Volatile
+    private var networkAdmissionAllowed = false
+
+    /**
+     * Firebase must not be touched while a persisted strict VPN session is
+     * waiting for its first full-route blocker. The VPN owner UID is exempt
+     * from Android lockdown, so even SDK initialization belongs behind the
+     * same process-to-VPN binding as every other ordinary Marten socket.
+     */
+    fun setNetworkAdmissionAllowed(allowed: Boolean) {
+        networkAdmissionAllowed = allowed
+    }
+
+    fun isNetworkAdmissionAllowed(): Boolean = networkAdmissionAllowed
+
     internal interface Backend {
         val collectionEnabled: Boolean
 
@@ -38,6 +53,7 @@ internal object NativeCrashDiagnostics {
     }
 
     fun logPhase(component: String, phase: String) {
+        if (!networkAdmissionAllowed) return
         logPhase(component, phase, FirebaseBackend)
     }
 

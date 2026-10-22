@@ -8,7 +8,10 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.net.TrafficStats
 import android.os.Build
+import android.os.Process
+import android.os.SystemClock
 import android.util.Log
 import androidx.annotation.StringRes
 import androidx.core.app.NotificationCompat
@@ -21,21 +24,33 @@ import app.marten.client.Settings
 import app.marten.client.VpnPermissionActivity
 import app.marten.client.constant.Action
 import app.marten.client.constant.Status
-import app.marten.client.utils.GrpcClientProvider
-import app.marten.core.api.v2.hcommon.Empty
-import app.marten.core.api.v2.hcore.CoreClient
-import app.marten.core.api.v2.hcore.SystemInfo
-import app.marten.core.libbox.Libbox
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicLong
+import java.util.Locale
+
+/** Presentation must remain usable even when the native runtime cannot answer. */
+internal fun formatNotificationBytes(bytes: Long): String {
+    val value = bytes.coerceAtLeast(0L)
+    if (value < 10L) return "$value B"
+    val units = arrayOf("B", "kB", "MB", "GB", "TB", "PB", "EB")
+    var scaled = value.toDouble()
+    var unit = 0
+    while (scaled >= 1_000.0 && unit < units.lastIndex) {
+        scaled /= 1_000.0
+        unit++
+    }
+    val rounded = kotlin.math.floor(scaled * 10.0 + 0.5) / 10.0
+    return String.format(Locale.ROOT, if (rounded < 10.0) "%.1f %s" else "%.0f %s", rounded, units[unit])
+}
 
 internal fun shouldStreamDynamicNotificationUpdates(
     dynamicNotificationEnabled: Boolean,
@@ -48,6 +63,26 @@ internal fun shouldPublishDynamicNotificationUpdate(
     platformStatus: Status?,
     gatePermitsUpdate: Boolean,
 ): Boolean = gatePermitsUpdate && platformStatus == Status.Started
+
+internal const val DYNAMIC_NOTIFICATION_MIN_UPDATE_INTERVAL_MS = 5_000L
+
+internal fun dynamicNotificationBytesPerSecond(deltaBytes: Long, elapsedMs: Long): Long {
+    if (deltaBytes <= 0L || elapsedMs <= 0L) return 0L
+    return (deltaBytes.toDouble() * 1_000.0 / elapsedMs.toDouble())
+        .coerceAtMost(Long.MAX_VALUE.toDouble())
+        .toLong()
+}
+
+internal data class DynamicNotificationTrafficSample(
+    val uplinkTotal: Long,
+    val downlinkTotal: Long,
+    val capturedAtMs: Long,
+)
+
+internal fun dynamicNotificationTrafficDelta(previousTotal: Long, currentTotal: Long): Long {
+    if (previousTotal < 0L || currentTotal < previousTotal) return 0L
+    return currentTotal - previousTotal
+}
 
 internal class NotificationUpdateGate {
     private val streamingGeneration = AtomicLong()
@@ -95,6 +130,8 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
     private val notificationUpdateGate = NotificationUpdateGate()
     private var receiverRegistered = false
     private var streamingJob: Job? = null
+    private var runningTitle = "Marten"
+    private var lastDynamicContent: String? = null
 
     private fun ensureChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -165,7 +202,11 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
     }
 
     private fun connectIntent(): PendingIntent {
-        return VpnPermissionActivity.pendingIntent(service, 3)
+        return VpnPermissionActivity.pendingIntent(
+            service,
+            3,
+            source = VpnPermissionActivity.SOURCE_NOTIFICATION,
+        )
     }
 
     private fun stopIntent(): PendingIntent {
@@ -184,6 +225,8 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
         Application.notificationManager.cancel(stoppedNotificationId)
         val title = displayName(profileName).ifBlank { "Marten" }
         val content = service.getString(contentTextId)
+        runningTitle = title
+        lastDynamicContent = null
         notificationUpdateGate.openForeground()
         service.startForeground(serviceNotificationId, runningBuilder(title, content).build())
     }
@@ -205,8 +248,8 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
                 registerReceiver()
                 // A service can be restored while the display is already off,
                 // in which case Android sends no new SCREEN_OFF broadcast.
-                // Never start the stats stream solely because the service was
-                // created; it is UI-only work and must not run during sleep.
+                // Never start traffic sampling solely because the service was
+                // created; it is presentation-only work and must not run during sleep.
                 if (
                     shouldStreamDynamicNotificationUpdates(
                         dynamicNotificationEnabled = Settings.dynamicNotification,
@@ -214,9 +257,9 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
                         deviceInteractive = Application.powerManager.isInteractive,
                     )
                 ) {
-                    startListenSystemInfo()
+                    startTrafficUpdates()
                 } else {
-                    stopListenSystemInfo()
+                    stopTrafficUpdates()
                 }
             }
         }
@@ -231,15 +274,25 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
         receiverRegistered = true
     }
 
-    fun updateStatus(previous: SystemInfo, current: SystemInfo) {
-        val uplink = current.uplink_total - previous.uplink_total
-        val downlink = current.downlink_total - previous.downlink_total
-        val outbound = displayName(current.current_outbound)
-        val speed = "${Libbox.formatBytes(uplink)}/s ↑\t${Libbox.formatBytes(downlink)}/s ↓"
-        val title = displayName(current.current_profile).ifBlank { outbound }.ifBlank { "Marten" }
+    private fun updateStatus(
+        previous: DynamicNotificationTrafficSample,
+        current: DynamicNotificationTrafficSample,
+    ) {
+        val elapsedMs = current.capturedAtMs - previous.capturedAtMs
+        val uplink = dynamicNotificationBytesPerSecond(
+            dynamicNotificationTrafficDelta(previous.uplinkTotal, current.uplinkTotal),
+            elapsedMs,
+        )
+        val downlink = dynamicNotificationBytesPerSecond(
+            dynamicNotificationTrafficDelta(previous.downlinkTotal, current.downlinkTotal),
+            elapsedMs,
+        )
+        val speed = "${formatNotificationBytes(uplink)}/s ↑\t${formatNotificationBytes(downlink)}/s ↓"
+        if (lastDynamicContent == speed) return
+        lastDynamicContent = speed
         Application.notificationManager.notify(
             serviceNotificationId,
-            runningBuilder(title, speed).build(),
+            runningBuilder(runningTitle, speed).build(),
         )
     }
 
@@ -253,14 +306,14 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
                         deviceInteractive = Application.powerManager.isInteractive,
                     )
                 ) {
-                    startListenSystemInfo()
+                    startTrafficUpdates()
                 } else {
-                    stopListenSystemInfo()
+                    stopTrafficUpdates()
                 }
             }
 
             Intent.ACTION_SCREEN_OFF -> {
-                stopListenSystemInfo()
+                stopTrafficUpdates()
             }
         }
     }
@@ -273,13 +326,13 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
     }
 
     fun stopDynamicUpdates() {
-        stopListenSystemInfo()
+        stopTrafficUpdates()
         unregisterScreenReceiver()
     }
 
     private fun closeForeground(removeNotification: Boolean) {
         notificationUpdateGate.closeForeground()
-        stopListenSystemInfo()
+        stopTrafficUpdates()
         ServiceCompat.stopForeground(
             service,
             if (removeNotification) ServiceCompat.STOP_FOREGROUND_REMOVE else ServiceCompat.STOP_FOREGROUND_DETACH,
@@ -301,56 +354,53 @@ class ServiceNotification(private val status: MutableLiveData<Status>, private v
         }
     }
 
-    fun startListenSystemInfo() {
-        Log.d("notification", "startListenSystemInfo")
+    fun startTrafficUpdates() {
+        Log.d("notification", "startTrafficUpdates")
         val streamGeneration = notificationUpdateGate.beginStreaming()
         streamingJob?.cancel()
 
         streamingJob = streamingCoroutineScope.launch(Dispatchers.IO) {
-            Log.d("notification", "startListenSystemInfo-launch")
-
-            val coreClient = GrpcClientProvider.grpcClient.create(CoreClient::class)
+            Log.d("notification", "startTrafficUpdates-launch")
 
             try {
-                streamSystemInfo(coreClient, streamGeneration)
+                streamUidTraffic(streamGeneration)
             } catch (e: CancellationException) {
-                Log.d("notification", "SystemInfo polling cancelled")
+                Log.d("notification", "traffic updates cancelled")
             } catch (e: Exception) {
-                Log.e("notification", "SystemInfo polling failed", e)
+                Log.e("notification", "traffic updates failed", e)
             }
         }
     }
 
-    private suspend fun streamSystemInfo(coreClient: CoreClient, streamGeneration: Long) {
-        val (sink, source) = coreClient.GetSystemInfo().executeBlocking()
-        try {
-            sink.write(Empty())
-            // GetSystemInfo is a one-request server stream. Reuse it instead
-            // of constructing a new HTTP/2 stream for every displayed sample.
-            sink.close()
-
-            var previous = source.read() ?: return
-            while (currentCoroutineContext().isActive) {
-                val current = source.read() ?: return
-                withContext(Dispatchers.Main.immediate) {
-                    if (
-                        shouldPublishDynamicNotificationUpdate(
-                            platformStatus = status.value,
-                            gatePermitsUpdate = notificationUpdateGate.permitsUpdate(streamGeneration),
-                        )
-                    ) {
-                        updateStatus(previous, current)
-                    }
+    private suspend fun streamUidTraffic(streamGeneration: Long) {
+        var previous = readUidTrafficSample()
+        while (currentCoroutineContext().isActive) {
+            delay(DYNAMIC_NOTIFICATION_MIN_UPDATE_INTERVAL_MS)
+            val current = readUidTrafficSample()
+            withContext(Dispatchers.Main.immediate) {
+                if (
+                    shouldPublishDynamicNotificationUpdate(
+                        platformStatus = status.value,
+                        gatePermitsUpdate = notificationUpdateGate.permitsUpdate(streamGeneration),
+                    )
+                ) {
+                    updateStatus(previous, current)
                 }
-                previous = current
             }
-        } finally {
-            runCatching { sink.close() }
-            runCatching { source.close() }
+            previous = current
         }
     }
 
-    fun stopListenSystemInfo() {
+    private fun readUidTrafficSample(): DynamicNotificationTrafficSample =
+        DynamicNotificationTrafficSample(
+            // The core's protected transport sockets run under this UID, so kernel
+            // counters provide notification throughput without waking the gRPC core.
+            uplinkTotal = TrafficStats.getUidTxBytes(Process.myUid()),
+            downlinkTotal = TrafficStats.getUidRxBytes(Process.myUid()),
+            capturedAtMs = SystemClock.elapsedRealtime(),
+        )
+
+    fun stopTrafficUpdates() {
         try {
             notificationUpdateGate.stopStreaming()
             streamingJob?.cancel()

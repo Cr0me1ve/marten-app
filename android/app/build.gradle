@@ -38,6 +38,8 @@ if (localPropertiesFile.exists()) {
 }
 
 boolean hasKeyStore = false
+// Explicit local tester build only; normal APK/AAB builds remain passive.
+def energyDiagnostics = providers.gradleProperty('martenEnergyDiagnostics').orNull == 'true'
 
 def martenCoreAar = file('libs/marten-core.aar')
 def martenCoreCrashlyticsSymbolsDir = file("$buildDir/intermediates/marten_core_crashlytics_symbols/release")
@@ -99,14 +101,46 @@ if (keystorePropertiesFile.exists()) {
     println "storeFile"
     println "+++"
 }
+if (energyDiagnostics && !hasKeyStore) {
+    throw new GradleException('Energy diagnostic APK requires the configured Marten signing key')
+}
 
 def flutterVersionCode = localProperties.getProperty('flutter.versionCode')?: '1'
 
 def flutterVersionName = localProperties.getProperty('flutter.versionName') ?: '1.0'
 
+// Keep one canonical CAPTCHA driver. The service-only Android path cannot
+// execute Dart after a cold Quick Settings start, so package the exact script
+// already used by CaptchaPage as a generated APK asset.
+def captchaAutomationSource = rootProject.file('../lib/features/captcha/widget/captcha_page.dart')
+def generatedCaptchaAssetsDirectory = file("$buildDir/generated/martenCaptchaAssets")
+def generatedCaptchaAutomationAsset = file("$generatedCaptchaAssetsDirectory/marten_captcha_automation.js")
+def generateCaptchaAutomationAsset = tasks.register('generateCaptchaAutomationAsset') {
+    inputs.file(captchaAutomationSource)
+    outputs.file(generatedCaptchaAutomationAsset)
+    doLast {
+        def source = captchaAutomationSource.getText('UTF-8')
+        def startMarker = "const _captchaAutomationScript = '''\n"
+        def endMarker = "\n''';"
+        def start = source.indexOf(startMarker)
+        def end = start < 0 ? -1 : source.indexOf(endMarker, start + startMarker.length())
+        if (start < 0 || end < 0) {
+            throw new GradleException('Unable to extract the canonical CAPTCHA automation script')
+        }
+        generatedCaptchaAutomationAsset.parentFile.mkdirs()
+        generatedCaptchaAutomationAsset.setText(
+            source.substring(start + startMarker.length(), end),
+            'UTF-8',
+        )
+    }
+}
+
 android {
     namespace 'app.marten.client'
     testNamespace "test.app.marten.client"
+    if (energyDiagnostics) {
+        testBuildType 'profile'
+    }
     compileSdkVersion 36
     ndkVersion "28.2.13676358"
 
@@ -121,6 +155,7 @@ android {
 
     sourceSets {
         main.java.srcDirs += 'src/main/kotlin'
+        main.assets.srcDir(generatedCaptchaAssetsDirectory)
     }
 
     defaultConfig {
@@ -130,10 +165,28 @@ android {
         versionCode flutterVersionCode.toInteger()
         versionName flutterVersionName
         multiDexEnabled true
+        testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
+        buildConfigField 'boolean', 'ENERGY_DIAGNOSTICS', energyDiagnostics.toString()
+        if (energyDiagnostics) {
+            ndk { abiFilters 'arm64-v8a' }
+            externalNativeBuild {
+                cmake {
+                    arguments "-DMARTEN_JVM_INCLUDE=${providers.gradleProperty('martenJvmtiInclude').orNull ?: System.getProperty('java.home') + '/include'}", '-DANDROID_STL=c++_static'
+                }
+            }
+        }
+    }
+
+    if (energyDiagnostics) {
+        externalNativeBuild {
+            cmake { path file('src/main/cpp/CMakeLists.txt'); version '3.22.1' }
+        }
     }
 
     packagingOptions {
         jniLibs {
+            //noinspection ChromeOsAbiSupport
+            excludes += ["lib/x86_64/**", "lib/x86/**", "lib/armeabi-v7a/**"]
             useLegacyPackaging = true
         }
     }
@@ -170,13 +223,26 @@ android {
                 }
             }
         }
+        profile {
+            // Flutter treats a debuggable release variant as debug/JIT. Its
+            // profile variant explicitly keeps AOT with local profiling tools.
+            if (energyDiagnostics) {
+                signingConfig signingConfigs.release
+                debuggable true
+            }
+        }
     }
 
     buildFeatures {
+        buildConfig true
         viewBinding true
         aidl true
     }
 
+}
+
+tasks.matching { it.name == 'preBuild' }.configureEach {
+    dependsOn(generateCaptchaAutomationAsset)
 }
 
 if (hasFirebaseConfig) {
@@ -190,7 +256,9 @@ if (hasFirebaseConfig) {
     tasks.matching {
         it.name == 'assembleRelease' || it.name == 'bundleRelease'
     }.configureEach {
-        // A configured release must upload the exact symbols for its native core.
+        // A release artifact without matching native symbols makes a captured
+        // libmarten-core.so crash unactionable. Keep symbol upload inside both
+        // APK and AAB release task graphs so an upload failure fails the build.
         dependsOn('uploadCrashlyticsSymbolFileRelease')
     }
 }
@@ -217,6 +285,9 @@ dependencies {
     implementation 'androidx.core:core-ktx:1.16.0'
     implementation 'androidx.appcompat:appcompat:1.7.0'
     implementation 'androidx.lifecycle:lifecycle-livedata-ktx:2.8.7'
+    // The app owns WorkManager's fail-closed WorkerFactory; declare the same
+    // runtime used by workmanager_android on the app compile classpath.
+    implementation 'androidx.work:work-runtime:2.11.2'
     implementation "androidx.compose.ui:ui:1.7.8"
     implementation("com.squareup.wire:wire-grpc-client:5.3.1")
 
@@ -225,6 +296,8 @@ dependencies {
     implementation 'io.grpc:grpc-stub:1.64.0'
     testImplementation 'junit:junit:4.13.2'
     testImplementation 'org.robolectric:robolectric:4.14.1'
+    androidTestImplementation 'androidx.test:runner:1.6.2'
+    androidTestImplementation 'androidx.test.ext:junit:1.2.1'
 //    protoPath(project(':marten_api'))
 //    implementation project(':marten_api')
 

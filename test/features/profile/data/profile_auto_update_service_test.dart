@@ -1,9 +1,11 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:dio/dio.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fpdart/fpdart.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
+import 'package:marten/core/network/strict_vpn_egress_gate.dart';
 import 'package:marten/features/profile/data/profile_auto_update_service.dart';
 import 'package:marten/features/profile/data/profile_data_providers.dart';
 import 'package:marten/features/profile/data/profile_refresh_diagnostics.dart';
@@ -84,11 +86,9 @@ final class _RecordingProfileRepository implements ProfileRepository {
   TaskEither<ProfileFailure, ProfileEntity?> getById(String id) => TaskEither.right(profile);
 
   @override
-  TaskEither<ProfileFailure, Unit> upsertRemote(
-    String url, {
-    UserOverride? userOverride,
+  TaskEither<ProfileFailure, Unit> refreshRemote(
+    RemoteProfileEntity profile, {
     CancelToken? cancelToken,
-    bool markAsActive = true,
     bool validate = true,
   }) {
     updateTokens.add(cancelToken);
@@ -103,6 +103,20 @@ final class _RecordingProfileRepository implements ProfileRepository {
 
   @override
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+final class _BlockingEgressAdmission implements StrictVpnEgressAdmission {
+  final entered = Completer<void>();
+  final released = Completer<void>();
+  final List<String> operations = [];
+
+  @override
+  Future<T> runWhenAdmitted<T>(String operation, Future<T> Function() action) async {
+    operations.add(operation);
+    if (!entered.isCompleted) entered.complete();
+    await released.future;
+    return action();
+  }
 }
 
 void main() {
@@ -293,6 +307,21 @@ void main() {
       }
     });
 
+    test('classifies a strict-egress rejection as a privacy-safe deferred refresh', () {
+      const operation = 'profile subscription refresh https://private.example/subscription?token=secret-token';
+      final diagnostic = ProfileAutoUpdateService.failureDiagnostic(
+        const ProfileFailure.unexpected(StrictVpnEgressSealedException(operation)),
+      );
+
+      expect(diagnostic.category, 'vpn_transition');
+      expect(diagnostic.errorType, 'strict_vpn_egress_sealed');
+      expect(diagnostic.httpStatusClass, 'none');
+      final loggedValues = '${diagnostic.category}|${diagnostic.errorType}|${diagnostic.httpStatusClass}';
+      expect(loggedValues, isNot(contains(operation)));
+      expect(loggedValues, isNot(contains('private.example')));
+      expect(loggedValues, isNot(contains('secret-token')));
+    });
+
     test('classifies every explicit profile failure variant', () {
       final cases = [
         (
@@ -323,6 +352,12 @@ void main() {
           failure: const ProfileFailure.deviceMismatch(sensitiveMessage),
           category: 'authorization',
           errorType: 'device_mismatch',
+          httpStatusClass: '4xx',
+        ),
+        (
+          failure: const ProfileFailure.deviceLimit(),
+          category: 'authorization',
+          errorType: 'device_limit',
           httpStatusClass: '4xx',
         ),
       ];
@@ -357,6 +392,20 @@ void main() {
       return (service: ProfileAutoUpdateService(_ServiceRef(container)), repository: repository, container: container);
     }
 
+    Future<({ProfileAutoUpdateService service, _RecordingProfileRepository repository, ProviderContainer container})>
+    newServiceWithAdmission(StrictVpnEgressAdmission admission) async {
+      final repository = _RecordingProfileRepository(profile());
+      final container = ProviderContainer(
+        overrides: [profileRepositoryProvider.overrideWith((_) => Future.value(repository))],
+      );
+      addTearDown(container.dispose);
+      return (
+        service: ProfileAutoUpdateService(_ServiceRef(container), egressAdmission: admission),
+        repository: repository,
+        container: container,
+      );
+    }
+
     test('forwards a live background cancellation token to the profile download', () async {
       final context = await newService();
       final cancelToken = CancelToken();
@@ -375,6 +424,34 @@ void main() {
 
       expect(results, isEmpty);
       expect(context.repository.updateTokens, isEmpty);
+    });
+
+    test('passively waits for VPN admission and coalesces repeated profile requests', () async {
+      final admission = _BlockingEgressAdmission();
+      final context = await newServiceWithAdmission(admission);
+
+      final first = context.service.updateProfile('remote-profile', force: true);
+      await admission.entered.future;
+      final second = context.service.updateProfile('remote-profile', force: true);
+
+      expect(
+        context.repository.updateTokens,
+        isEmpty,
+        reason: 'no subscription request may begin while admission is sealed',
+      );
+      expect(admission.operations, [
+        'subscription refresh',
+      ], reason: 'the coalesced work has one passive admission wait');
+
+      admission.released.complete();
+      final results = await Future.wait([first, second]);
+
+      expect(results.map((result) => result?.outcome), everyElement(ProfileAutoUpdateOutcome.updated));
+      expect(
+        context.repository.updateTokens,
+        hasLength(1),
+        reason: 'release runs exactly one repository upsert for the profile',
+      );
     });
   });
 }

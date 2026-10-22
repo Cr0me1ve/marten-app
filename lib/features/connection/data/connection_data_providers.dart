@@ -39,6 +39,10 @@ ConnectionRepository connectionRepository(Ref ref) {
     singbox: ref.watch(martenCoreServiceProvider),
     profilePathResolver: ref.watch(profilePathResolverProvider),
     readDeviceIdentity: () => ref.read(deviceIdentityProvider.future),
+    readProfileConfig: (id) async {
+      final repository = await ref.read(profileRepositoryProvider.future);
+      return repository.getRawConfig(id).getOrElse((failure) => throw failure).run();
+    },
     nativeResumeConfigSynchronizer: ref.watch(nativeResumeConfigSynchronizerProvider),
   );
 }

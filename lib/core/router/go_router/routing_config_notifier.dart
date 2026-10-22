@@ -86,7 +86,15 @@ class RoutingConfigNotifier extends _$RoutingConfigNotifier {
             WidgetsBinding.instance.addPostFrameCallback((_) async {
               try {
                 await ref.read(Preferences.startedByUser.notifier).update(true);
-                await ref.read(connectionNotifierProvider.notifier).mayConnect();
+                final connectionNotifier = ref.read(connectionNotifierProvider.notifier);
+                if (PlatformUtils.isIOS) {
+                  // A cold notification/deep-link can arrive before the iOS
+                  // foreground core publishes its first authoritative status.
+                  // Retain that one-shot intent until mayConnect can observe
+                  // Disconnected instead of silently dropping it in loading.
+                  await ref.read(connectionNotifierProvider.future);
+                }
+                await connectionNotifier.mayConnect();
               } catch (error, stackTrace) {
                 Logger.app.warning("error handling notification connect link", error, stackTrace);
               }

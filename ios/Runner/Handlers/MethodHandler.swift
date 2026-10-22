@@ -60,6 +60,13 @@ public class MethodHandler: NSObject, FlutterPlugin {
             }
             VPNConfig.shared.configOptions = options
             result(true)
+        case "matches_active_config_generation":
+            guard let args = call.arguments as? [String: Any],
+                  let path = args["path"] as? String else {
+                result(false)
+                return
+            }
+            result(ResumeConfigStore.matchesActiveConfig(configPath: path))
         case "setup":
                 Task {
                     guard
@@ -68,7 +75,8 @@ public class MethodHandler: NSObject, FlutterPlugin {
                         let workingDir = args["workingDir"] as? String,
                         let tempDir = args["tempDir"] as? String,
                         let mode = args["mode"] as? Int,
-                        let grpcPort = args["grpcPort"] as? Int
+                        let grpcPort = args["grpcPort"] as? Int,
+                        let debug = (args["debug"] as? NSNumber)?.boolValue
                     else {
                         result(FlutterError(code: "INVALID_ARGS", message: nil, details: nil))
                         return
@@ -77,16 +85,14 @@ public class MethodHandler: NSObject, FlutterPlugin {
                     VPNConfig.shared.workingDir=workingDir
                     VPNConfig.shared.tempDir=tempDir
                     var error: NSError?
-                    let opts = MobileSetupOptions()
-                    opts.basePath = baseDir
-                    opts.workingDir = workingDir
-                    opts.tempDir = tempDir
-                    opts.listen = "127.0.0.1:\(grpcPort)"
-                    opts.secret = ""
-                    opts.debug = false
-                    opts.mode = 4
-                    opts.fixAndroidStack = false
-                    MobileSetup(opts,
+                    MobileSetup(
+                        baseDir,
+                        workingDir,
+                        tempDir,
+                        mode,
+                        "127.0.0.1:\(grpcPort)",
+                        "",
+                        debug,
                         nil,
                         &error
                     )
@@ -95,14 +101,21 @@ public class MethodHandler: NSObject, FlutterPlugin {
                         result(FlutterError(code: String(error.code), message: error.localizedDescription, details: nil))
                         return
                     }
-                    do {
-                        try await VPNManager.shared.setup()
-                    } catch {
-                        result(FlutterError(code: "SETUP", message: error.localizedDescription, details: nil))
-                        return
-                    }
+                    // Foreground core setup is also required for import and
+                    // refresh. NetworkExtension preferences are loaded lazily
+                    // by an explicit Connect so an unavailable VPN service
+                    // cannot disable the rest of the iOS app.
                     result(true)
                 }
+        case "prepare_vpn_permission":
+            Task {
+                do {
+                    try await VPNManager.shared.setup()
+                    await mainResult(true)
+                } catch {
+                    await mainResult(FlutterError(code: "VPN_PERMISSION", message: error.localizedDescription, details: nil))
+                }
+            }
         case "start":
             Task {
                 guard
@@ -124,6 +137,20 @@ public class MethodHandler: NSObject, FlutterPlugin {
                     await mainResult(FlutterError(code: String(error.code), message: error.description, details: nil))
                     return
                 }
+                #if targetEnvironment(simulator)
+                // iOS Simulator uses the host networking stack and cannot run
+                // an iPhone Packet Tunnel provider. Fail before touching
+                // NetworkExtension so the UI does not surface raw IPC errors
+                // or wait for a background core that cannot be launched.
+                await mainResult(
+                    FlutterError(
+                        code: "NETWORK_EXTENSION_UNAVAILABLE",
+                        message: "marten:network-extension-unavailable",
+                        details: nil
+                    )
+                )
+                return
+                #else
                 do {
                     try await VPNManager.shared.setup()
                     try await VPNManager.shared.connect(with: path, grpcServiceModePort: grpcPort, disableMemoryLimit: VPNConfig.shared.disableMemoryLimit)
@@ -132,6 +159,7 @@ public class MethodHandler: NSObject, FlutterPlugin {
                     return
                 }
                 await mainResult(true)
+                #endif
             }
 //        case "restart":
 //            Task { [unowned self] in
@@ -162,11 +190,23 @@ public class MethodHandler: NSObject, FlutterPlugin {
 //                await mainResult(true)
 //            }
         case "stop":
-            VPNManager.shared.disconnect()
-            result(true)
+            Task {
+                do {
+                    try await VPNManager.shared.disconnect()
+                    await mainResult(true)
+                } catch {
+                    await mainResult(FlutterError(code: "STOP_CONNECTION", message: error.localizedDescription, details: nil))
+                }
+            }
         case "reset":
-            VPNManager.shared.reset()
-            result(true)
+            Task {
+                do {
+                    try await VPNManager.shared.reset()
+                    await mainResult(true)
+                } catch {
+                    await mainResult(FlutterError(code: "RESET_CONNECTION", message: error.localizedDescription, details: nil))
+                }
+            }
         case "url_test":
             guard
                 let args = call.arguments as? [String:Any?]

@@ -111,6 +111,7 @@ class TurncoatLivenessNotifier extends _$TurncoatLivenessNotifier with InfraLogg
   StreamSubscription<List<pb.LogMessage>>? _logSub;
   pb.LogMessage? _lastProcessedLog;
   bool _armedForTurncoat = false;
+  int _generation = 0;
   String? _selectedTag;
   Timer? _connectTimer;
   Completer<TurncoatLivenessState>? _startupWaiter;
@@ -141,16 +142,49 @@ class TurncoatLivenessNotifier extends _$TurncoatLivenessNotifier with InfraLogg
     _completeStartupRouteEvidenceWaiter(state);
     _connectTimer?.cancel();
     _connectTimer = null;
+    _generation++;
     _armedForTurncoat = inUse;
     _selectedTag = inUse ? selectedTag : null;
     _lastProcessedLog = ref.read(martenCoreServiceProvider).runtimeLogBuffer.lastOrNull;
     final next = TurncoatLivenessState(inUse: inUse);
-    loggy.info('turncoat liveness: armed inUse=$inUse selectedTag=$_selectedTag');
+    loggy.info('turncoat liveness: armed generation=$_generation inUse=$inUse');
     if (state != next) state = next;
     _completeStartupWaiterIfTerminal();
     if (inUse) {
       _connectTimer = Timer(connectTimeout, _markTimedOut);
     }
+  }
+
+  /// Identity of the current armed liveness cycle.
+  ///
+  /// Route verification can overlap a profile restart. Callers must capture
+  /// this value before accepting a proof so a late result from the previous
+  /// route cannot satisfy the replacement generation.
+  int get generation => _generation;
+
+  /// Accepts an authoritative fresh proof for the selected TURNcoat route.
+  ///
+  /// Android publishes `Connected` only after HTTP and DNS have both crossed
+  /// the current VPN Network/TUN generation. That end-to-end proof is stronger
+  /// than the carrier promotion marker and is therefore sufficient to settle
+  /// this startup liveness gate even when a warm TURNcoat carrier reuses its
+  /// already-promoted streams and emits no new promotion line after restart.
+  void acceptVerifiedRouteProof({required int expectedGeneration}) {
+    if (!_armedForTurncoat || !state.inUse) return;
+    if (expectedGeneration != _generation) {
+      loggy.info(
+        'turncoat liveness: ignoring route proof expectedGeneration=$expectedGeneration '
+        'currentGeneration=$_generation',
+      );
+      return;
+    }
+    _connectTimer?.cancel();
+    _connectTimer = null;
+    if (state.live && state.routeActive && !state.timedOut) return;
+    state = state.copyWith(live: true, routeActive: true, timedOut: false);
+    _completeStartupWaiterIfTerminal();
+    _completeStartupRouteEvidenceWaiterIfTerminal();
+    loggy.info('turncoat liveness: authoritative route proof accepted generation=$_generation');
   }
 
   void reset() {
@@ -206,9 +240,9 @@ class TurncoatLivenessNotifier extends _$TurncoatLivenessNotifier with InfraLogg
 
   void _onLogs(List<pb.LogMessage> events) {
     if (events.isEmpty) return;
-    // logController emits the full rolling buffer each time. Core log
-    // timestamps are not reliable on every platform, so keep an object cursor
-    // into that rolling buffer instead of comparing protobuf time values.
+    // The controller may emit either an incremental immutable batch or a full
+    // rolling buffer (including values injected by tests). Core timestamps are
+    // not reliable on every platform, so keep an object cursor instead.
     final start = _nextLogStartIndex(events);
     var nextInUse = state.inUse;
     var nextLive = state.live;
@@ -233,7 +267,7 @@ class TurncoatLivenessNotifier extends _$TurncoatLivenessNotifier with InfraLogg
       if (backendRx || (selectedTag != null && isSelectedOutboundActivityLogLine(line, selectedTag))) {
         nextRouteActivityCount++;
         if (!nextRouteActive) {
-          loggy.info('turncoat liveness: selected route active ($line)');
+          loggy.info('turncoat liveness: selected route active');
         }
         nextRouteActive = true;
         nextInUse = true;
@@ -271,6 +305,7 @@ class TurncoatLivenessNotifier extends _$TurncoatLivenessNotifier with InfraLogg
   void _reset() {
     _connectTimer?.cancel();
     _connectTimer = null;
+    _generation++;
     _armedForTurncoat = false;
     _selectedTag = null;
     if (state.inUse || state.live || state.routeActive || state.timedOut) {

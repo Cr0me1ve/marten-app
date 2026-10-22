@@ -27,6 +27,9 @@ sealed class ProfileFailure with _$ProfileFailure, Failure {
   @With<ExpectedFailure>()
   const factory ProfileFailure.deviceMismatch([String? message]) = ProfileDeviceMismatchFailure;
 
+  @With<ExpectedFailure>()
+  const factory ProfileFailure.deviceLimit() = ProfileDeviceLimitFailure;
+
   @override
   ({String type, String? message}) present(TranslationsEn t) {
     return switch (this) {
@@ -36,7 +39,16 @@ sealed class ProfileFailure with _$ProfileFailure, Failure {
       ProfileInvalidConfigFailure(:final message, :final configOptionFailure) =>
         configOptionFailure?.present(t) ?? (type: t.errors.profiles.invalidConfig, message: message),
       ProfileCancelByUserFailure(:final message) => (type: t.errors.profiles.canceledByUser, message: message),
-      ProfileDeviceMismatchFailure() => (type: t.errors.profiles.deviceMismatch, message: t.errors.profiles.deviceMismatchMsg),
+      ProfileDeviceMismatchFailure() => (
+        type: t.errors.profiles.deviceMismatch,
+        message: t.errors.profiles.deviceMismatchMsg,
+      ),
+      ProfileDeviceLimitFailure() => (type: t.errors.profiles.deviceLimit, message: null),
     };
   }
+}
+
+String presentProfileUpdateError(TranslationsEn t, Object error, {required String action}) {
+  if (error is ProfileDeviceLimitFailure) return t.errors.profiles.deviceLimit;
+  return t.presentShortError(error, action: action);
 }

@@ -11,6 +11,13 @@ rootProject.allprojects {
 apply plugin: 'com.android.library'
 apply plugin: 'kotlin-android'
 
+dependencies {
+    // The app packages this AAR at runtime. compileOnly keeps the plugin from
+    // embedding a second native core while making the pure subscription
+    // canonicalizer available to headless Flutter engines.
+    compileOnly files('../../../android/app/libs/marten-core.aar')
+}
+
 android {
     namespace 'app.marten.native_resume'
     compileSdk = flutter.compileSdkVersion

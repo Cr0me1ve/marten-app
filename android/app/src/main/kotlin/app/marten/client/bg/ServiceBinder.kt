@@ -3,6 +3,7 @@ package app.marten.client.bg
 import android.os.RemoteCallbackList
 import android.util.Log
 import androidx.lifecycle.MutableLiveData
+import app.marten.client.Application
 import app.marten.client.IService
 import app.marten.client.IServiceCallback
 import app.marten.client.constant.Status
@@ -24,6 +25,7 @@ class ServiceBinder(private val status: MutableLiveData<Status>) : IService.Stub
     init {
         status.observeForever {
             NativeCrashDiagnostics.logPhase("box_service", "status_${it.name.lowercase()}")
+            TileService.requestStateUpdate(Application.application.applicationContext, it)
             broadcast { callback ->
                 callback.onServiceStatusChanged(it.ordinal)
             }

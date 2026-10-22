@@ -8,6 +8,7 @@ import 'package:marten/utils/utils.dart';
 part 'profile_data_source.g.dart';
 
 abstract interface class ProfileDataSource {
+  Future<T> transaction<T>(Future<T> Function() action);
   Future<ProfileEntry?> getById(String id);
   Future<ProfileEntry?> getByUrl(String url);
   Future<ProfileEntry?> getByName(String name);
@@ -108,7 +109,12 @@ class ProfileDao extends DatabaseAccessor<Db> with _$ProfileDaoMixin, InfraLogge
       if (entry.active.present && entry.active.value) {
         await update(profileEntries).write(const ProfileEntriesCompanion(active: Value(false)));
       }
-      await (update(profileEntries)..where((tbl) => tbl.id.equals(id))).write(entry);
+      // Selection is presentation state. Every content mutation invalidates
+      // refreshes that captured the old persisted generation, even within the
+      // same timestamp resolution or with identical server metadata.
+      final changesContent = entry.toColumns(false).keys.any((column) => column != 'active');
+      final updated = changesContent ? entry.copyWith(revision: Value(profile.revision + 1)) : entry;
+      await (update(profileEntries)..where((tbl) => tbl.id.equals(id))).write(updated);
     });
   }
 

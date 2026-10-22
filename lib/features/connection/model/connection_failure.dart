@@ -7,6 +7,7 @@ part 'connection_failure.freezed.dart';
 
 const missingProfileConfigFailureMessage = 'marten:profile-config-file-missing';
 const localCoreControlChannelFailureMessage = 'marten:local-core-control-channel-unavailable';
+const networkExtensionUnavailableFailureMessage = 'marten:network-extension-unavailable';
 
 @freezed
 sealed class ConnectionFailure with _$ConnectionFailure, Failure {
@@ -43,6 +44,10 @@ sealed class ConnectionFailure with _$ConnectionFailure, Failure {
         type: t.errors.profiles.notFound,
         message: null,
       ),
+      UnexpectedConnectionFailure(:final error) when looksLikeNetworkExtensionUnavailable(error) => (
+        type: t.errors.connection.connectionError,
+        message: t.errors.connection.networkExtensionUnavailableMsg,
+      ),
       UnexpectedConnectionFailure(:final error) when looksLikeCoreStartConnectivityError(error) => (
         type: t.errors.connection.connectionError,
         message: t.errors.connection.startFailedMsg,
@@ -64,6 +69,13 @@ sealed class ConnectionFailure with _$ConnectionFailure, Failure {
       BackgroundCoreNotAvailable(:final message) => (type: t.errors.connectivity.core, message: message),
     };
   }
+}
+
+bool looksLikeNetworkExtensionUnavailable(Object? error) {
+  if (error == null) return false;
+  final message = error.toString().toLowerCase();
+  return message.contains(networkExtensionUnavailableFailureMessage) ||
+      message.contains('network_extension_unavailable');
 }
 
 bool looksLikeCoreStartConnectivityError(Object? error) {

@@ -248,6 +248,7 @@
 				DDB714AFDEF721265C0C3AF7 /* [CP] Embed Pods Frameworks */,
 				414949D92CCE3C2C0069D5BA /* ShellScript */,
 				B19812F5A9BDAF11DD3D48FA /* [CP] Copy Pods Resources */,
+				C1A500212E8B100000000001 /* [firebase_crashlytics] Crashlytics Upload Symbols */,
 			);
 			buildRules = (
 			);
@@ -467,6 +468,30 @@
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
 			shellScript = "\"${PODS_ROOT}/Target Support Files/Pods-Runner/Pods-Runner-frameworks.sh\"\n";
+			showEnvVarsInLog = 0;
+		};
+		C1A500212E8B100000000001 /* [firebase_crashlytics] Crashlytics Upload Symbols */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"${DWARF_DSYM_FOLDER_PATH}/${DWARF_DSYM_FILE_NAME}",
+				"${DWARF_DSYM_FOLDER_PATH}/${DWARF_DSYM_FILE_NAME}/Contents/Resources/DWARF/${PRODUCT_NAME}",
+				"${DWARF_DSYM_FOLDER_PATH}/${DWARF_DSYM_FILE_NAME}/Contents/Info.plist",
+				"$(TARGET_BUILD_DIR)/$(EXECUTABLE_PATH)",
+			);
+			name = "[firebase_crashlytics] Crashlytics Upload Symbols";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "if [ ! -f \"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/GoogleService-Info.plist\" ]; then\n  exit 0\nfi\nif [ \"${DEBUG_INFORMATION_FORMAT}\" != \"dwarf-with-dsym\" ] || [ ! -d \"${DWARF_DSYM_FOLDER_PATH}/App.framework.dSYM\" ]; then\n  exit 0\nfi\nFIREBASE_APP_ID=$(/usr/libexec/PlistBuddy -c \"Print :GOOGLE_APP_ID\" \"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/GoogleService-Info.plist\")\n\"${PODS_ROOT}/FirebaseCrashlytics/upload-symbols\" --build-phase --validate -ai \"${FIREBASE_APP_ID}\" -- \"${DWARF_DSYM_FOLDER_PATH}/App.framework.dSYM\"\n\"${PODS_ROOT}/FirebaseCrashlytics/upload-symbols\" --build-phase -ai \"${FIREBASE_APP_ID}\" -- \"${DWARF_DSYM_FOLDER_PATH}/App.framework.dSYM\"\n";
 			showEnvVarsInLog = 0;
 		};
 /* End PBXShellScriptBuildPhase section */

@@ -39,13 +39,12 @@ bool isOnPauseCalled = false;
 class App extends HookConsumerWidget with WidgetsBindingObserver, PresLogger {
   const App({super.key});
 
-  void onInactive(WidgetRef ref) {
-    onPause(ref);
-  }
-
   void onPause(WidgetRef ref) {
     if (PlatformUtils.isDesktop) return;
     isOnPauseCalled = true;
+    if (PlatformUtils.isIOS) {
+      ref.read(connectionNotifierProvider.notifier).deferRouteWatchdogForBackground();
+    }
     ref.read(martenCoreServiceProvider).closeFront();
   }
 
@@ -62,7 +61,7 @@ class App extends HookConsumerWidget with WidgetsBindingObserver, PresLogger {
 
   Future<void> _resumeCoreAndCheckRoute(WidgetRef ref, {required bool wasPaused}) async {
     if (!wasPaused) return;
-    await ref.read(martenCoreServiceProvider).init();
+    await ref.read(martenCoreServiceProvider).resumeFront();
     unawaited(ref.read(foregroundProfilesUpdateNotifierProvider.notifier).checkDueNow());
     ref.read(connectionNotifierProvider.notifier).checkRouteAfterResume();
   }
@@ -207,10 +206,11 @@ class App extends HookConsumerWidget with WidgetsBindingObserver, PresLogger {
     useEffect(() {
       loggy.info("current app state");
       loggy.info(appLifecycleState);
+      // Opening Android's notification shade / Quick Settings reports a
+      // transient inactive state while the Activity is still present. Only a
+      // real pause detaches the foreground core channel.
       if (appLifecycleState == AppLifecycleState.paused) {
         onPause(ref);
-      } else if (appLifecycleState == AppLifecycleState.inactive) {
-        onInactive(ref);
       } else if (appLifecycleState == AppLifecycleState.resumed) {
         onResume(ref);
       }

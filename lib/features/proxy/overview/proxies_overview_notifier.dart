@@ -64,7 +64,7 @@ class ProxiesOverviewNotifier extends _$ProxiesOverviewNotifier with AppLogger {
   // }
 
   Future<void> changeProxy(String groupTag, String outboundTag) async {
-    loggy.debug("changing proxy, group: [$groupTag] - outbound: [$outboundTag]");
+    loggy.debug("changing selected proxy");
     final connection = ref.read(connectionNotifierProvider).valueOrNull ?? const Disconnected();
     if (connection is! Disconnected) {
       loggy.info("proxy change ignored while connection is active");
@@ -93,7 +93,7 @@ class ProxiesOverviewNotifier extends _$ProxiesOverviewNotifier with AppLogger {
   }
 
   Future<void> urlTest(String groupTag) async {
-    loggy.debug("testing group: [$groupTag]");
+    loggy.debug("testing proxy group");
     if (state case AsyncData()) {
       await ref.read(hapticServiceProvider.notifier).lightImpact();
       final localTargets = await _connectedRoutePingTargets();

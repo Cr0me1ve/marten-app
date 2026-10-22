@@ -252,34 +252,24 @@ void main() {
       expect(r, isNotNull);
       expect(r!.url, equals('https://edge.example.net/sub/token-1'));
       expect(r.name, equals('Alice'));
-      expect(r.pushEndpoint, isNull);
     });
 
-    test("marten://import with HTTPS push endpoint extracts push endpoint", () {
+    test("marten import link accepts HTTPS push endpoint", () {
       final r = LinkParser.deep(
-        'marten://import?url=https%3A%2F%2Fedge.example.net%2Fsub%2Ftoken-1&'
-        'push=${Uri.encodeComponent('https://push.example.net/v1/subscription')}&name=Alice',
+        'marten://import?url=https%3A%2F%2Fedge.example.net%2Fsub%2Ftoken-1&name=Alice&push='
+        '${Uri.encodeComponent('https://edge.example.net/device/push')}',
       );
       expect(r, isNotNull);
-      expect(r!.url, equals('https://edge.example.net/sub/token-1'));
-      expect(r.pushEndpoint, equals('https://push.example.net/v1/subscription'));
+      expect(r!.pushEndpoint, equals('https://edge.example.net/device/push'));
     });
 
-    test("marten://import rejects non-https push endpoint", () {
-      expect(
-        LinkParser.deep(
-          'marten://import?url=https%3A%2F%2Fedge.example.net%2Fsub%2Ftoken-1&'
-          'push=${Uri.encodeComponent('http://push.example.net/token')}',
-        ),
-        isNull,
-      );
-      expect(
-        LinkParser.deep(
-          'marten://import?url=https%3A%2F%2Fedge.example.net%2Fsub%2Ftoken-1&'
-          'push=${Uri.encodeComponent('javascript:alert(1)')}',
-        ),
-        isNull,
-      );
+    test("marten import link rejects unsafe push endpoints", () {
+      final url = 'marten://import?url=https%3A%2F%2Fedge.example.net%2Fsub%2Ftoken-1&name=Alice&push=';
+
+      expect(LinkParser.deep('$url${Uri.encodeComponent('http://edge.example.net/device/push')}'), isNull);
+      expect(LinkParser.deep('$url${Uri.encodeComponent('https://user:pass@edge.example.net/device/push')}'), isNull);
+      expect(LinkParser.deep('$url${Uri.encodeComponent('https://edge.example.net/device/push?x=1')}'), isNull);
+      expect(LinkParser.deep('$url${Uri.encodeComponent('https://edge.example.net/device/push#frag')}'), isNull);
     });
 
     test("unknown scheme returns null", () {

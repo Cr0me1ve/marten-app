@@ -597,7 +597,8 @@
       "badResponse": "Bad response",
       "connectionError": "Connection error",
       "startFailedMsg": "Could not start the connection. Check your internet connection and try again.",
-      "selectedRouteFailedMsg": "The selected server is unavailable. Connection was stopped without switching to another server.",
+      "networkExtensionUnavailableMsg": "Packet Tunnel is unavailable in iPhone Simulator. Test the VPN connection on a physical iPhone.",
+      "selectedRouteFailedMsg": "The selected server is unavailable. Connection was stopped.",
       "badCertificate": "Bad certificate"
     },
     "profiles": {
@@ -607,7 +608,8 @@
       "invalidUrl": "Invalid URL",
       "canceledByUser": "Canceled by user",
       "deviceMismatch": "Subscription bound to another device",
-      "deviceMismatchMsg": "This subscription is linked to a different device. Contact your operator to transfer it."
+      "deviceMismatchMsg": "This subscription is linked to a different device. Contact your operator to transfer it.",
+      "deviceLimit": "The device limit for this subscription has been reached"
     },
     "connectivity": {
       "unexpected": "Unexpected failure",

@@ -26,38 +26,80 @@ class ServiceNotificationEnergyPolicyTest {
     }
 
     @Test
-    fun `service notification start and screen-off restore respect interactive gate and stop stream`() {
+    fun `service notification starts UID traffic updates only while interactive and stops them on screen-off`() {
         val serviceNotification = sourceFile("ServiceNotification.kt")
 
         val start = functionBody(serviceNotification, "start")
         assertTrue(start.contains("if (Settings.dynamicNotification && permissionGranted)"))
         assertTrue(start.contains("Application.powerManager.isInteractive"))
         assertTrue(start.contains("shouldStreamDynamicNotificationUpdates("))
-        assertTrue(start.contains("startListenSystemInfo()"))
-        assertTrue(start.contains("stopListenSystemInfo()"))
-        assertTrue(start.indexOf("startListenSystemInfo()") > start.indexOf("shouldStreamDynamicNotificationUpdates("))
-        assertTrue(start.indexOf("stopListenSystemInfo()") > start.indexOf("shouldStreamDynamicNotificationUpdates("))
+        assertTrue(start.contains("startTrafficUpdates()"))
+        assertTrue(start.contains("stopTrafficUpdates()"))
+        assertTrue(start.indexOf("startTrafficUpdates()") > start.indexOf("shouldStreamDynamicNotificationUpdates("))
+        assertTrue(start.indexOf("stopTrafficUpdates()") > start.indexOf("shouldStreamDynamicNotificationUpdates("))
 
         val onReceive = functionBody(serviceNotification, "onReceive")
         assertTrue(onReceive.contains("Intent.ACTION_SCREEN_OFF ->"))
-        assertTrue(onReceive.contains("stopListenSystemInfo()"))
+        assertTrue(onReceive.contains("stopTrafficUpdates()"))
         val offBranch = onReceive.indexOf("Intent.ACTION_SCREEN_OFF ->")
         assertTrue(offBranch >= 0)
         val offBranchEnd = onReceive.indexOf("}", offBranch)
         assertTrue(offBranchEnd > offBranch)
         assertFalse(
-            "screen-off branch must not call startListenSystemInfo",
-            onReceive.substring(offBranch, offBranchEnd + 1).contains("startListenSystemInfo()"),
+            "screen-off branch must not start traffic polling",
+            onReceive.substring(offBranch, offBranchEnd + 1).contains("startTrafficUpdates()"),
+        )
+
+        val serviceNotificationClass = serviceNotification.substring(serviceNotification.indexOf("class ServiceNotification"))
+        val closeForeground = functionBody(serviceNotificationClass, "closeForeground")
+        assertTrue(
+            "foreground teardown must cancel the UI-only traffic coroutine",
+            closeForeground.contains("stopTrafficUpdates()"),
         )
     }
 
     @Test
-    fun `system info stream must use single executeBlocking stream call without legacy polling fallback`() {
-        val streamSystemInfo = functionBody(sourceFile("ServiceNotification.kt"), "streamSystemInfo")
-        val calls = Regex("coreClient\\.GetSystemInfo\\(\\)\\.executeBlocking\\(\\)").findAll(streamSystemInfo).toList()
-        assertEquals(1, calls.size)
-        assertEquals(-1, streamSystemInfo.indexOf("delay(1_000)"))
-        assertEquals(-1, streamSystemInfo.indexOf("readSystemInfo(coreClient)"))
+    fun `dynamic notifications poll only process UID traffic rather than opening a core system info stream`() {
+        val serviceNotification = sourceFile("ServiceNotification.kt")
+        val stream = functionBody(serviceNotification, "streamUidTraffic")
+        val sample = functionBody(serviceNotification, "readUidTrafficSample")
+
+        listOf("GrpcClient", "GetSystemInfo", "SystemInfo", "streamSystemInfo", "startListenSystemInfo").forEach { legacyCoreStream ->
+            assertFalse(
+                "dynamic notification polling must not retain the legacy core system-info stream: $legacyCoreStream",
+                serviceNotification.contains(legacyCoreStream),
+            )
+        }
+        assertTrue(sample.contains("TrafficStats.getUidTxBytes(Process.myUid())"))
+        assertTrue(sample.contains("TrafficStats.getUidRxBytes(Process.myUid())"))
+        assertTrue(sample.contains("SystemClock.elapsedRealtime()"))
+        assertTrue(stream.contains("delay(DYNAMIC_NOTIFICATION_MIN_UPDATE_INTERVAL_MS)"))
+        assertTrue(stream.contains("currentCoroutineContext().isActive"))
+        val initialSample = stream.indexOf("var previous = readUidTrafficSample()")
+        val wait = stream.indexOf("delay(DYNAMIC_NOTIFICATION_MIN_UPDATE_INTERVAL_MS)")
+        val currentSample = stream.indexOf("val current = readUidTrafficSample()")
+        assertTrue(
+            "traffic polling must capture an initial baseline, wait five seconds, then capture the current sample",
+            initialSample >= 0 && wait >= 0 && currentSample >= 0 && initialSample < wait && wait < currentSample,
+        )
+    }
+
+    @Test
+    fun `notification content is published only after a permitted changing UID traffic sample`() {
+        val serviceNotification = sourceFile("ServiceNotification.kt")
+        val stream = functionBody(serviceNotification, "streamUidTraffic")
+        val updateStatus = functionBody(serviceNotification, "updateStatus")
+
+        val permissionGate = stream.indexOf("shouldPublishDynamicNotificationUpdate(")
+        val update = stream.indexOf("updateStatus(previous, current)")
+        assertTrue("traffic samples must consult lifecycle, status, and generation gate", permissionGate >= 0)
+        assertTrue(stream.contains("platformStatus = status.value"))
+        assertTrue(stream.contains("gatePermitsUpdate = notificationUpdateGate.permitsUpdate(streamGeneration)"))
+        assertTrue("traffic notification can update only after the gate permits it", update > permissionGate)
+
+        val unchangedContent = updateStatus.indexOf("if (lastDynamicContent == speed) return")
+        val notify = updateStatus.indexOf("Application.notificationManager.notify(")
+        assertTrue("unchanged traffic speeds must not wake NotificationManager", unchangedContent >= 0 && notify > unchangedContent)
     }
 
     private fun sourceFile(name: String): String = sourceFromCandidates(

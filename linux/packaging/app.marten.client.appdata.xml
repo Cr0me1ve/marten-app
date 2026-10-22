@@ -55,9 +55,9 @@
     <mime-type>x-scheme-handler/prizrak-box</mime-type>
   </mime-types>
 
-  <url type="homepage">https://github.com/Cr0me1ve/marten-app</url>
-  <url type="bugtracker">https://github.com/Cr0me1ve/marten-app/issues</url>
-  <url type="help">https://github.com/Cr0me1ve/marten-app</url>
+  <url type="homepage">https://github.com/Cr0me1ve/Marten</url>
+  <url type="bugtracker">https://github.com/Cr0me1ve/Marten/issues</url>
+  <url type="help">https://github.com/Cr0me1ve/Marten</url>
 
   <provides>
     <binary>marten</binary>

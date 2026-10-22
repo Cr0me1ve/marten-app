@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -5,6 +6,7 @@ import 'package:dio/dio.dart';
 import 'package:dio/io.dart';
 import 'package:dio_smart_retry/dio_smart_retry.dart';
 
+import 'package:marten/core/network/strict_vpn_egress_gate.dart';
 import 'package:marten/utils/custom_loggers.dart';
 
 class DioHttpClient with InfraLogger {
@@ -12,7 +14,16 @@ class DioHttpClient with InfraLogger {
   static const maxResponseBytes = 16 * 1024 * 1024;
 
   final Map<String, Dio> _dio = {};
-  DioHttpClient({required Duration timeout, required this.userAgent, required bool debug}) {
+  DioHttpClient({required this.timeout, required this.userAgent, required this.debug}) {
+    strictVpnEgressGate.registerRetirer(this, _retireConnectionPools);
+  }
+
+  final Duration timeout;
+  final bool debug;
+
+  void _ensureConnectionPools() {
+    if (_closed) throw StateError('HTTP client is closed');
+    if (_dio.isNotEmpty) return;
     for (final mode in ["proxy", "direct", "both"]) {
       _dio[mode] = Dio(
         BaseOptions(
@@ -62,6 +73,11 @@ class DioHttpClient with InfraLogger {
   void close({bool force = true}) {
     if (_closed) return;
     _closed = true;
+    strictVpnEgressGate.unregisterRetirer(this);
+    _retireConnectionPools(force: force);
+  }
+
+  void _retireConnectionPools({bool force = true}) {
     for (final dio in _dio.values) {
       dio.close(force: force);
     }
@@ -80,16 +96,13 @@ class DioHttpClient with InfraLogger {
   //     return false;
   //   }
   // }
-  Future<bool> isPortOpen(String host, int port, {Duration timeout = const Duration(seconds: 5)}) async {
-    try {
-      final socket = await Socket.connect(host, port, timeout: timeout);
-      await socket.close();
-      return true;
-    } on SocketException catch (_) {
-      return false;
-    } catch (_) {
-      return false;
-    }
+  Future<bool> isPortOpen(String host, int port, {Duration timeout = const Duration(seconds: 5)}) {
+    final operation = _RetirableNetworkOperation();
+    return strictVpnEgressGate.run(
+      'TCP reachability probe',
+      () => operation.isPortOpen(host, port, timeout: timeout),
+      retire: operation.retire,
+    );
   }
 
   void setProxyPort(int port) {
@@ -104,23 +117,20 @@ class DioHttpClient with InfraLogger {
     ({String username, String password})? credentials,
     Map<String, String>? extraHeaders,
     bool proxyOnly = false,
-  }) async {
-    final mode = proxyOnly
-        ? "proxy"
-        : await isPortOpen("127.0.0.1", port)
-        ? "both"
-        : "direct";
-    final dio = _dio[mode]!;
-
-    return _requestFollowingRedirects<T>(
-      dio,
-      url,
-      method: 'GET',
-      cancelToken: cancelToken,
-      userAgent: userAgent,
-      credentials: credentials,
-      extraHeaders: extraHeaders,
-    );
+  }) {
+    final operation = _RetirableNetworkOperation(cancelToken: cancelToken);
+    return strictVpnEgressGate.run('HTTP GET', () async {
+      final dio = await _clientFor(proxyOnly, operation);
+      return _requestFollowingRedirects<T>(
+        dio,
+        url,
+        method: 'GET',
+        cancelToken: operation.cancelToken,
+        userAgent: userAgent,
+        credentials: credentials,
+        extraHeaders: extraHeaders,
+      );
+    }, retire: operation.retire);
   }
 
   Future<Response<T>> post<T>(
@@ -131,24 +141,21 @@ class DioHttpClient with InfraLogger {
     ({String username, String password})? credentials,
     Map<String, String>? extraHeaders,
     bool proxyOnly = false,
-  }) async {
-    final mode = proxyOnly
-        ? "proxy"
-        : await isPortOpen("127.0.0.1", port)
-        ? "both"
-        : "direct";
-    final dio = _dio[mode]!;
-
-    return _requestFollowingRedirects<T>(
-      dio,
-      url,
-      method: 'POST',
-      data: data,
-      cancelToken: cancelToken,
-      userAgent: userAgent,
-      credentials: credentials,
-      extraHeaders: extraHeaders,
-    );
+  }) {
+    final operation = _RetirableNetworkOperation(cancelToken: cancelToken);
+    return strictVpnEgressGate.run('HTTP POST', () async {
+      final dio = await _clientFor(proxyOnly, operation);
+      return _requestFollowingRedirects<T>(
+        dio,
+        url,
+        method: 'POST',
+        data: data,
+        cancelToken: operation.cancelToken,
+        userAgent: userAgent,
+        credentials: credentials,
+        extraHeaders: extraHeaders,
+      );
+    }, retire: operation.retire);
   }
 
   Future<Response<T>> delete<T>(
@@ -159,24 +166,21 @@ class DioHttpClient with InfraLogger {
     ({String username, String password})? credentials,
     Map<String, String>? extraHeaders,
     bool proxyOnly = false,
-  }) async {
-    final mode = proxyOnly
-        ? "proxy"
-        : await isPortOpen("127.0.0.1", port)
-        ? "both"
-        : "direct";
-    final dio = _dio[mode]!;
-
-    return _requestFollowingRedirects<T>(
-      dio,
-      url,
-      method: 'DELETE',
-      data: data,
-      cancelToken: cancelToken,
-      userAgent: userAgent,
-      credentials: credentials,
-      extraHeaders: extraHeaders,
-    );
+  }) {
+    final operation = _RetirableNetworkOperation(cancelToken: cancelToken);
+    return strictVpnEgressGate.run('HTTP DELETE', () async {
+      final dio = await _clientFor(proxyOnly, operation);
+      return _requestFollowingRedirects<T>(
+        dio,
+        url,
+        method: 'DELETE',
+        data: data,
+        cancelToken: operation.cancelToken,
+        userAgent: userAgent,
+        credentials: credentials,
+        extraHeaders: extraHeaders,
+      );
+    }, retire: operation.retire);
   }
 
   Future<Response> download(
@@ -188,23 +192,40 @@ class DioHttpClient with InfraLogger {
     ({String username, String password})? credentials,
     Map<String, String>? extraHeaders,
     bool proxyOnly = false,
-  }) async {
+  }) {
+    final operation = _RetirableNetworkOperation(cancelToken: cancelToken);
+    return strictVpnEgressGate.run('HTTP download', () async {
+      final dio = await _clientFor(proxyOnly, operation);
+      return _downloadFollowingRedirects(
+        dio,
+        url,
+        path,
+        method: method,
+        cancelToken: operation.cancelToken,
+        userAgent: userAgent,
+        credentials: credentials,
+        extraHeaders: extraHeaders,
+      );
+    }, retire: operation.retire);
+  }
+
+  Future<Dio> _clientFor(bool proxyOnly, _RetirableNetworkOperation operation) async {
+    _ensureConnectionPools();
     final mode = proxyOnly
         ? "proxy"
-        : await isPortOpen("127.0.0.1", port)
+        : await operation.isPortOpen("127.0.0.1", port, timeout: const Duration(seconds: 5))
         ? "both"
         : "direct";
-    final dio = _dio[mode]!;
-    return _downloadFollowingRedirects(
-      dio,
-      url,
-      path,
-      method: method,
-      cancelToken: cancelToken,
-      userAgent: userAgent,
-      credentials: credentials,
-      extraHeaders: extraHeaders,
-    );
+    operation.throwIfRetired();
+    final client = _dio[mode];
+    if (client == null) {
+      if (strictVpnEgressGate.isSealed) {
+        operation.retire();
+        operation.throwIfRetired();
+      }
+      throw StateError('HTTP connection pool retired during active request');
+    }
+    return client;
   }
 
   Future<Response<T>> _requestFollowingRedirects<T>(
@@ -280,7 +301,7 @@ class DioHttpClient with InfraLogger {
             credentials: allowSensitiveHeaders ? credentials : null,
             extraHeaders: redirectHeaders(extraHeaders, allowSensitive: allowSensitiveHeaders),
             allowUrlUserInfo: allowSensitiveHeaders,
-          ),
+          )..disableRetry = true,
         );
         final next = _nextRedirect(response, currentUri, redirectCount);
         if (next == null) {
@@ -369,6 +390,79 @@ class DioHttpClient with InfraLogger {
         ...?extraHeaders,
       },
     );
+  }
+}
+
+/// Owns every cancellable resource used by one admitted ordinary-network
+/// operation. Sealing the strict VPN boundary retires the exact request and
+/// its proxy reachability probe before waiting for the operation to settle.
+final class _RetirableNetworkOperation {
+  _RetirableNetworkOperation({CancelToken? cancelToken}) : cancelToken = cancelToken ?? CancelToken() {
+    cancelToken?.whenCancel.then((_) => _retireTransport());
+  }
+
+  final CancelToken cancelToken;
+  ConnectionTask<Socket>? _connectTask;
+  Socket? _socket;
+  bool _retired = false;
+
+  void throwIfRetired() {
+    if (!_retired && !cancelToken.isCancelled) return;
+    if (!cancelToken.isCancelled) {
+      cancelToken.cancel('ordinary network operation retired for VPN transition');
+    }
+    throw cancelToken.cancelError!;
+  }
+
+  void retire() {
+    if (_retired) return;
+    _retired = true;
+    _retireTransport();
+    if (!cancelToken.isCancelled) {
+      cancelToken.cancel('ordinary network operation retired for VPN transition');
+    }
+  }
+
+  void _retireTransport() {
+    _connectTask?.cancel();
+    _connectTask = null;
+    _socket?.destroy();
+    _socket = null;
+  }
+
+  Future<bool> isPortOpen(String host, int port, {required Duration timeout}) async {
+    if (_retired || cancelToken.isCancelled) return false;
+    try {
+      final task = await Socket.startConnect(host, port);
+      _connectTask = task;
+      if (_retired || cancelToken.isCancelled) {
+        task.cancel();
+        return false;
+      }
+      final socket = await task.socket.timeout(
+        timeout,
+        onTimeout: () {
+          task.cancel();
+          throw TimeoutException('TCP reachability probe timed out');
+        },
+      );
+      _connectTask = null;
+      _socket = socket;
+      if (_retired || cancelToken.isCancelled) return false;
+      await socket.close();
+      _socket = null;
+      return true;
+    } on SocketException catch (_) {
+      return false;
+    } on TimeoutException catch (_) {
+      return false;
+    } catch (_) {
+      return false;
+    } finally {
+      _connectTask = null;
+      _socket?.destroy();
+      _socket = null;
+    }
   }
 }
 

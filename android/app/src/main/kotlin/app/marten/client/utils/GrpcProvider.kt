@@ -58,10 +58,31 @@ object GrpcClientProvider {
             .build()
     }
 
+    private fun streamingGrpcClient(connectTimeoutMillis: Long): GrpcClient {
+        val client = OkHttpClient.Builder()
+            .protocols(listOf(Protocol.H2_PRIOR_KNOWLEDGE))
+            // A service-owned LogListener is intentionally open for the whole
+            // VPN generation. Only connect and write establishment are
+            // bounded; BoxService cancels the exact call during teardown.
+            .callTimeout(0L, TimeUnit.MILLISECONDS)
+            .connectTimeout(connectTimeoutMillis, TimeUnit.MILLISECONDS)
+            .readTimeout(0L, TimeUnit.MILLISECONDS)
+            .writeTimeout(connectTimeoutMillis, TimeUnit.MILLISECONDS)
+            .build()
+        return GrpcClient.Builder()
+            .client(client)
+            .baseUrl("http://127.0.0.1:${Settings.grpcServiceModePort}")
+            .build()
+    }
+
     val grpcClient: GrpcClient = grpcClient(10_000L)
 
     fun coreClient(timeoutMillis: Long = 10_000L): CoreClient {
         return grpcClient(timeoutMillis).create(CoreClient::class)
+    }
+
+    fun streamingCoreClient(connectTimeoutMillis: Long = 10_000L): CoreClient {
+        return streamingGrpcClient(connectTimeoutMillis).create(CoreClient::class)
     }
 
 

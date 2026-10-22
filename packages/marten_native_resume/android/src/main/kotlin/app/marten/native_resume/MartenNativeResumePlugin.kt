@@ -2,6 +2,7 @@ package app.marten.native_resume
 
 import android.os.Handler
 import android.os.Looper
+import app.marten.core.mobile.Mobile
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -14,6 +15,7 @@ class MartenNativeResumePlugin : FlutterPlugin, MethodChannel.MethodCallHandler 
 
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         this.binding = binding
+        HeadlessCaptchaWebView.initializeDiagnostics(binding.applicationContext)
         channel = MethodChannel(binding.binaryMessenger, CHANNEL_NAME).also {
             it.setMethodCallHandler(this)
         }
@@ -30,6 +32,32 @@ class MartenNativeResumePlugin : FlutterPlugin, MethodChannel.MethodCallHandler 
             ?: return result.error("detached", "native resume bridge is detached", null)
 
         when (call.method) {
+            "canonicalizeSubscription" -> {
+                val arguments = call.arguments as? Map<*, *>
+                    ?: return result.error("invalid_arguments", "missing subscription arguments", null)
+                val content = arguments["content"] as? String
+                    ?: return result.error("invalid_arguments", "missing subscription content", null)
+                val settingsJson = arguments["settingsJson"] as? String
+                    ?: return result.error("invalid_arguments", "missing subscription settings", null)
+                executor.execute {
+                    val outcome = runCatching {
+                        Mobile.canonicalizeSubscription(content, settingsJson)
+                    }
+                    mainHandler.post {
+                        outcome.onSuccess(result::success).onFailure {
+                            // Never include the candidate or native exception text:
+                            // subscription data can contain private endpoints and credentials.
+                            result.error(
+                                "subscription_canonicalization_failed",
+                                "subscription candidate is not usable",
+                                null,
+                            )
+                        }
+                    }
+                }
+                return
+            }
+
             "loadHeadlessCaptcha" -> {
                 val arguments = call.arguments as? Map<*, *>
                     ?: return result.error("invalid_arguments", "missing headless captcha arguments", null)
@@ -37,10 +65,11 @@ class MartenNativeResumePlugin : FlutterPlugin, MethodChannel.MethodCallHandler 
                     ?: return result.error("invalid_arguments", "missing headless captcha URL", null)
                 val automationScript = arguments["automationScript"] as? String
                     ?: return result.error("invalid_arguments", "missing headless captcha automation", null)
+                val revision = (arguments["revision"] as? Number)?.toLong()
+                    ?: return result.error("invalid_arguments", "missing headless captcha revision", null)
                 mainHandler.post {
                     runCatching {
-                        HeadlessCaptchaWebView.load(context, url, automationScript)
-                        true
+                        HeadlessCaptchaWebView.load(context, url, automationScript, revision)
                     }.onSuccess(result::success).onFailure {
                         result.error("headless_captcha_failed", it.message, null)
                     }
@@ -49,10 +78,13 @@ class MartenNativeResumePlugin : FlutterPlugin, MethodChannel.MethodCallHandler 
             }
 
             "clearHeadlessCaptcha" -> {
+                val arguments = call.arguments as? Map<*, *>
+                    ?: return result.error("invalid_arguments", "missing headless captcha clear arguments", null)
+                val revision = (arguments["revision"] as? Number)?.toLong()
+                    ?: return result.error("invalid_arguments", "missing headless captcha revision", null)
                 mainHandler.post {
                     runCatching {
-                        HeadlessCaptchaWebView.clear()
-                        true
+                        HeadlessCaptchaWebView.clear(revision)
                     }.onSuccess(result::success).onFailure {
                         result.error("headless_captcha_failed", it.message, null)
                     }

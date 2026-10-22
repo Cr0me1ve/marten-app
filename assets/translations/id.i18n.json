@@ -589,7 +589,8 @@
       "notFound": "Profil tidak ditemukan",
       "invalidConfig": "Konfigurasi tidak valid",
       "invalidUrl": "URL tidak valid",
-      "canceledByUser": "Dibatalkan oleh pengguna"
+      "canceledByUser": "Dibatalkan oleh pengguna",
+      "deviceLimit": "Batas perangkat untuk langganan ini telah tercapai"
     },
     "connectivity": {
       "unexpected": "Kegagalan tak terduga",

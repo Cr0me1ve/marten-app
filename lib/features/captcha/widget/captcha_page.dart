@@ -3,17 +3,16 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
-import 'package:marten/features/captcha/data/captcha_event.dart';
 import 'package:marten/features/captcha/data/captcha_notifier.dart';
 import 'package:marten/utils/custom_loggers.dart';
 import 'package:marten/utils/platform_utils.dart';
-import 'package:marten_native_resume/marten_native_resume.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:webview_windows/webview_windows.dart' as win_webview;
 
 const _captchaAutomationRevealDelay = Duration(seconds: 30);
 const _captchaAutomationChannel = 'MartenCaptchaAutomation';
 const _captchaWindowsLoadWatchdogDelay = Duration(seconds: 8);
+const _captchaLifecycleMarker = 'MARTEN_CAPTCHA_LIFECYCLE';
 const _captchaAutomationDiagnosticEvents = <String>{
   'monitor-installed',
   'driver-installed',
@@ -372,7 +371,7 @@ const _captchaAutomationScript = '''
     var phase = 'idle';
     var firedAt = 0;
     var retries = readRetryCount();
-    var maxRetries = 1;
+    var maxRetries = window.__martenCaptchaHostReplayUsed ? 0 : 1;
     var lastPowDiagnostic = '';
 
     function powDiagnosticState() {
@@ -490,18 +489,15 @@ class CaptchaPage extends ConsumerStatefulWidget {
   const CaptchaPage({
     super.key,
     required this.url,
+    this.revision = 0,
     this.revealDelay = Duration.zero,
     this.background = false,
-    this.persistentBackgroundRunner = false,
-  }) : assert(!persistentBackgroundRunner || background);
+  });
 
   final String url;
+  final int revision;
   final Duration revealDelay;
   final bool background;
-
-  /// Keeps one already-mounted Android WebView ready to receive replayable
-  /// CAPTCHA events while Flutter is paused behind another application.
-  final bool persistentBackgroundRunner;
 
   @override
   ConsumerState<CaptchaPage> createState() => _CaptchaPageState();
@@ -511,8 +507,8 @@ class _CaptchaPageState extends ConsumerState<CaptchaPage> with InfraLogger {
   WebViewController? _controller;
   win_webview.WebviewController? _windowsController;
   final List<StreamSubscription<dynamic>> _windowsSubscriptions = [];
-  ProviderSubscription<CaptchaEvent?>? _persistentCaptchaSubscription;
   String _resolvedUrl = 'about:blank';
+  int _resolvedRevision = 0;
   Timer? _revealTimer;
   Timer? _windowsLoadWatchdog;
   bool _loading = true;
@@ -541,9 +537,14 @@ class _CaptchaPageState extends ConsumerState<CaptchaPage> with InfraLogger {
     // original localhost origin because TURNcoat's injected captcha JS expects
     // http://localhost:8765 when rewriting proxied requests.
     _resolvedUrl = _resolveUrl(widget.url);
+    _resolvedRevision = widget.revision;
     loggy.info(
       'captcha page loading webview=${_useWindowsWebView ? 'windows' : 'mobile'} '
       'background=${widget.background} delayedReveal=${!_revealed}',
+    );
+    loggy.info(
+      '$_captchaLifecycleMarker event=load revision=$_resolvedRevision outcome=page_initialized '
+      'background=${widget.background}',
     );
 
     if (_useWindowsWebView) {
@@ -561,6 +562,10 @@ class _CaptchaPageState extends ConsumerState<CaptchaPage> with InfraLogger {
         NavigationDelegate(
           onPageStarted: (url) {
             loggy.info('captcha page started background=${widget.background}');
+            loggy.info(
+              '$_captchaLifecycleMarker event=load revision=$_resolvedRevision outcome=page_started '
+              'background=${widget.background}',
+            );
             // Android may postpone onPageFinished indefinitely when Marten is
             // behind another app even though the local proxy already returned
             // the CAPTCHA HTML. Install against the new document as soon as
@@ -576,6 +581,10 @@ class _CaptchaPageState extends ConsumerState<CaptchaPage> with InfraLogger {
           },
           onPageFinished: (url) {
             loggy.info('captcha page finished background=${widget.background}');
+            loggy.info(
+              '$_captchaLifecycleMarker event=load revision=$_resolvedRevision outcome=page_finished '
+              'background=${widget.background}',
+            );
             unawaited(_installAutomationMonitor());
             if (mounted) setState(() => _loading = false);
           },
@@ -602,24 +611,10 @@ class _CaptchaPageState extends ConsumerState<CaptchaPage> with InfraLogger {
         ),
       )
       ..loadRequest(Uri.parse(_resolvedUrl));
-
-    if (widget.persistentBackgroundRunner) {
-      _persistentCaptchaSubscription = ref.listenManual<CaptchaEvent?>(captchaNotifierProvider, (previous, next) {
-        final nextUrl = next?.url;
-        if (nextUrl != null && _isBackgroundChallenge(nextUrl)) {
-          unawaited(_loadPersistentBackgroundUrl(nextUrl));
-          return;
-        }
-        if (next == null && _resolvedUrl != 'about:blank') {
-          unawaited(_loadPersistentBackgroundUrl('about:blank'));
-        }
-      }, fireImmediately: true);
-    }
   }
 
   @override
   void dispose() {
-    _persistentCaptchaSubscription?.close();
     _revealTimer?.cancel();
     _windowsLoadWatchdog?.cancel();
     for (final subscription in _windowsSubscriptions) {
@@ -635,50 +630,6 @@ class _CaptchaPageState extends ConsumerState<CaptchaPage> with InfraLogger {
   String _resolveUrl(String url) {
     if (_useWindowsWebView) return url;
     return url.replaceFirst(RegExp('^http://localhost:'), 'http://127.0.0.1:');
-  }
-
-  bool _isBackgroundChallenge(String url) => Uri.tryParse(url)?.queryParameters['blank'] == '1';
-
-  Future<void> _loadPersistentBackgroundUrl(String url) async {
-    final resolvedUrl = _resolveUrl(url);
-    if (_resolvedUrl == resolvedUrl) {
-      loggy.info('captcha persistent runner: challenge already loaded');
-      return;
-    }
-    _resolvedUrl = resolvedUrl;
-    _automationSignalSeen = false;
-    _errorMessage = null;
-    _loading = resolvedUrl != 'about:blank';
-    loggy.info('captcha persistent runner: loading challenge=${resolvedUrl != 'about:blank'}');
-
-    if (PlatformUtils.isAndroid) {
-      var nativeAccepted = false;
-      try {
-        nativeAccepted = resolvedUrl == 'about:blank'
-            ? await MartenNativeResume.clearHeadlessCaptcha()
-            : await MartenNativeResume.loadHeadlessCaptcha(
-                url: resolvedUrl,
-                automationScript: _captchaAutomationScript,
-              );
-        if (!nativeAccepted) loggy.warning('captcha native headless runner rejected navigation');
-      } catch (_) {
-        // The platform error may embed a private challenge URL. Keep the log
-        // fixed and let the still-mounted Flutter WebView remain a foreground
-        // fallback rather than exposing exception contents.
-        loggy.warning('captcha native headless runner navigation failed');
-      }
-      if (nativeAccepted) return;
-    }
-
-    final controller = _controller;
-    if (controller == null || !mounted) return;
-    try {
-      await controller.loadRequest(Uri.parse(resolvedUrl));
-    } catch (_) {
-      // Do not include the platform exception: some WebView implementations
-      // embed the challenge URL in it, and provider URLs are private.
-      loggy.warning('captcha persistent runner navigation failed');
-    }
   }
 
   void _scheduleReveal(Duration delay) {
@@ -706,6 +657,10 @@ class _CaptchaPageState extends ConsumerState<CaptchaPage> with InfraLogger {
     loggy.info(
       'captcha automation event=$event first=$firstSignal '
       'revealed=$_revealed background=${widget.background}',
+    );
+    loggy.info(
+      '$_captchaLifecycleMarker event=automation revision=$_resolvedRevision outcome=$event '
+      'first=$firstSignal background=${widget.background}',
     );
     if (!_revealed && !widget.background && _captchaAutomationImmediateRevealEvents.contains(event)) {
       _revealTimer?.cancel();
@@ -994,6 +949,11 @@ class _CaptchaPageState extends ConsumerState<CaptchaPage> with InfraLogger {
   }
 
   Widget _buildHiddenBackgroundWebView(Widget child) {
+    if (PlatformUtils.isIOS) {
+      // The listener places an opaque app surface above this painted view.
+      // Removing it from painting can pause WKWebView's bounded JS timers.
+      return SizedBox.expand(child: child);
+    }
     // Keep the full viewport for captcha JS/layout, but paint it fully hidden
     // so the provider page cannot ghost over Marten while auto-solving.
     return IgnorePointer(

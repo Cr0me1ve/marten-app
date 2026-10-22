@@ -92,12 +92,16 @@ private class FakeServiceContext(
     var bindCalls = 0
     var unbindCalls = 0
     var lastIntent: Intent? = null
+    var throwOnBind: RuntimeException? = null
+    val capturedConnections = mutableListOf<AndroidServiceConnection>()
 
     override fun getSharedPreferences(name: String, mode: Int): SharedPreferences = testSharedPreferences
 
     override fun bindService(service: Intent, conn: AndroidServiceConnection, flags: Int): Boolean {
         bindCalls += 1
         lastIntent = service
+        capturedConnections += conn
+        throwOnBind?.let { throw it }
         if (bindResult) {
             connectNow?.invoke(conn)
         }
@@ -123,9 +127,14 @@ private class NoopServiceCallback : ServiceConnection.Callback {
 
 private class RecordingServiceCallback : ServiceConnection.Callback {
     val statuses = mutableListOf<Status>()
+    var bindingFailures = 0
 
     override fun onServiceStatusChanged(status: Status) {
         statuses += status
+    }
+
+    override fun onServiceBindingFailed() {
+        bindingFailures += 1
     }
 }
 
@@ -259,4 +268,41 @@ class ServiceConnectionTest {
         assertEquals(2, context.bindCalls)
         assertEquals(Status.Started, connection.currentStatus)
     }
+
+    @Test
+    fun `rejected and throwing binds report one failure each and stale callbacks cannot satisfy retry`() =
+        withFakeSettingsPrefs { context ->
+            val callback = RecordingServiceCallback()
+            val connection = ServiceConnection(context, callback)
+
+            context.bindResult = false
+            assertEquals(false, connection.connect())
+            assertEquals(1, callback.bindingFailures)
+            assertNull(connection.currentStatus)
+            val rejectedAttempt = context.capturedConnections.single()
+
+            context.bindResult = true
+            context.throwOnBind = IllegalStateException("system service rejected the bind")
+            assertEquals(false, connection.connect())
+            assertEquals(2, callback.bindingFailures)
+            assertNull(connection.currentStatus)
+            val throwingAttempt = context.capturedConnections.last()
+
+            context.throwOnBind = null
+            assertEquals(true, connection.connect())
+            assertEquals(3, context.capturedConnections.size)
+            val retryAttempt = context.capturedConnections.last()
+            val service = RecordingService(Status.Started)
+            val component = ComponentName(context, service.javaClass)
+
+            rejectedAttempt.onServiceConnected(component, service.asBinder())
+            throwingAttempt.onServiceConnected(component, service.asBinder())
+            assertEquals(emptyList<Status>(), callback.statuses)
+            assertNull(connection.currentStatus)
+
+            retryAttempt.onServiceConnected(component, service.asBinder())
+            assertEquals(listOf(Status.Started), callback.statuses)
+            assertEquals(Status.Started, connection.currentStatus)
+            assertEquals(2, callback.bindingFailures)
+        }
 }

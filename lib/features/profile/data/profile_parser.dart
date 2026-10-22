@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -5,6 +6,7 @@ import 'package:dartx/dartx.dart';
 import 'package:dio/dio.dart';
 import 'package:fpdart/fpdart.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
+import 'package:marten/core/crypto/profile_crypto.dart';
 import 'package:marten/core/crypto/subscription_envelope.dart';
 import 'package:marten/core/db/db.dart';
 import 'package:marten/core/device/device_identity.dart';
@@ -13,6 +15,7 @@ import 'package:marten/features/profile/data/profile_data_mapper.dart';
 import 'package:marten/features/profile/data/profile_refresh_diagnostics.dart';
 import 'package:marten/features/profile/data/subscription_compatibility.dart';
 import 'package:marten/features/profile/data/subscription_content_adapter.dart';
+import 'package:marten/features/profile/data/subscription_download_budget.dart';
 import 'package:marten/features/profile/model/profile_entity.dart';
 import 'package:marten/features/profile/model/profile_failure.dart';
 import 'package:marten/features/settings/data/config_option_repository.dart';
@@ -121,7 +124,15 @@ class ProfileParser with InfraLogger {
   final Ref _ref;
   final DioHttpClient _httpClient;
 
-  ProfileParser({required Ref ref, required DioHttpClient httpClient}) : _ref = ref, _httpClient = httpClient;
+  ProfileParser({
+    required Ref ref,
+    required DioHttpClient httpClient,
+    Duration downloadTimeout = const Duration(seconds: 30),
+  }) : _ref = ref,
+       _httpClient = httpClient,
+       _downloadTimeout = downloadTimeout;
+
+  final Duration _downloadTimeout;
 
   @visibleForTesting
   static bool isUnsupportedClientSubscription(String content) {
@@ -143,32 +154,41 @@ class ProfileParser with InfraLogger {
     required String tempFilePath,
     required UserOverride? userOverride,
     bool active = true,
-  }) {
-    return TaskEither.tryCatch(() async {
-          await expandRemoteLinesInParallel(
-            tempFilePath: tempFilePath,
-            httpClient: _httpClient,
-            cancelToken: CancelToken(),
-            ref: _ref,
-          );
-        }, (error, stackTrace) => error is ProfileFailure ? error : ProfileFailure.unexpected(error, stackTrace))
-        .flatMap((_) => TaskEither.fromEither(populateHeaders(content: content)))
-        .flatMap(
-          (populatedHeaders) => TaskEither.fromEither(
-            parse(
-              tempFilePath: tempFilePath,
-              profile: ProfileEntity.local(
-                id: id,
-                active: active,
-                name: '',
-                lastUpdate: DateTime.now(),
-                userOverride: userOverride,
-                populatedHeaders: populatedHeaders,
-              ),
-            ).flatMap((profEntity) => Either.tryCatch(() => profEntity.toInsertEntry(), ProfileFailure.unexpected)),
-          ),
+    CancelToken? cancelToken,
+  }) => TaskEither.tryCatch(
+    () async {
+      final budget = SubscriptionDownloadBudget(timeout: _downloadTimeout, parent: cancelToken);
+      try {
+        await expandRemoteLinesInParallel(
+          tempFilePath: tempFilePath,
+          httpClient: _httpClient,
+          cancelToken: budget.cancelToken,
+          ref: _ref,
+          budget: budget,
         );
-  }
+        budget.check();
+        final headers = populateHeaders(content: content).getOrElse((failure) => throw failure);
+        return parse(
+          tempFilePath: tempFilePath,
+          profile: ProfileEntity.local(
+            id: id,
+            active: active,
+            name: '',
+            lastUpdate: DateTime.now(),
+            userOverride: userOverride,
+            populatedHeaders: headers,
+          ),
+        ).getOrElse((failure) => throw failure).toInsertEntry();
+      } finally {
+        budget.dispose();
+      }
+    },
+    (error, stackTrace) => error is ProfileFailure
+        ? error
+        : error is DioException && CancelToken.isCancel(error)
+        ? const ProfileFailure.cancelByUser()
+        : ProfileFailure.unexpected(error, stackTrace),
+  );
 
   TaskEither<ProfileFailure, ProfileEntriesCompanion> addRemote({
     required String id,
@@ -251,208 +271,254 @@ class ProfileParser with InfraLogger {
       'X-Marten-Capabilities': 'icmp-v1',
     };
 
-    Future<Response> download(
-      String targetUrl, {
-      String method = 'GET',
-      String? compatibilityUserAgent,
-      Map<String, String> compatibilityHeaders = const {},
-    }) {
-      return _httpClient.download(
-        targetUrl,
-        tempFilePath,
-        method: method,
-        cancelToken: cancelToken,
-        userAgent: compatibilityUserAgent ?? userAgent,
-        extraHeaders: compatibilityUserAgent == null ? extraHeaders : compatibilityHeaders,
-      );
-    }
-
-    final candidates = refresh ? subscriptionCandidateUrls(requestUrl, profile: profile) : [requestUrl];
-    loggy.debug('subscription_download phase=start refresh=$refresh candidate_count=${candidates.length}');
-    Object? lastError;
-    Response? rs;
-    String successfulUrl = requestUrl;
-
-    for (var candidateIndex = 0; candidateIndex < candidates.length; candidateIndex++) {
-      final candidate = candidates[candidateIndex];
-      final attemptIndex = candidateIndex + 1;
-      final refreshUrl = refreshUrlFor(candidate);
-      final useRefreshEndpoint = refresh && refreshUrl != null;
-      final primaryMethod = useRefreshEndpoint ? 'refresh_post' : 'canonical_get';
-      _logDownloadAttempt(
-        phase: 'attempt',
-        candidateIndex: attemptIndex,
-        candidateCount: candidates.length,
-        method: primaryMethod,
-      );
-      try {
-        rs = await download(
-          useRefreshEndpoint ? refreshUrl.toString() : candidate,
-          method: useRefreshEndpoint ? 'POST' : 'GET',
+    final budget = SubscriptionDownloadBudget(timeout: _downloadTimeout, parent: cancelToken);
+    var downloadIndex = 0;
+    try {
+      Future<Response> download(
+        String targetUrl, {
+        String method = 'GET',
+        String? compatibilityUserAgent,
+        Map<String, String> compatibilityHeaders = const {},
+      }) async {
+        budget.check();
+        // A late response from a cancelled request must never write into the
+        // next refresh's transaction file.
+        final scratch = File('$tempFilePath.download-${DateTime.now().microsecondsSinceEpoch}-${downloadIndex++}');
+        var promoted = false;
+        final request = _httpClient.download(
+          targetUrl,
+          scratch.path,
+          method: method,
+          cancelToken: budget.cancelToken,
+          userAgent: compatibilityUserAgent ?? userAgent,
+          extraHeaders: compatibilityUserAgent == null ? extraHeaders : compatibilityHeaders,
         );
-        successfulUrl = candidate;
-        _logDownloadAttempt(
-          phase: 'success',
-          candidateIndex: attemptIndex,
-          candidateCount: candidates.length,
-          method: primaryMethod,
-        );
-        break;
-      } catch (err) {
-        _logDownloadFailure(
-          phase: 'failure',
-          candidateIndex: attemptIndex,
-          candidateCount: candidates.length,
-          method: primaryMethod,
-          error: err,
-        );
-        final martenRedirectTarget = martenImportRedirectTargetFromError(err) ?? martenImportDownloadTarget(candidate);
-        if (martenRedirectTarget != null) {
-          _logDownloadFallback(
-            candidateIndex: attemptIndex,
-            candidateCount: candidates.length,
-            fallback: 'import_redirect_get',
-          );
+        Future<void> cleanup() async {
+          if (promoted) return;
           try {
-            rs = await download(martenRedirectTarget);
-            successfulUrl = martenRedirectTarget;
-            _logDownloadAttempt(
-              phase: 'success',
-              candidateIndex: attemptIndex,
-              candidateCount: candidates.length,
-              method: 'import_redirect_get',
-            );
-            break;
-          } catch (redirectErr) {
-            _logDownloadFailure(
-              phase: 'fallback_failure',
-              candidateIndex: attemptIndex,
-              candidateCount: candidates.length,
-              method: 'import_redirect_get',
-              error: redirectErr,
-            );
-            lastError = redirectErr;
+            await scratch.delete();
+          } on FileSystemException catch (error) {
+            if (!ProfileCrypto.isMissingFileError(error)) rethrow;
           }
-        } else if (useRefreshEndpoint && _shouldFallbackFromRefresh(err)) {
-          _logDownloadFallback(
-            candidateIndex: attemptIndex,
-            candidateCount: candidates.length,
-            fallback: 'canonical_get',
+        }
+
+        try {
+          final response = await budget.run(() => request);
+          budget.check();
+          await scratch.rename(tempFilePath);
+          promoted = true;
+          return response;
+        } finally {
+          // Observe a transport that completes after cancellation and clean only
+          // its private scratch file, never the canonical/transaction file.
+          unawaited(
+            request
+                .then((_) => cleanup(), onError: (Object error, StackTrace stackTrace) => cleanup())
+                .catchError((Object _) {}),
           );
-          try {
-            rs = await download(candidate);
-            successfulUrl = candidate;
-            _logDownloadAttempt(
-              phase: 'success',
-              candidateIndex: attemptIndex,
-              candidateCount: candidates.length,
-              method: 'canonical_get',
-            );
-            break;
-          } catch (fallbackErr) {
-            _logDownloadFailure(
-              phase: 'fallback_failure',
-              candidateIndex: attemptIndex,
-              candidateCount: candidates.length,
-              method: 'canonical_get',
-              error: fallbackErr,
-            );
-            lastError = fallbackErr;
-          }
-        } else {
-          lastError = err;
+          await cleanup();
         }
-        final errToThrow = lastError;
-        if (!_isRetryableEndpointFailure(errToThrow)) {
-          _throwDownloadFailure(errToThrow);
-        }
-        loggy.debug(
-          'subscription_download phase=rotate candidate_index=$attemptIndex '
-          'candidate_count=${candidates.length} has_next=${attemptIndex < candidates.length}',
-        );
       }
-    }
-    if (rs == null) {
-      loggy.debug('subscription_download phase=exhausted candidate_count=${candidates.length}');
-      _throwDownloadFailure(lastError ?? StateError('subscription download failed'));
-    }
-    var selectedResponse = rs;
 
-    var rawContent = await File(tempFilePath).readAsString();
-    if (!SubscriptionEnvelope.isEnvelope(rawContent) && isUnsupportedClientSubscription(rawContent)) {
-      var acceptedCompatibilityResponse = false;
-      final compatibilityAttempts = await SubscriptionCompatibility.attempts();
+      final candidates = refresh ? subscriptionCandidateUrls(requestUrl, profile: profile) : [requestUrl];
+      loggy.debug('subscription_download phase=start refresh=$refresh candidate_count=${candidates.length}');
+      Object? lastError;
+      Response? rs;
+      String successfulUrl = requestUrl;
 
-      for (var index = 0; index < compatibilityAttempts.length; index++) {
-        final compatibility = compatibilityAttempts[index];
-        loggy.debug(
-          'subscription_download phase=compatibility_fallback '
-          'attempt=${index + 1} total=${compatibilityAttempts.length}',
+      for (var candidateIndex = 0; candidateIndex < candidates.length; candidateIndex++) {
+        final candidate = candidates[candidateIndex];
+        final attemptIndex = candidateIndex + 1;
+        final refreshUrl = refreshUrlFor(candidate);
+        final useRefreshEndpoint = refresh && refreshUrl != null;
+        final primaryMethod = useRefreshEndpoint ? 'refresh_post' : 'canonical_get';
+        _logDownloadAttempt(
+          phase: 'attempt',
+          candidateIndex: attemptIndex,
+          candidateCount: candidates.length,
+          method: primaryMethod,
         );
         try {
-          final candidateResponse = await download(
-            successfulUrl,
-            compatibilityUserAgent: compatibility.userAgent,
-            compatibilityHeaders: compatibility.headers,
+          rs = await download(
+            useRefreshEndpoint ? refreshUrl.toString() : candidate,
+            method: useRefreshEndpoint ? 'POST' : 'GET',
           );
-          final candidateContent = await File(tempFilePath).readAsString();
-          final isEnvelope = SubscriptionEnvelope.isEnvelope(candidateContent);
-          final isUnsupported = isUnsupportedClientSubscription(candidateContent);
-          loggy.info(
-            'subscription_download phase=compatibility_fallback_result '
-            'attempt=${index + 1} bytes=${utf8.encode(candidateContent).length} '
-            'classification=${isEnvelope ? 'envelope' : (isUnsupported ? 'unsupported' : 'compatible')}',
+          successfulUrl = candidate;
+          _logDownloadAttempt(
+            phase: 'success',
+            candidateIndex: attemptIndex,
+            candidateCount: candidates.length,
+            method: primaryMethod,
           );
-          if (isEnvelope || !isUnsupported) {
-            selectedResponse = candidateResponse;
-            rawContent = candidateContent;
-            acceptedCompatibilityResponse = true;
-            break;
+          break;
+        } catch (err) {
+          _logDownloadFailure(
+            phase: 'failure',
+            candidateIndex: attemptIndex,
+            candidateCount: candidates.length,
+            method: primaryMethod,
+            error: err,
+          );
+          final martenRedirectTarget =
+              martenImportRedirectTargetFromError(err) ?? martenImportDownloadTarget(candidate);
+          if (martenRedirectTarget != null) {
+            _logDownloadFallback(
+              candidateIndex: attemptIndex,
+              candidateCount: candidates.length,
+              fallback: 'import_redirect_get',
+            );
+            try {
+              rs = await download(martenRedirectTarget);
+              successfulUrl = martenRedirectTarget;
+              _logDownloadAttempt(
+                phase: 'success',
+                candidateIndex: attemptIndex,
+                candidateCount: candidates.length,
+                method: 'import_redirect_get',
+              );
+              break;
+            } catch (redirectErr) {
+              _logDownloadFailure(
+                phase: 'fallback_failure',
+                candidateIndex: attemptIndex,
+                candidateCount: candidates.length,
+                method: 'import_redirect_get',
+                error: redirectErr,
+              );
+              lastError = redirectErr;
+            }
+          } else if (useRefreshEndpoint && _shouldFallbackFromRefresh(err)) {
+            _logDownloadFallback(
+              candidateIndex: attemptIndex,
+              candidateCount: candidates.length,
+              fallback: 'canonical_get',
+            );
+            try {
+              rs = await download(candidate);
+              successfulUrl = candidate;
+              _logDownloadAttempt(
+                phase: 'success',
+                candidateIndex: attemptIndex,
+                candidateCount: candidates.length,
+                method: 'canonical_get',
+              );
+              break;
+            } catch (fallbackErr) {
+              _logDownloadFailure(
+                phase: 'fallback_failure',
+                candidateIndex: attemptIndex,
+                candidateCount: candidates.length,
+                method: 'canonical_get',
+                error: fallbackErr,
+              );
+              lastError = fallbackErr;
+            }
+          } else {
+            lastError = err;
           }
-        } catch (error) {
-          final diagnostic = profileRefreshUnexpectedErrorDiagnostic(error);
-          loggy.info(
-            'subscription_download phase=compatibility_fallback_failure '
-            'attempt=${index + 1} error_type=${diagnostic.errorType} '
-            'runtime_type=${error.runtimeType}',
+          final errToThrow = lastError;
+          if (!_isRetryableEndpointFailure(errToThrow)) {
+            _throwDownloadFailure(errToThrow);
+          }
+          loggy.debug(
+            'subscription_download phase=rotate candidate_index=$attemptIndex '
+            'candidate_count=${candidates.length} has_next=${attemptIndex < candidates.length}',
           );
         }
       }
-
-      if (!acceptedCompatibilityResponse) {
-        throw const ProfileFailure.invalidConfig('subscription server returned no supported client representation');
+      if (rs == null) {
+        loggy.debug('subscription_download phase=exhausted candidate_count=${candidates.length}');
+        _throwDownloadFailure(lastError ?? StateError('subscription download failed'));
       }
-    }
+      var selectedResponse = rs;
 
-    // decrypt envelope if the server sent one
-    if (SubscriptionEnvelope.isEnvelope(rawContent)) {
-      final serverDeviceSecret = selectedResponse.headers.value('x-device-secret') ?? '';
-      final plaintext = await SubscriptionEnvelope.decrypt(rawContent, serverDeviceSecret, deviceIdentity.clientSecret);
-      await File(tempFilePath).writeAsString(plaintext);
-    }
+      var rawContent = await File(tempFilePath).readAsString();
+      if (!SubscriptionEnvelope.isEnvelope(rawContent) && isUnsupportedClientSubscription(rawContent)) {
+        var acceptedCompatibilityResponse = false;
+        final compatibilityAttempts = await SubscriptionCompatibility.attempts();
 
-    await expandRemoteLinesInParallel(
-      tempFilePath: tempFilePath,
-      httpClient: _httpClient,
-      cancelToken: cancelToken ?? CancelToken(),
-      ref: _ref,
-    );
-    final expandedContent = await File(tempFilePath).readAsString();
-    final normalizedContent = SubscriptionContentAdapter.normalize(expandedContent);
-    if (normalizedContent != expandedContent) {
-      await File(tempFilePath).writeAsString(normalizedContent, flush: true);
+        for (var index = 0; index < compatibilityAttempts.length; index++) {
+          final compatibility = compatibilityAttempts[index];
+          loggy.debug(
+            'subscription_download phase=compatibility_fallback '
+            'attempt=${index + 1} total=${compatibilityAttempts.length}',
+          );
+          try {
+            final candidateResponse = await download(
+              successfulUrl,
+              compatibilityUserAgent: compatibility.userAgent,
+              compatibilityHeaders: compatibility.headers,
+            );
+            final candidateContent = await File(tempFilePath).readAsString();
+            final isEnvelope = SubscriptionEnvelope.isEnvelope(candidateContent);
+            final isUnsupported = isUnsupportedClientSubscription(candidateContent);
+            loggy.info(
+              'subscription_download phase=compatibility_fallback_result '
+              'attempt=${index + 1} bytes=${utf8.encode(candidateContent).length} '
+              'classification=${isEnvelope ? 'envelope' : (isUnsupported ? 'unsupported' : 'compatible')}',
+            );
+            if (isEnvelope || !isUnsupported) {
+              selectedResponse = candidateResponse;
+              rawContent = candidateContent;
+              acceptedCompatibilityResponse = true;
+              break;
+            }
+          } catch (error) {
+            budget.check();
+            final diagnostic = profileRefreshUnexpectedErrorDiagnostic(error);
+            loggy.info(
+              'subscription_download phase=compatibility_fallback_failure '
+              'attempt=${index + 1} error_type=${diagnostic.errorType} '
+              'runtime_type=${error.runtimeType}',
+            );
+          }
+        }
+
+        if (!acceptedCompatibilityResponse) {
+          throw const ProfileFailure.invalidConfig('subscription server returned no supported client representation');
+        }
+      }
+
+      // decrypt envelope if the server sent one
+      if (SubscriptionEnvelope.isEnvelope(rawContent)) {
+        final serverDeviceSecret = selectedResponse.headers.value('x-device-secret') ?? '';
+        final plaintext = await SubscriptionEnvelope.decrypt(
+          rawContent,
+          serverDeviceSecret,
+          deviceIdentity.clientSecret,
+        );
+        budget.check();
+        await File(tempFilePath).writeAsString(plaintext);
+      }
+
+      await expandRemoteLinesInParallel(
+        tempFilePath: tempFilePath,
+        httpClient: _httpClient,
+        cancelToken: budget.cancelToken,
+        ref: _ref,
+        budget: budget,
+      );
+      budget.check();
+      final expandedContent = await File(tempFilePath).readAsString();
+      final normalizedContent = SubscriptionContentAdapter.normalize(expandedContent);
+      if (normalizedContent != expandedContent) {
+        await File(tempFilePath).writeAsString(normalizedContent, flush: true);
+      }
+      final parsedEndpoints = subscriptionEndpointsFromContent(normalizedContent);
+      final fallbackEndpoint = subscriptionEndpointFor(successfulUrl);
+      final endpoints = parsedEndpoints.isNotEmpty ? parsedEndpoints : [if (fallbackEndpoint != null) fallbackEndpoint];
+      final currentEndpoint = fallbackEndpoint != null && endpoints.contains(fallbackEndpoint)
+          ? fallbackEndpoint
+          : (endpoints.isNotEmpty ? endpoints.first : fallbackEndpoint);
+      final headers = selectedResponse.headers.map.map((key, value) {
+        if (value.length == 1) return MapEntry(key, value.first);
+        return MapEntry(key, value);
+      });
+      budget.check();
+      return _ProfileDownloadResult(headers: headers, endpoints: endpoints, currentEndpoint: currentEndpoint);
+    } finally {
+      budget.dispose();
     }
-    final parsedEndpoints = subscriptionEndpointsFromContent(normalizedContent);
-    final fallbackEndpoint = subscriptionEndpointFor(successfulUrl);
-    final endpoints = parsedEndpoints.isNotEmpty ? parsedEndpoints : [if (fallbackEndpoint != null) fallbackEndpoint];
-    final currentEndpoint = fallbackEndpoint != null && endpoints.contains(fallbackEndpoint)
-        ? fallbackEndpoint
-        : (endpoints.isNotEmpty ? endpoints.first : fallbackEndpoint);
-    final headers = selectedResponse.headers.map.map((key, value) {
-      if (value.length == 1) return MapEntry(key, value.first);
-      return MapEntry(key, value);
-    });
-    return _ProfileDownloadResult(headers: headers, endpoints: endpoints, currentEndpoint: currentEndpoint);
   }, (err, st) => err is ProfileFailure ? err : ProfileFailure.unexpected(err, st));
 
   void _logDownloadAttempt({
@@ -665,6 +731,9 @@ class ProfileParser with InfraLogger {
       if (err.response?.statusCode == 403) {
         throw const ProfileFailure.deviceMismatch();
       }
+      if (err.response?.statusCode == 409) {
+        throw const ProfileFailure.deviceLimit();
+      }
     }
     throw err;
   }
@@ -675,6 +744,7 @@ class ProfileParser with InfraLogger {
     required CancelToken cancelToken,
     required Ref ref,
     int parallelism = 4,
+    SubscriptionDownloadBudget? budget,
   }) async {
     final content = await File(tempFilePath).readAsString();
     final lines = content.split('\n');
@@ -715,7 +785,7 @@ class ProfileParser with InfraLogger {
         }
 
         try {
-          final includeFile = File('$tempFilePath.$currentIndex');
+          final includeFile = File('$tempFilePath.$currentIndex.include-${DateTime.now().microsecondsSinceEpoch}');
           final include = await readRemoteIncludeWithCleanup(
             includeFile,
             () => httpClient.download(
@@ -726,9 +796,11 @@ class ProfileParser with InfraLogger {
                   ? httpClient.userAgent.replaceAll('Marten', 'MartenX')
                   : null,
             ),
+            budget: budget,
           );
           storeResult(currentIndex, include);
         } catch (err) {
+          budget?.check();
           if (err is ProfileFailure) rethrow;
           if (err is DioException && CancelToken.isCancel(err)) {
             return;
@@ -740,6 +812,7 @@ class ProfileParser with InfraLogger {
 
     // Start workers
     await Future.wait(List.generate(parallelism, (_) => worker()));
+    budget?.check();
     if (cancelToken.isCancelled) {
       throw const ProfileFailure.cancelByUser('remote subscription include expansion canceled');
     }
@@ -751,12 +824,31 @@ class ProfileParser with InfraLogger {
   }
 
   @visibleForTesting
-  static Future<String> readRemoteIncludeWithCleanup(File includeFile, Future<void> Function() download) async {
+  static Future<String> readRemoteIncludeWithCleanup(
+    File includeFile,
+    Future<void> Function() download, {
+    SubscriptionDownloadBudget? budget,
+  }) async {
+    budget?.check();
+    final request = Future<void>.sync(download);
+    Future<void> cleanup() async {
+      try {
+        await includeFile.delete();
+      } on FileSystemException catch (error) {
+        if (!ProfileCrypto.isMissingFileError(error)) rethrow;
+      }
+    }
+
     try {
-      await download();
+      await (budget == null ? request : budget.run(() => request));
       return (await includeFile.readAsString()).trim();
     } finally {
-      if (await includeFile.exists()) await includeFile.delete();
+      unawaited(
+        request
+            .then((_) => cleanup(), onError: (Object error, StackTrace stackTrace) => cleanup())
+            .catchError((Object _) {}),
+      );
+      await cleanup();
     }
   }
 

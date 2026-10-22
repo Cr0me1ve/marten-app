@@ -24,41 +24,14 @@ struct VPNManagerAlert {
 }
 
 class VPNManager: ObservableObject {
-    private var cancelBag: Set<AnyCancellable> = []
-    
     private var observer: NSObjectProtocol?
     private var manager = NEVPNManager.shared()
     private var loaded: Bool = false
-    private var timer: Timer?
             
     static let shared: VPNManager = VPNManager()
         
     @Published private(set) var state: NEVPNStatus = .invalid
     @Published private(set) var alert: VPNManagerAlert = .init(alert: nil, message: nil)
-    
-    @Published private(set) var upload: Int64 = 0
-    @Published private(set) var download: Int64 = 0
-    @Published private(set) var elapsedTime: TimeInterval = 0
-    
-    private var _connectTime: Date?
-    private var connectTime: Date? {
-        set {
-            UserDefaults(suiteName: FilePath.groupName)?.set(newValue?.timeIntervalSince1970, forKey: "SingBoxConnectTime")
-            _connectTime = newValue
-        }
-        get {
-            if let _connectTime {
-                return _connectTime
-            }
-            guard let interval = UserDefaults(suiteName: FilePath.groupName)?.value(forKey: "SingBoxConnectTime") as? TimeInterval else {
-                return nil
-            }
-            return Date(timeIntervalSince1970: interval)
-        }
-    }
-    private var readingWS: Bool = false
-    
-    @Published var isConnectedToAnyVPN: Bool = false
     
     init() {
         observer = NotificationCenter.default.addObserver(forName: .NEVPNStatusDidChange, object: nil, queue: nil) { [weak self] notification in
@@ -66,171 +39,220 @@ class VPNManager: ObservableObject {
             self?.state = connection.status
         }
         
-        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            updateStats()
-            elapsedTime = -1 * (connectTime?.timeIntervalSinceNow ?? 0)
-        }
     }
-                
+
     deinit {
         if let observer {
             NotificationCenter.default.removeObserver(observer)
         }
-        timer?.invalidate()
     }
     
     func setup() async throws {
-        // guard !loaded else { return }
+        guard !loaded else { return }
+        try await loadVPNPreference()
         loaded = true
-        do {
-            try await loadVPNPreference()
-        } catch {
-            print(error.localizedDescription)
-        }
     }
     
-    private func loadVPNPreference() async throws {
-        do {
-            let managers = try await NETunnelProviderManager.loadAllFromPreferences()
-            if let manager = managers.first {
-                self.manager = manager
-                return
-            }
-            let newManager = NETunnelProviderManager()
-            let `protocol` = NETunnelProviderProtocol()
-            `protocol`.providerBundleIdentifier = Bundle.main.baseBundleIdentifier + ".MartenPacketTunnel"
-            `protocol`.serverAddress = "localhost"
-            newManager.protocolConfiguration = `protocol`
-            newManager.localizedDescription = "Marten"
-            try await newManager.saveToPreferences()
-            try await newManager.loadFromPreferences()
-            self.manager = newManager
-        } catch {
-            print(error.localizedDescription)	
+    @discardableResult
+    private func loadVPNPreference(createIfMissing: Bool = true) async throws -> Bool {
+        let managers = try await NETunnelProviderManager.loadAllFromPreferences()
+        let expectedProvider = Bundle.main.baseBundleIdentifier + ".MartenPacketTunnel"
+        if let manager = managers.first(where: {
+            ($0.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier == expectedProvider
+        }) {
+            self.manager = manager
+            return true
         }
+        guard createIfMissing else { return false }
+        let newManager = NETunnelProviderManager()
+        let `protocol` = NETunnelProviderProtocol()
+        `protocol`.providerBundleIdentifier = Bundle.main.baseBundleIdentifier + ".MartenPacketTunnel"
+        `protocol`.serverAddress = "localhost"
+        `protocol`.includeAllNetworks = true
+        `protocol`.excludeLocalNetworks = false
+        newManager.protocolConfiguration = `protocol`
+        newManager.localizedDescription = "Marten"
+        try await newManager.saveToPreferences()
+        try await newManager.loadFromPreferences()
+        self.manager = newManager
+        return true
     }
     
     private func enableVPNManager() async throws {
+        guard let configuration = manager.protocolConfiguration as? NETunnelProviderProtocol else {
+            throw VPNManagerError.connectionFailed
+        }
+        configuration.includeAllNetworks = true
+        configuration.excludeLocalNetworks = false
+        manager.protocolConfiguration = configuration
         manager.isEnabled = true
+        manager.onDemandRules = []
+        manager.isOnDemandEnabled = false
+
+        try await manager.saveToPreferences()
+        try await manager.loadFromPreferences()
+    }
+
+    private func enableOnDemand() async throws {
         let rule = NEOnDemandRuleConnect()
         rule.interfaceTypeMatch = .any
-        rule.probeURL = URL(string: "http://captive.apple.com")
         manager.onDemandRules = [rule]
         manager.isOnDemandEnabled = true
-        
-        do {
-            try await manager.saveToPreferences()
-            try await manager.loadFromPreferences()
-        } catch {
-            print(error.localizedDescription)
-        }
+
+        try await manager.saveToPreferences()
+        try await manager.loadFromPreferences()
+    }
+
+    private func disableOnDemand() async throws {
+        guard manager.isOnDemandEnabled || !(manager.onDemandRules ?? []).isEmpty else { return }
+        manager.isOnDemandEnabled = false
+        manager.onDemandRules = []
+        try await manager.saveToPreferences()
+        try await manager.loadFromPreferences()
     }
     
-    @MainActor private func set(upload: Int64, download: Int64) {
-        self.upload = upload
-        self.download = download
-    }
-    
-    var isAnyVPNConnected: Bool {
-        guard let cfDict = CFNetworkCopySystemProxySettings() else { return false }
-        let nsDict = cfDict.takeRetainedValue() as NSDictionary
-        guard let keys = nsDict["__SCOPED__"] as? NSDictionary else {
-            return false
+    func reset() async throws {
+        if !loaded {
+            try await loadVPNPreference()
+            loaded = true
         }
-        for key: String in keys.allKeys as! [String] {
-            if key == "tap" || key == "tun" || key == "ppp" || key == "ipsec" || key == "ipsec0" {
-                return true
-            } else if key.starts(with: "utun") {
-                return true
-            }
-        }
-        return false
-    }
-    
-    func reset() {
-        loaded = false
-        if state != .disconnected && state != .invalid {
-            disconnect()
-        }
-        $state.filter { $0 == .disconnected || $0 == .invalid }.first().sink { [weak self] _ in
-            Task { [weak self] () in
-                self?.manager = .shared()
-                do {
-                    let managers = try await NETunnelProviderManager.loadAllFromPreferences()
-                    for manager in managers ?? [] {
-                        try await manager.removeFromPreferences()
-                    }
-                    try await self?.loadVPNPreference()
-                } catch {
-                    print(error.localizedDescription)
-                }
-            }
-        }.store(in: &cancelBag)
-        
-    }
-    
-    
-    private func updateStats() {
-        let isAnyVPNConnected = self.isAnyVPNConnected
-        if isConnectedToAnyVPN != isAnyVPNConnected {
-            isConnectedToAnyVPN = isAnyVPNConnected
-        }
-        guard state == .connected else { return }
-        guard let connection = manager.connection as? NETunnelProviderSession else { return }
-        do {
-            try connection.sendProviderMessage("stats".data(using: .utf8)!) { [weak self] response in
-                guard
-                    let response,
-                    let response = String(data: response, encoding: .utf8)
-                else { return }
-                let responseComponents = response.components(separatedBy: ",")
-                guard
-                    responseComponents.count == 2,
-                    let upload = Int64(responseComponents[0]),
-                    let download = Int64(responseComponents[1])
-                else { return }
-                Task { [upload, download, weak self] () in
-                    await self?.set(upload: upload, download: download)
-                }
-            }
-        } catch {
-            print(error.localizedDescription)
-        }
-    }
-    
-    func connect(with config: String, grpcServiceModePort:Int, disableMemoryLimit: Bool = false) async throws {
-        
-        await set(upload: 0, download: 0)
-//        guard state == .disconnected else { return }
-        do {
-            try await enableVPNManager()
-            try manager.connection.startVPNTunnel(options: [
-                "Config": config as NSString,
-                "GrpcServiceModePort":NSNumber(value: grpcServiceModePort),
-                "DisableMemoryLimit": (disableMemoryLimit ? "YES" : "NO") as NSString,
-            ])
-            
-        } catch {
-            print(error.localizedDescription)
-        }
-        connectTime = .now
-    }
-    
-    func disconnect() {
-        if manager.isOnDemandEnabled {
-            manager.isOnDemandEnabled = false
-            manager.onDemandRules = []
-            
-            manager.saveToPreferences { error in
-                if let error = error {
-                    print("save error:", error)
-                    return
-                }
-            }
+        if manager.connection.status != .disconnected && manager.connection.status != .invalid {
+            try await disconnect()
+            try await waitForDisconnected()
+        } else {
+            try await disableOnDemand()
+            try ResumeConfigStore.clear()
         }
 
-//        guard state == .connected else { return }
+        let managers = try await NETunnelProviderManager.loadAllFromPreferences()
+        for manager in managers ?? [] {
+            try await manager.removeFromPreferences()
+        }
+        loaded = false
+        manager = .shared()
+        try await loadVPNPreference()
+        loaded = true
+    }
+    
+    
+    func connect(with config: String, grpcServiceModePort:Int, disableMemoryLimit: Bool = false) async throws {
+        switch manager.connection.status {
+        case .connected:
+            if ResumeConfigStore.matchesActiveConfig(configPath: config, grpcServiceModePort: grpcServiceModePort) {
+                try await enableOnDemand()
+                return
+            }
+            try await disconnect()
+        case .connecting, .reasserting:
+            try await waitForConnected()
+            if ResumeConfigStore.matchesActiveConfig(configPath: config, grpcServiceModePort: grpcServiceModePort) {
+                try await enableOnDemand()
+                return
+            }
+            try await disconnect()
+        case .disconnecting:
+            try await waitForDisconnected()
+        default:
+            break
+        }
+
+        try await enableVPNManager()
+        let resumeGeneration = try ResumeConfigStore.store(
+            configPath: config,
+            grpcServiceModePort: grpcServiceModePort,
+            disableMemoryLimit: disableMemoryLimit
+        )
+        do {
+            try manager.connection.startVPNTunnel(options: [
+                "Config": config as NSString,
+                "GrpcServiceModePort": NSNumber(value: grpcServiceModePort),
+                "DisableMemoryLimit": (disableMemoryLimit ? "YES" : "NO") as NSString,
+                "ResumeGeneration": resumeGeneration as NSString,
+            ])
+            try await waitForConnected()
+            try await enableOnDemand()
+        } catch {
+            manager.connection.stopVPNTunnel()
+            try? await disableOnDemand()
+            try? ResumeConfigStore.clear()
+            throw error
+        }
+    }
+
+    func disconnect() async throws {
+        if !loaded {
+            // Cleanup must never create a VPN profile or present permission UI.
+            guard try await loadVPNPreference(createIfMissing: false) else {
+                try ResumeConfigStore.clear()
+                    return
+            }
+            loaded = true
+        }
+
+        var firstError: Error?
+        do {
+            try await disableOnDemand()
+        } catch {
+            firstError = error
+        }
+        do {
+            try ResumeConfigStore.clear()
+        } catch {
+            if firstError == nil { firstError = error }
+        }
         manager.connection.stopVPNTunnel()
+        do {
+            try await waitForDisconnected()
+        } catch {
+            if firstError == nil { firstError = error }
+        }
+        if let firstError { throw firstError }
+    }
+
+    private func waitForConnected() async throws {
+        var transitionStartedAt: Date?
+        for _ in 0..<300 {
+            switch manager.connection.status {
+            case .connected:
+                return
+            case .connecting, .reasserting:
+                if transitionStartedAt == nil { transitionStartedAt = .now }
+            case .disconnected, .invalid:
+                if let transitionStartedAt, Date().timeIntervalSince(transitionStartedAt) >= 2 {
+                    throw VPNManagerError.connectionFailed
+                }
+            default:
+                break
+            }
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+        throw VPNManagerError.connectionTimedOut
+    }
+
+    private func waitForDisconnected() async throws {
+        for _ in 0..<100 {
+            if manager.connection.status == .disconnected || manager.connection.status == .invalid {
+                return
+            }
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+        throw VPNManagerError.disconnectionTimedOut
+    }
+
+    private enum VPNManagerError: LocalizedError {
+        case connectionFailed
+        case connectionTimedOut
+        case disconnectionTimedOut
+
+        var errorDescription: String? {
+            switch self {
+            case .connectionFailed:
+                return "The VPN extension failed to start"
+            case .connectionTimedOut:
+                return "The VPN extension did not start in time"
+            case .disconnectionTimedOut:
+                return "The VPN extension did not stop in time"
+            }
+        }
     }
 }

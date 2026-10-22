@@ -25,13 +25,18 @@ public class PlatformMethodHandler: NSObject, FlutterPlugin {
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         switch call.method {
         case "get_paths":
-            result(getPaths(args: call.arguments) as NSDictionary)
+            do {
+                result(try getPaths(args: call.arguments) as NSDictionary)
+            } catch {
+                result(FlutterError(code: "profile_storage_unavailable", message: "Profile storage is unavailable", details: nil))
+            }
         default:
             result(FlutterMethodNotImplemented)
         }
     }
     
-    public func getPaths(args: Any?) -> [String:String] {
+    public func getPaths(args: Any?) throws -> [String:String] {
+        _ = try FilePath.prepareProfileStorage(in: FilePath.sharedDirectory)
         return [
             "base": FilePath.sharedDirectory.path,
             "working": FilePath.workingDirectory.path,

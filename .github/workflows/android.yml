@@ -15,6 +15,30 @@ on:
         description: "Optional vX.Y.Z tag to create or update after a successful build"
         required: false
         type: string
+      core_release_tag:
+        description: "Release containing a native core built for this source revision"
+        required: true
+        type: string
+      core_aar_sha256:
+        description: "SHA256 of marten-core.aar"
+        required: true
+        type: string
+      core_library_sha256:
+        description: "SHA256 of the embedded arm64 libmarten-core.so"
+        required: true
+        type: string
+      core_revision:
+        description: "Expected embedded core revision"
+        required: true
+        type: string
+      sing_box_revision:
+        description: "Expected embedded networking engine revision"
+        required: true
+        type: string
+      turncoat_revision:
+        description: "Expected embedded transport revision"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -26,16 +50,37 @@ concurrency:
 env:
   FLUTTER_VERSION: "3.38.5"
   ANDROID_NDK_VERSION: "28.2.13676358"
-  CORE_RELEASE_TAG: "core-0.7.9"
-  CORE_AAR_SHA256: "c37191aa6bd7953bc73b617be4db38a0dcb1b3e917a0bcaae0de6215170bbe59"
-  CORE_AAR_SO_SHA256: "85d909146f48b69906d5fe955bc9c7161d340cb36ac93d26ab7c6c02b2bb4071"
-  CORE_REVISION: "edbe0d498ac55e28f822a0b8dc9ac708c86dc8c8"
-  SING_BOX_REVISION: "7303baa90f7f55102b621fb34704736011b3e1a1"
-  TURNCOAT_REVISION: "29ba26b97c3c62a9aa7da7f8a4d5bd04a36e1622"
+  CORE_RELEASE_TAG: ${{ inputs.core_release_tag }}
+  CORE_AAR_SHA256: ${{ inputs.core_aar_sha256 }}
+  CORE_AAR_SO_SHA256: ${{ inputs.core_library_sha256 }}
+  CORE_REVISION: ${{ inputs.core_revision }}
+  SING_BOX_REVISION: ${{ inputs.sing_box_revision }}
+  TURNCOAT_REVISION: ${{ inputs.turncoat_revision }}
   RELEASE_SIGNER_SHA256: "4acd16e170370e30653cd5be65643e745c6b8e9ee1e00f91a308bc86110b1f5d"
 
 jobs:
+  source:
+    name: Check Flutter source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: Generate Flutter sources
+        run: |
+          flutter pub get
+          dart run build_runner build --delete-conflicting-outputs
+          dart run slang
+      - name: Run Flutter tests
+        run: flutter test
+
   build:
+    if: github.event_name == 'workflow_dispatch'
+    needs: source
     name: Test and build Android arm64
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -55,7 +100,7 @@ jobs:
       - name: Set up Go for embedded provenance inspection
         uses: actions/setup-go@v5
         with:
-          go-version: "1.26.5"
+          go-version: "1.26.6"
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
@@ -102,7 +147,7 @@ jobs:
         run: |
           test -n "${GOOGLE_SERVICES_JSON}"
           printf '%s' "${GOOGLE_SERVICES_JSON}" > android/app/google-services.json
-          test "$(jq -r '.project_info.project_id' android/app/google-services.json)" = "marten-test-690a1"
+          test -n "$(jq -r '.project_info.project_id // empty' android/app/google-services.json)"
           jq -e '.client[] | select(.client_info.android_client_info.package_name == "app.marten.client")' \
             android/app/google-services.json >/dev/null
 

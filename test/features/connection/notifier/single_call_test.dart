@@ -10,7 +10,29 @@ String _extractFunctionBlock(String source, String signature) {
   final marker = source.indexOf(signature);
   if (marker < 0) return '';
 
-  final open = source.indexOf('{', marker);
+  int? open;
+  final lineEnd = source.indexOf('\n', marker);
+  final signatureTail = lineEnd < 0 ? source.substring(marker) : source.substring(marker, lineEnd);
+  final asyncSignature = RegExp(r'\)\s*async\*?\s*\{').firstMatch(signatureTail);
+  if (asyncSignature != null) {
+    open = marker + asyncSignature.start + asyncSignature.group(0)!.lastIndexOf('{');
+  }
+
+  var parenDepth = 0;
+  if (open == null) {
+    for (var index = marker; index < source.length; index++) {
+      final char = source[index];
+      if (char == '(') parenDepth++;
+      if (char == ')') parenDepth--;
+      if (char == '{' && parenDepth == 0) {
+        open = index;
+        break;
+      }
+      if (parenDepth < 0) parenDepth = 0;
+    }
+  }
+
+  open ??= source.indexOf('{', marker);
   if (open < 0) return '';
 
   var depth = 0;
@@ -40,6 +62,23 @@ int _countOccurrences(String source, String needle) {
 }
 
 void main() {
+  test('native satisfied-connect wire result distinguishes authoritative outcomes and legacy booleans', () {
+    expect(nativeSatisfiedConnectResolutionFromPlatform('satisfied'), NativeSatisfiedConnectResolution.satisfied);
+    expect(
+      nativeSatisfiedConnectResolutionFromPlatform('connect_required'),
+      NativeSatisfiedConnectResolution.connectRequired,
+    );
+    expect(nativeSatisfiedConnectResolutionFromPlatform('cancelled'), NativeSatisfiedConnectResolution.cancelled);
+    expect(nativeSatisfiedConnectResolutionFromPlatform(true), NativeSatisfiedConnectResolution.satisfied);
+    expect(nativeSatisfiedConnectResolutionFromPlatform(false), NativeSatisfiedConnectResolution.cancelled);
+    expect(nativeSatisfiedConnectResolutionFromPlatform(null), NativeSatisfiedConnectResolution.transportFailure);
+    expect(
+      nativeSatisfiedConnectResolutionFromPlatform('unexpected'),
+      NativeSatisfiedConnectResolution.transportFailure,
+    );
+    expect(nativeSatisfiedConnectResolutionFromPlatform(17), NativeSatisfiedConnectResolution.transportFailure);
+  });
+
   test('post-release input settle keeps Connect semantically unavailable for 750ms', () {
     expect(manualDisconnectInputSettleDelay, const Duration(milliseconds: 750));
 
@@ -69,26 +108,38 @@ void main() {
     expect(stopFromManual, contains('_abortConnectionImmediately();'));
   });
 
-  test('Android route verification observes raw lifecycle-equivalent Connecting before UI deduplication', () {
+  test('Android cold-attach avoids startup verification from raw build stream', () {
     final source = File('lib/features/connection/notifier/connection_notifier.dart').readAsStringSync();
     final build = _extractFunctionBlock(source, 'Stream<ConnectionStatus> build() async* {');
+    final listenSelf = _extractFunctionBlock(source, 'listenSelf((previous, next) async {');
+    final startupVerification = _extractFunctionBlock(
+      source,
+      'void _handleStartupRouteVerification(ConnectionStatus? nextStatus) {',
+    );
 
     expect(build, isNotEmpty);
+    expect(listenSelf, isNotEmpty);
+    expect(startupVerification, isNotEmpty);
+
     final statusStream = build.indexOf('yield* _connectionRepo');
-    final routeVerification = build.indexOf(
-      'if (Platform.isAndroid) _handleStartupRouteVerification(event);',
-      statusStream,
-    );
-    final deduplication = build.indexOf('.distinct()', statusStream);
+    final doOnData = build.indexOf('.doOnData((event) {', statusStream);
+    final deduplication = build.indexOf('.distinct()', doOnData);
 
     expect(statusStream, isNonNegative);
-    expect(routeVerification, greaterThan(statusStream));
-    expect(deduplication, greaterThan(routeVerification));
+    expect(doOnData, greaterThan(statusStream));
+    expect(deduplication, greaterThan(doOnData));
     expect(
-      build.substring(statusStream, deduplication),
-      contains('.doOnData((event) {'),
-      reason: 'the startup-route verifier must observe every raw repository event before public UI deduplication',
+      build.substring(doOnData, deduplication),
+      isNot(contains('_handleStartupRouteVerification')),
+      reason: 'startup verification must stay on notifier-state transitions, not raw build events',
     );
+
+    expect(startupVerification, contains('if (nextStatus is! Connecting) {'));
+    expect(listenSelf, contains('_handleStartupRouteVerification(nextStatus);'));
+
+    final routeVerificationInListenSelf = listenSelf.indexOf('_handleStartupRouteVerification(nextStatus);');
+    expect(routeVerificationInListenSelf, isNonNegative);
+    expect(deduplication, greaterThan(doOnData), reason: 'stream remains distinct() after doOnData');
   });
 
   test(
@@ -186,27 +237,28 @@ void main() {
 
   test('manual haptic feedback is dispatched without delaying lifecycle commands', () {
     final source = File('lib/features/connection/notifier/connection_notifier.dart').readAsStringSync();
-    final commandBlock = _extractFunctionBlock(
-      source,
-      'Future<void> executeManualCommand(ManualConnectionCommand command) async {',
-    );
+    final commandStart = source.indexOf('Future<void> executeManualCommand(');
+    final commandEnd = source.indexOf('\n  Future<void> _stopFromManualCommand', commandStart);
+    final commandBlock = commandStart < 0 || commandEnd < 0 ? '' : source.substring(commandStart, commandEnd);
     final hapticBlock = _extractFunctionBlock(source, 'void _sendManualHaptic(Future<void> feedback) {');
 
     expect(commandBlock, isNotEmpty);
     expect(hapticBlock, isNotEmpty);
+    expect(commandBlock, contains('ManualConnectionCommand command, {'));
     expect(commandBlock, isNot(contains('await haptic.')));
-    expect(
-      commandBlock.indexOf('_sendManualHaptic(haptic.lightImpact())'),
-      lessThan(commandBlock.indexOf('await _connect()')),
-    );
-    expect(
-      commandBlock.indexOf('_sendManualHaptic(haptic.mediumImpact())'),
-      lessThan(commandBlock.indexOf('await _stopFromManualCommand(currentStatus);')),
-    );
-    expect(
-      commandBlock.lastIndexOf('_sendManualHaptic(haptic.mediumImpact())'),
-      lessThan(commandBlock.lastIndexOf('await _stopFromManualCommand(currentStatus);')),
-    );
+    final connectHaptic = commandBlock.indexOf('_sendManualHaptic(haptic.lightImpact())');
+    final connect = commandBlock.indexOf('await _connect(');
+    final firstStopHaptic = commandBlock.indexOf('_sendManualHaptic(haptic.mediumImpact())');
+    final firstStop = commandBlock.indexOf('await _stopFromManualCommand(currentStatus);');
+    final lastStopHaptic = commandBlock.lastIndexOf('_sendManualHaptic(haptic.mediumImpact())');
+    final lastStop = commandBlock.lastIndexOf('await _stopFromManualCommand(currentStatus);');
+    expect(connectHaptic, isNonNegative);
+    expect(connect, isNonNegative);
+    expect(firstStopHaptic, isNonNegative);
+    expect(firstStop, isNonNegative);
+    expect(connectHaptic, lessThan(connect));
+    expect(firstStopHaptic, lessThan(firstStop));
+    expect(lastStopHaptic, lessThan(lastStop));
     expect(hapticBlock, contains('unawaited('));
     expect(hapticBlock, contains('feedback.catchError'));
   });
@@ -236,48 +288,67 @@ void main() {
 
   test('notifier admits manual connect inside the gate and does not request queued execution', () {
     final source = File('lib/features/connection/notifier/connection_notifier.dart').readAsStringSync();
-    final connectStart = source.indexOf('Future<bool> _connect({bool silent = false}) {');
+    final connectStart = source.indexOf('Future<bool> _connect({');
     final connectEnd = source.indexOf('Future<bool> _connectThrottled', connectStart);
     final connectBlock = connectStart < 0 || connectEnd < 0 ? '' : source.substring(connectStart, connectEnd);
-    final commandBlock = _extractFunctionBlock(
-      source,
-      'Future<void> executeManualCommand(ManualConnectionCommand command) async {',
-    );
+    final commandStart = source.indexOf('Future<void> executeManualCommand(');
+    final commandEnd = source.indexOf('\n  Future<void> _stopFromManualCommand', commandStart);
+    final commandBlock = commandStart < 0 || commandEnd < 0 ? '' : source.substring(commandStart, commandEnd);
 
     expect(connectBlock, isNotEmpty);
     expect(commandBlock, isNotEmpty);
-    expect(connectBlock, contains('return _singleStart.run('));
-    expect(connectBlock, isNot(contains('waitForCurrent:')));
-    expect(connectBlock, isNot(contains('supersedeQueued:')));
+    expect(connectBlock, contains('final lifecycleCompleted = await _singleStart.run('));
+    expect(connectBlock, contains('return lifecycleCompleted;'));
+    expect(connectBlock, contains('bool queueAfterCurrentOperation = false'));
+    expect(connectBlock, contains('waitForCurrent: queueAfterCurrentOperation'));
+    expect(connectBlock, contains('supersedeQueued: queueAfterCurrentOperation'));
     expect(
       connectBlock.indexOf('() async {'),
       lessThan(connectBlock.indexOf('state = const AsyncData(Connecting());')),
     );
+    expect(commandBlock, contains('bool queueConnectAfterCurrentOperation = false'));
     expect(commandBlock, contains('canExecuteManualConnectionCommand(command, currentStatus)'));
     expect(commandBlock, contains(r'stale manual $command ignored'));
   });
 
-  test('a completed startup failure becomes disconnected before its dialog and never leaves an async error', () {
+  test('a completed startup failure releases the lifecycle gate before its dialog and never leaves an async error', () {
     final source = File('lib/features/connection/notifier/connection_notifier.dart').readAsStringSync();
-    final connectStart = source.indexOf('Future<bool> _connect({bool silent = false}) {');
+    final connectStart = source.indexOf('Future<bool> _connect({');
     final throttledStart = source.indexOf('Future<bool> _connectThrottled({');
-    final throttledEnd = source.indexOf('\n  Future<bool> _disconnect', throttledStart);
     final connect = connectStart < 0 || throttledStart < 0 ? '' : source.substring(connectStart, throttledStart);
-    final throttled = throttledStart < 0 || throttledEnd < 0 ? '' : source.substring(throttledStart, throttledEnd);
+    final throttled = _extractFunctionBlock(source, 'Future<bool> _connectThrottled({');
 
     expect(connectStart, isNonNegative);
     expect(throttledStart, isNonNegative);
-    expect(throttledEnd, greaterThan(throttledStart));
+    expect(throttled, isNotEmpty);
     expect(
       throttled,
       isNot(contains('.mapLeft((\n      ConnectionFailure err,\n    ) async')),
       reason: 'TaskEither.mapLeft cannot await an async failure handler',
     );
-    expect(throttled, contains('required ConnectionRepository connectionRepo'));
-    expect(throttled, contains('required PreferencesNotifier<bool, bool> startedByUserNotifier'));
-    expect(throttled, contains('required DialogNotifier dialogNotifier'));
-    expect(throttled, contains('required Future<Translations> translationsFuture'));
-    expect(throttled, contains('await connectionRepo.connect('));
+    expect(throttled, contains("_sealAndroidOrdinaryNetworking('manual or automatic Connect')"));
+    expect(throttled, contains('await startedByUserNotifier.update(true);'));
+    expect(
+      throttled,
+      isNot(contains('DialogNotifier')),
+      reason: 'dialog dependencies belong to asynchronous presentation, never to the lifecycle gate',
+    );
+    expect(
+      throttled,
+      isNot(contains('translationsFuture')),
+      reason: 'waiting for translated UI text must not retain the lifecycle gate',
+    );
+    final admittedIntent = throttled.indexOf('await startedByUserNotifier.update(true);');
+    final epochConnect = throttled.indexOf(
+      'connectionRepo.connect(activeProfile, disableMemoryLimit, androidVpnStartEpoch: admissionEpoch)',
+      admittedIntent,
+    );
+    expect(
+      epochConnect,
+      greaterThan(admittedIntent),
+      reason:
+          'the repository connect must remain chained after successful VPN admission and intent publication, carrying its exact epoch',
+    );
     expect(throttled, contains('.run();'));
     expect(
       throttled,
@@ -287,13 +358,12 @@ void main() {
 
     final clearIntent = throttled.indexOf('await startedByUserNotifier.update(false);');
     final terminalState = throttled.indexOf('state = AsyncData(Disconnected(err));');
-    final showDialog = throttled.indexOf('await dialogNotifier.showCustomAlertFromErr(');
     expect(clearIntent, isNonNegative);
     expect(terminalState, greaterThan(clearIntent), reason: 'cleanup completion clears user intent first');
     expect(
-      showDialog,
-      greaterThan(terminalState),
-      reason: 'the retryable terminal state must publish before the dialog',
+      throttled,
+      isNot(contains('showCustomAlertFromErr')),
+      reason: 'an invisible, blocked, or unclosed dialog must not keep _singleStart running',
     );
     expect(
       throttled,
@@ -305,6 +375,19 @@ void main() {
       connect,
       contains('_manualConnectPending = false;'),
       reason: 'every awaited connect completion must release the transient Connecting mask',
+    );
+    final lifecycleCompletion = connect.indexOf('await _singleStart.run(');
+    final asynchronousPresentation = connect.indexOf('unawaited(');
+    expect(lifecycleCompletion, isNonNegative);
+    expect(
+      asynchronousPresentation,
+      greaterThan(lifecycleCompletion),
+      reason: 'failure presentation must begin only after the lifecycle future has completed and released _singleStart',
+    );
+    expect(
+      source,
+      contains('showCustomAlertFromErr'),
+      reason: 'the failure remains user-visible, but outside the lifecycle critical section',
     );
   });
 
@@ -364,6 +447,42 @@ void main() {
     }, onIgnored: () {});
     expect(secondRun, isTrue);
     expect(runs, 2);
+  });
+
+  test('cancel does not complete active work and waitForCurrent awaits its finally block', () async {
+    final singleCall = SingleCall();
+    final running = Completer<void>();
+    final order = <String>[];
+
+    final firstRun = singleCall.run(() async {
+      order.add('start');
+      try {
+        await running.future;
+      } finally {
+        order.add('finally');
+      }
+    }, onIgnored: () {});
+    await Future<void>.delayed(Duration.zero);
+    expect(order, ['start']);
+
+    singleCall.cancel();
+    final waitForCurrent = singleCall.waitForCurrent();
+    var waitCompleted = false;
+    unawaited(
+      waitForCurrent.then((_) {
+        waitCompleted = true;
+      }),
+    );
+
+    await Future<void>.delayed(Duration.zero);
+    expect(waitCompleted, isFalse);
+    expect(order, ['start']);
+
+    running.complete();
+    expect(await firstRun, isTrue);
+    await waitForCurrent;
+    expect(waitCompleted, isTrue);
+    expect(order, ['start', 'finally']);
   });
 
   test('rejected concurrent manual disconnect never releases the active disconnect visibility lease', () async {
@@ -760,11 +879,140 @@ void main() {
     expect(_countOccurrences(cleanupBlock, '_manualButtonDisconnectInProgress = false;'), 1);
 
     final failureBlock = _extractFunctionBlock(cleanupBlock, 'if (!disconnectSucceeded) {');
-    expect(failureBlock, contains('return;'));
-    expect(failureBlock, isNot(contains('_manualButtonDisconnectInProgress = false;')));
-    expect(failureBlock, isNot(contains('_settleManualDisconnectInput')));
+    final secondFailureGuardStart = cleanupBlock.lastIndexOf('if (!disconnectSucceeded) {');
+    expect(secondFailureGuardStart, isNonNegative);
+    final secondFailureBlock = secondFailureGuardStart < 0
+        ? ''
+        : _extractFunctionBlock(cleanupBlock.substring(secondFailureGuardStart), 'if (!disconnectSucceeded) {');
+    expect(secondFailureBlock, contains('return;'));
+    expect(secondFailureBlock, isNot(contains('_manualButtonDisconnectInProgress = false;')));
+    expect(
+      failureBlock,
+      isNot(contains('_settleManualDisconnectInput')),
+      reason: 'first failure branch must defer settle/reconnect',
+    );
     expect(failureBlock, isNot(contains('_connect(')));
     expect(cleanupBlock, isNot(contains('_connect(')));
+  });
+
+  test('_disconnect returns success only after both repository disconnect and egress release', () {
+    final source = File('lib/features/connection/notifier/connection_notifier.dart').readAsStringSync();
+    final disconnectBlock = _extractFunctionBlock(
+      source,
+      'Future<bool> _disconnect({bool showError = true, ConnectionRepository? repository}) async {',
+    );
+
+    expect(disconnectBlock, isNotEmpty);
+    expect(disconnectBlock, contains('var egressReleased = !Platform.isAndroid;'));
+    expect(
+      disconnectBlock,
+      contains(
+        'egressReleased = await _tryReleaseAndroidOrdinaryNetworkingAfterTerminalDisconnect(expectedEpoch: egressEpoch);',
+      ),
+    );
+    expect(disconnectBlock, contains('return result.isRight() && egressReleased;'));
+    expect(disconnectBlock, isNot(contains('return result.isRight();')));
+    expect(disconnectBlock, isNot(contains('return egressReleased;')));
+  });
+
+  test(
+    'terminal native gate rejection stays distinct from a Dart epoch supersession and abort retry reaches the same release',
+    () {
+      final source = File('lib/features/connection/notifier/connection_notifier.dart').readAsStringSync();
+      final releaseBlock = _extractFunctionBlock(
+        source,
+        'Future<bool> _tryReleaseAndroidOrdinaryNetworkingAfterTerminalDisconnect({int? expectedEpoch}) async {',
+      );
+      final abortCleanup = _extractFunctionBlock(source, 'Future<void> _disconnectAfterAbort(int token) async {');
+
+      final releaseGate = releaseBlock.indexOf('strictVpnEgressGate.releaseAfterTerminalDisconnect();');
+      final nativeRejected = releaseBlock.indexOf('if (!released) {', releaseGate);
+      final nativeRejectedLog = releaseBlock.indexOf(
+        'terminal ordinary-network release was rejected by native gate',
+        nativeRejected,
+      );
+      final nativeRejectedReturn = releaseBlock.indexOf('return false;', nativeRejectedLog);
+      final dartSuperseded = releaseBlock.indexOf('if (releaseEpoch != _androidEgressEpoch) {', nativeRejectedReturn);
+      final dartSupersededLog = releaseBlock.indexOf(
+        'terminal ordinary-network release was superseded',
+        dartSuperseded,
+      );
+      final retry = abortCleanup.indexOf(
+        '_tryReleaseAndroidOrdinaryNetworkingAfterTerminalDisconnect(expectedEpoch: _androidEgressEpoch)',
+      );
+
+      expect(releaseBlock, isNotEmpty);
+      expect(abortCleanup, isNotEmpty);
+      expect(releaseGate, isNonNegative);
+      expect(nativeRejected, greaterThan(releaseGate));
+      expect(nativeRejectedLog, greaterThan(nativeRejected));
+      expect(nativeRejectedReturn, greaterThan(nativeRejectedLog));
+      expect(
+        dartSuperseded,
+        greaterThan(nativeRejectedReturn),
+        reason: 'a successful native release is required before Dart may call the transition superseded',
+      );
+      expect(dartSupersededLog, greaterThan(dartSuperseded));
+      expect(
+        releaseBlock,
+        isNot(contains('if (!released || releaseEpoch != _androidEgressEpoch)')),
+        reason: 'a native rejection must never be logged as a Dart-epoch supersession',
+      );
+      expect(
+        retry,
+        isNonNegative,
+        reason: 'an aborted start retries the exact terminal release path after the active start unwinds',
+      );
+    },
+  );
+
+  test(
+    'abort cleanup waits for the active _singleStart gate before retrying release and only then publishes reconnect',
+    () {
+      final source = File('lib/features/connection/notifier/connection_notifier.dart').readAsStringSync();
+      final cleanupBlock = _extractFunctionBlock(source, 'Future<void> _disconnectAfterAbort(int token) async {');
+      final firstDisconnect = cleanupBlock.indexOf('await _disconnect(showError: false)');
+      final waitForCurrent = cleanupBlock.indexOf('await _singleStart.waitForCurrent();');
+      final retryRelease = cleanupBlock.indexOf(
+        '_tryReleaseAndroidOrdinaryNetworkingAfterTerminalDisconnect(expectedEpoch: _androidEgressEpoch)',
+      );
+      final firstFailureGuard = cleanupBlock.indexOf('if (!disconnectSucceeded) {');
+      final secondFailureGuard = cleanupBlock.indexOf('if (!disconnectSucceeded) {', firstFailureGuard + 1);
+      final finalFailureReturn = cleanupBlock.indexOf('return;', secondFailureGuard);
+      final settleInput = cleanupBlock.indexOf('await _settleManualDisconnectInput();');
+      final reconnectAvailable = cleanupBlock.indexOf('reconnect is available');
+
+      expect(cleanupBlock, isNotEmpty);
+      expect(firstDisconnect, isNonNegative);
+      expect(waitForCurrent, isNonNegative);
+      expect(retryRelease, isNonNegative);
+      expect(firstFailureGuard, isNonNegative);
+      expect(secondFailureGuard, isNonNegative);
+      expect(finalFailureReturn, isNonNegative);
+      expect(settleInput, isNonNegative);
+      expect(reconnectAvailable, isNonNegative);
+      expect(waitForCurrent, greaterThan(firstDisconnect));
+      expect(retryRelease, greaterThan(waitForCurrent));
+      expect(secondFailureGuard, greaterThan(retryRelease));
+      expect(finalFailureReturn, greaterThan(secondFailureGuard));
+      expect(settleInput, greaterThan(finalFailureReturn));
+      expect(reconnectAvailable, greaterThan(settleInput));
+      expect(_countOccurrences(cleanupBlock, 'if (!disconnectSucceeded) {'), 2);
+      expect(_countOccurrences(cleanupBlock, '_showIdleDuringAbort = false;'), 1);
+      expect(_countOccurrences(cleanupBlock, '_manualButtonDisconnectInProgress = false;'), 1);
+    },
+  );
+
+  test('abort egress retry is event-driven and does not use timer/polling retry', () {
+    final source = File('lib/features/connection/notifier/connection_notifier.dart').readAsStringSync();
+    final cleanupBlock = _extractFunctionBlock(source, 'Future<void> _disconnectAfterAbort(int token) async {');
+
+    expect(cleanupBlock, isNotEmpty);
+    expect(cleanupBlock, isNot(contains('Timer(')));
+    expect(cleanupBlock, isNot(contains('Timer.periodic')));
+    expect(cleanupBlock, isNot(contains('Future.delayed(')));
+    expect(cleanupBlock, isNot(contains('while (')));
+    expect(cleanupBlock, isNot(contains('.retry(')));
   });
 
   test(
@@ -809,10 +1057,10 @@ void main() {
   });
 
   test('route watchdog can preserve long-lived TURNcoat routes across transient failures', () {
-    expect(shouldReconnectAfterRouteWatchdogFailures(1), isFalse);
-    expect(shouldReconnectAfterRouteWatchdogFailures(2), isFalse);
-    expect(shouldReconnectAfterRouteWatchdogFailures(3), isTrue);
+    expect(shouldReconnectAfterRouteWatchdogFailures(1, preserveLongLivedRoute: true, isIOS: true), isFalse);
+    expect(shouldReconnectAfterRouteWatchdogFailures(2, preserveLongLivedRoute: true, isIOS: true), isTrue);
     expect(shouldReconnectAfterRouteWatchdogFailures(99, preserveLongLivedRoute: true), isFalse);
+    expect(shouldReconnectAfterRouteWatchdogFailures(99, preserveLongLivedRoute: true, isIOS: false), isFalse);
   });
 
   test('cold attach retries a live TURNcoat route before restarting the carrier', () {
@@ -841,7 +1089,7 @@ void main() {
   test('reconnect error path uses explicit async match and awaits cleanup before terminal state', () {
     final source = File('lib/features/connection/notifier/connection_notifier.dart').readAsStringSync();
     final reconnectStart = source.indexOf('  Future<void> reconnect(\n');
-    final reconnectEnd = source.indexOf('\n  void _scheduleReconnectAfterNativeRecovery', reconnectStart);
+    final reconnectEnd = source.indexOf('\n  Future<void> _synchronizeAndroidTerminalUserIntent', reconnectStart);
     final reconnectBlock = reconnectStart < 0 || reconnectEnd < 0 ? '' : source.substring(reconnectStart, reconnectEnd);
     expect(reconnectBlock, isNotEmpty);
 
@@ -1092,6 +1340,72 @@ void main() {
     expect(automaticConnectionRecoveryOwnerForPlatform(isAndroid: false), AutomaticConnectionRecoveryOwner.flutter);
   });
 
+  test('newer exact Connect suppresses stale rejected cleanup while its native handoff remains reserved', () {
+    expect(isCurrentConnectIntent(attemptGeneration: 71, currentGeneration: 72), isFalse);
+    expect(isCurrentConnectIntent(attemptGeneration: 72, currentGeneration: 72), isTrue);
+
+    final source = File('lib/features/connection/notifier/connection_notifier.dart').readAsStringSync();
+    final connect = _extractFunctionBlock(source, 'Future<bool> _connectThrottled({');
+    final pending = _extractFunctionBlock(
+      source,
+      'void _tryExecutePendingNativeConnectRequest(ConnectionStatus? status) {',
+    );
+    final reserve = _extractFunctionBlock(source, 'int _reserveNativeConnectIntent(int handoffId) {');
+    final execute = _extractFunctionBlock(source, 'void _executePendingNativeConnectRequest(int handoffId');
+
+    final rejected = connect.indexOf('await result.match(');
+    final staleIntent = connect.indexOf('if (!intentIsCurrent()) {', rejected);
+    final staleReturn = connect.indexOf('return;', staleIntent);
+    final cleanup = connect.indexOf('final cleanup = await connectionRepo.disconnect().run();', staleReturn);
+    final terminalState = connect.indexOf('state = AsyncData(Disconnected(err));', cleanup);
+    final failurePresentation = connect.indexOf('onUserVisibleFailure(err);', terminalState);
+    expect(rejected, isNonNegative);
+    expect(staleIntent, greaterThan(rejected));
+    expect(staleReturn, greaterThan(staleIntent));
+    expect(
+      cleanup,
+      greaterThan(staleReturn),
+      reason: 'an older rejected Connect must return before terminal cleanup can cancel the newer handoff',
+    );
+    expect(
+      terminalState,
+      greaterThan(staleReturn),
+      reason: 'a stale rejection must not publish Disconnected(error) over the newer Connect',
+    );
+    expect(
+      failurePresentation,
+      greaterThan(terminalState),
+      reason: 'a stale rejection must not publish an error or schedule its dialog',
+    );
+
+    final terminalStatus = pending.indexOf('if (status is Disconnected || state is AsyncError<ConnectionStatus>) {');
+    final reserveBeforeAttempt = pending.indexOf('_reserveNativeConnectIntent(handoffId);', terminalStatus);
+    final activeAttempt = pending.indexOf(
+      'if (_nativeConnectRequestAttemptHandoffId != null) return;',
+      reserveBeforeAttempt,
+    );
+    expect(
+      reserveBeforeAttempt,
+      greaterThan(terminalStatus),
+      reason: 'a retained native handoff must mint its newest intent before the older attempt finishes unwinding',
+    );
+    expect(activeAttempt, greaterThan(reserveBeforeAttempt));
+    expect(reserve, contains('_nativeConnectRequestIntentGeneration ??= ++_connectIntentGeneration'));
+
+    final attemptAssigned = execute.indexOf('_nativeConnectRequestAttemptHandoffId = handoffId;');
+    final completion = execute.indexOf('execution.whenComplete(() {', attemptAssigned);
+    final clearExactAttempt = execute.indexOf('if (_nativeConnectRequestAttemptHandoffId == handoffId)', completion);
+    final completionBlock = completion < 0 ? '' : execute.substring(completion);
+    expect(attemptAssigned, isNonNegative);
+    expect(completion, greaterThan(attemptAssigned));
+    expect(clearExactAttempt, greaterThan(completion));
+    expect(
+      completionBlock,
+      isNot(contains('_nativeConnectRequestIntentGeneration = null')),
+      reason: 'old completion may release only its attempt marker, never the reserved newer intent generation',
+    );
+  });
+
   test('startup data-plane failure is terminal only after the awaited native cleanup', () {
     final source = File('lib/features/connection/notifier/connection_notifier.dart').readAsStringSync();
     final connectStart = source.indexOf('  Future<bool> _connectThrottled({');
@@ -1106,13 +1420,20 @@ void main() {
       reason: 'a failed Android startup probe must stop/close instead of remaining indefinitely in Connecting',
     );
 
-    final connectionRun = connectThrottled.indexOf(
-      'final result = await connectionRepo.connect(activeProfile, disableMemoryLimit).run();',
+    final resultPipeline = connectThrottled.indexOf('final result = await connectionRepo');
+    final connectionStep = connectThrottled.indexOf(
+      'connectionRepo.connect(activeProfile, disableMemoryLimit, androidVpnStartEpoch: admissionEpoch)',
+      resultPipeline,
     );
-    final clearUserIntent = connectThrottled.indexOf('await startedByUserNotifier.update(false)', connectionRun);
+    final connectionRun = connectThrottled.indexOf('.run();', connectionStep);
+    final cleanup = connectThrottled.indexOf('final cleanup = await connectionRepo.disconnect().run();', connectionRun);
+    final clearUserIntent = connectThrottled.indexOf('await startedByUserNotifier.update(false)', cleanup);
     final dialog = connectThrottled.indexOf('showCustomAlertFromErr', clearUserIntent);
     final terminalState = connectThrottled.indexOf('state = AsyncData(Disconnected(err));', clearUserIntent);
-    expect(connectionRun, isNonNegative);
+    expect(resultPipeline, isNonNegative);
+    expect(connectionStep, greaterThan(resultPipeline));
+    expect(connectionRun, greaterThan(connectionStep));
+    expect(cleanup, greaterThan(connectionRun));
     expect(clearUserIntent, isNonNegative);
     expect(clearUserIntent, greaterThan(connectionRun));
     expect(terminalState, greaterThan(clearUserIntent));

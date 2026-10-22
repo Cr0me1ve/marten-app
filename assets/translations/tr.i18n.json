@@ -589,7 +589,8 @@
       "notFound": "Profil bulunamadı",
       "invalidConfig": "Geçersiz yapılandırmalar",
       "invalidUrl": "Geçersiz URL",
-      "canceledByUser": "Kullanıcı tarafından iptal edildi"
+      "canceledByUser": "Kullanıcı tarafından iptal edildi",
+      "deviceLimit": "Bu abonelik için cihaz sınırına ulaşıldı"
     },
     "connectivity": {
       "unexpected": "Beklenmeyen hata",

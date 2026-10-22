@@ -589,7 +589,8 @@
       "notFound": "未找到配置文件",
       "invalidConfig": "配置无效",
       "invalidUrl": "URL 无效",
-      "canceledByUser": "用户已取消"
+      "canceledByUser": "用户已取消",
+      "deviceLimit": "此订阅的设备数量已达上限"
     },
     "connectivity": {
       "unexpected": "意外失败",

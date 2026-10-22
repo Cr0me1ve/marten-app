@@ -12,6 +12,7 @@ import 'package:marten/features/connection/model/connection_status.dart';
 import 'package:marten/features/connection/notifier/connection_notifier.dart';
 import 'package:marten/features/home/data/local_outbounds_provider.dart';
 import 'package:marten/features/profile/model/profile_entity.dart';
+import 'package:marten/features/profile/model/profile_failure.dart';
 import 'package:marten/features/profile/notifier/active_profile_notifier.dart';
 import 'package:marten/features/profile/notifier/profile_notifier.dart';
 import 'package:marten/features/profile/overview/profiles_notifier.dart';
@@ -271,13 +272,19 @@ class _PanelHeader extends HookConsumerWidget {
             IconButton(
               tooltip: t.pages.proxies.testDelay,
               onPressed: () async {
-                if (useLive) {
-                  await ref.read(proxiesOverviewNotifierProvider.notifier).urlTest("select");
-                } else {
-                  final outboundsFuture = ref.read(localOutboundsByProfileProvider(profile.id).future);
-                  final localPing = ref.read(localPingProvider.notifier);
-                  final outbounds = await outboundsFuture;
-                  await localPing.pingAll(profile.id, outbounds);
+                try {
+                  if (useLive) {
+                    await ref.read(proxiesOverviewNotifierProvider.notifier).urlTest("select");
+                  } else {
+                    final outboundsFuture = ref.read(localOutboundsByProfileProvider(profile.id).future);
+                    final localPing = ref.read(localPingProvider.notifier);
+                    final outbounds = await outboundsFuture;
+                    await localPing.pingAll(profile.id, outbounds);
+                  }
+                } catch (error) {
+                  if (context.mounted) {
+                    if (error is! ProfileFailure) CustomToast.error(t.presentShortError(error)).show(context);
+                  }
                 }
               },
               icon: const Icon(FluentIcons.flash_24_filled, color: Colors.white70),

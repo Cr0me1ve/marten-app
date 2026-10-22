@@ -21,6 +21,7 @@ object SettingsKey {
     // cache
 
     const val STARTED_BY_USER = "${KEY_PREFIX}started_by_user"
+    const val STRICT_VPN_ROUTE_VERIFIED = "${KEY_PREFIX}strict_vpn_route_verified"
     const val CONFIG_OPTIONS = "config_options_json"
 
     const val START_CORE_ON_STARTING_SERVICE = "${KEY_PREFIX}starting_core_on_starting_service"

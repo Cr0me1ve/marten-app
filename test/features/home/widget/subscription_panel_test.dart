@@ -166,6 +166,32 @@ void main() {
     profileState.dispose();
   });
 
+  testWidgets('outbound storage errors keep the last visible server without exposing technical details', (
+    tester,
+  ) async {
+    final profileState = _ProfileSwitchHarness(baseProfiles.take(1).toList());
+    final outboundsHarness = _OutboundsHarness(baseOutbounds.take(1).toList());
+
+    await _pumpPanel(
+      tester,
+      connectionStatus: const Disconnected(),
+      outbounds: baseOutbounds,
+      profileState: profileState,
+      outboundsHarness: outboundsHarness,
+    );
+    expect(find.text('Alpha'), findsOneWidget);
+
+    outboundsHarness.beginRefresh();
+    _invalidateLocalOutbounds(tester, profileState.activeProfile.id);
+    await tester.pump();
+    outboundsHarness.fail(StateError('MARTEN_STORAGE_INTERNAL_PATH'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Alpha'), findsOneWidget);
+    expect(find.textContaining('MARTEN_STORAGE_INTERNAL_PATH'), findsNothing);
+    profileState.dispose();
+  });
+
   testWidgets('non-disconnected phases show only the current selected server in a compact panel', (tester) async {
     final remoteProfile = ProfileEntity.remote(
       id: 'connected-refresh-profile-id',
@@ -769,6 +795,16 @@ class _OutboundsHarness {
     }
     refresh.complete(items);
     _future = Future.value(items);
+    _refresh = null;
+  }
+
+  void fail(Object error) {
+    final refresh = _refresh;
+    if (refresh == null) {
+      throw StateError('beginRefresh must be called before fail');
+    }
+    unawaited(refresh.future.then<void>((_) {}, onError: (Object _, StackTrace _) {}));
+    refresh.completeError(error);
     _refresh = null;
   }
 }

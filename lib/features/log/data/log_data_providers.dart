@@ -1,6 +1,8 @@
 import 'package:marten/core/directories/directories_provider.dart';
+import 'package:marten/core/localization/locale_preferences.dart';
 import 'package:marten/features/log/data/log_path_resolver.dart';
 import 'package:marten/features/log/data/log_repository.dart';
+import 'package:marten/gen/translations.g.dart';
 import 'package:marten/martencore/marten_core_service_provider.dart';
 import 'package:riverpod_annotation/riverpod_annotation.dart';
 
@@ -18,5 +20,8 @@ Future<LogRepository> logRepository(LogRepositoryRef ref) async {
 
 @Riverpod(keepAlive: true)
 LogPathResolver logPathResolver(LogPathResolverRef ref) {
-  return LogPathResolver(ref.watch(appDirectoriesProvider).requireValue.workingDir);
+  return LogPathResolver(
+    ref.watch(appDirectoriesProvider).requireValue.workingDir,
+    russian: ref.watch(localePreferencesProvider) == AppLocale.ru,
+  );
 }

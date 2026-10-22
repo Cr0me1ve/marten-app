@@ -589,7 +589,8 @@
       "notFound": "پروفایل یافت نشد",
       "invalidConfig": "کانفیگ‌های نامعتبر",
       "invalidUrl": "URL نامعتبر",
-      "canceledByUser": "توسط کاربر لغو شد"
+      "canceledByUser": "توسط کاربر لغو شد",
+      "deviceLimit": "سقف تعداد دستگاه‌ها برای این اشتراک پر شده است"
     },
     "connectivity": {
       "unexpected": "شکست غیرمنتظره",

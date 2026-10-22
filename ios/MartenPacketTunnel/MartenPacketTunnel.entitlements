@@ -15,6 +15,10 @@
     <array>
         <string>group.$(BASE_BUNDLE_IDENTIFIER)</string>
     </array>
+    <key>keychain-access-groups</key>
+    <array>
+        <string>$(AppIdentifierPrefix)$(BASE_BUNDLE_IDENTIFIER).shared</string>
+    </array>
     <key>com.apple.security.network.client</key>
     <true/>
     <key>com.apple.security.network.server</key>

@@ -4,6 +4,7 @@ import 'package:drift/drift.dart';
 import 'package:drift_dev/api/migrations_native.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:marten/core/db/db.dart';
+import 'package:marten/features/profile/model/profile_entity.dart';
 
 import 'generated/schema.dart';
 
@@ -11,6 +12,7 @@ import 'generated/schema_v1.dart' as v1;
 import 'generated/schema_v2.dart' as v2;
 import 'generated/schema_v3.dart' as v3;
 import 'generated/schema_v4.dart' as v4;
+import 'generated/schema_v6.dart' as v6;
 
 void main() {
   driftRuntimeOptions.dontWarnAboutMultipleDatabases = true;
@@ -93,6 +95,42 @@ void main() {
       },
     );
   });
+
+  test(
+    'migration from v6 to v7 preserves profiles and initializes revision to zero',
+    () async {
+      final lastUpdate = DateTime.utc(2026, 10, 15, 12, 34, 56);
+      final schema = await verifier.schemaAt(6);
+      addTearDown(() => schema.rawDatabase.dispose());
+      final oldDb = v6.DatabaseAtV6(schema.newConnection());
+      await oldDb
+          .into(oldDb.profileEntries)
+          .insert(
+            v6.ProfileEntriesCompanion.insert(
+              id: 'existing-remote',
+              type: 'remote',
+              active: true,
+              name: 'Existing profile',
+              url: const Value('https://edge.example/sub/preserved-token'),
+              lastUpdate: lastUpdate,
+            ),
+          );
+      await oldDb.close();
+
+      final migrated = Db(schema.newConnection());
+      final rows = await migrated.select(migrated.profileEntries).get();
+      await migrated.close();
+
+      expect(rows, hasLength(1));
+      expect(rows.single.id, 'existing-remote');
+      expect(rows.single.type, ProfileType.remote);
+      expect(rows.single.active, isTrue);
+      expect(rows.single.name, 'Existing profile');
+      expect(rows.single.url, 'https://edge.example/sub/preserved-token');
+      expect(rows.single.lastUpdate, lastUpdate);
+      expect(rows.single.revision, 0);
+    },
+  );
 
   group('_columnExists-backed migrations', () {
     test('migration from v3 to v4 adds test_url when missing', () async {

@@ -8,6 +8,7 @@ extension ProfileEntityMapper on ProfileEntity {
   ProfileEntriesCompanion toInsertEntry() => map(
     remote: (rp) => ProfileEntriesCompanion.insert(
       id: rp.id,
+      revision: Value(rp.revision),
       type: ProfileType.remote,
       active: rp.active,
       name: rp.name,
@@ -29,6 +30,7 @@ extension ProfileEntityMapper on ProfileEntity {
     ),
     local: (lp) => ProfileEntriesCompanion.insert(
       id: lp.id,
+      revision: Value(lp.revision),
       type: ProfileType.local,
       active: lp.active,
       name: lp.name,
@@ -95,6 +97,7 @@ extension ProfileEntryMapper on ProfileEntry {
     return switch (type) {
       ProfileType.remote => RemoteProfileEntity(
         id: id,
+        revision: revision,
         active: active,
         name: name,
         url: url!,
@@ -111,6 +114,7 @@ extension ProfileEntryMapper on ProfileEntry {
       ),
       ProfileType.local => LocalProfileEntity(
         id: id,
+        revision: revision,
         active: active,
         name: name,
         lastUpdate: lastUpdate,

@@ -595,7 +595,8 @@
       "notFound": "لم يتم العثور على الملف الشخصي",
       "invalidConfig": "تكوينات غير صالحة",
       "invalidUrl": "رابط غير صالح",
-      "canceledByUser": "تم الإلغاء من قبل المستخدم"
+      "canceledByUser": "تم الإلغاء من قبل المستخدم",
+      "deviceLimit": "تم بلوغ الحد الأقصى للأجهزة لهذا الاشتراك"
     },
     "connectivity": {
       "unexpected": "فشل غير متوقع",

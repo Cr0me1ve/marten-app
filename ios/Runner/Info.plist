@@ -4,6 +4,8 @@
 <dict>
 	<key>BASE_BUNDLE_IDENTIFIER</key>
 	<string>$(BASE_BUNDLE_IDENTIFIER)</string>
+	<key>MartenKeychainAccessGroup</key>
+	<string>$(AppIdentifierPrefix)$(PRODUCT_BUNDLE_IDENTIFIER)</string>
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
 	<key>CFBundleDevelopmentRegion</key>
@@ -99,7 +101,7 @@
 		<string>app.marten.client.subscription.refresh</string>
 	</array>
 	<key>FlutterDeepLinkingEnabled</key>
-	<true/>
+	<false/>
 	<key>CFBundleVersion</key>
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
 	<key>EXAppExtensionAttributes</key>
@@ -108,14 +110,11 @@
 		<string>com.apple.appintents-extension</string>
 	</dict>
 	<key>ITSAppUsesNonExemptEncryption</key>
-	<false/>
+	<true/>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSAppTransportSecurity</key>
 	<dict>
-		<!-- The TURNcoat dialer hosts the captcha proxy on 127.0.0.1:8765
-		     (plain HTTP, inside this app's process). The in-app WebView must
-		     be allowed to load it; everything else stays under ATS defaults. -->
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 		<key>NSExceptionDomains</key>
@@ -131,10 +130,6 @@
 	</dict>
 	<key>NSCameraUsageDescription</key>
 	<string>This app needs camera access to scan QR codes</string>
-	<!-- iOS 14+ requires explicit consent for any traffic to private network
-	     addresses, including the captcha proxy that the Network Extension
-	     hosts on 127.0.0.1:8765. Without this key WKWebView gets an opaque
-	     "no route to host" the first time it tries to load the proxy. -->
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Marten loads captcha challenges from the in-app proxy when establishing the tunnel.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
@@ -143,6 +138,27 @@
 	<string>$(SERVICE_IDENTIFIER)</string>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<false/>
+		<key>UISceneConfigurations</key>
+		<dict>
+			<key>UIWindowSceneSessionRoleApplication</key>
+			<array>
+				<dict>
+					<key>UISceneClassName</key>
+					<string>UIWindowScene</string>
+					<key>UISceneConfigurationName</key>
+					<string>flutter</string>
+					<key>UISceneDelegateClassName</key>
+					<string>$(PRODUCT_MODULE_NAME).SceneDelegate</string>
+					<key>UISceneStoryboardFile</key>
+					<string>Main</string>
+				</dict>
+			</array>
+		</dict>
+	</dict>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>fetch</string>

@@ -15,6 +15,7 @@ sealed class ProfileEntity with _$ProfileEntity {
 
   const factory ProfileEntity.remote({
     required String id,
+    @Default(0) int revision,
     required bool active,
     required String name,
     required String url,
@@ -32,6 +33,7 @@ sealed class ProfileEntity with _$ProfileEntity {
 
   const factory ProfileEntity.local({
     required String id,
+    @Default(0) int revision,
     required bool active,
     required String name,
     required DateTime lastUpdate,

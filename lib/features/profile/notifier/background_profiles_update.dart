@@ -10,6 +10,7 @@ import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:marten/core/app_info/app_info_provider.dart';
 import 'package:marten/core/device/device_identity.dart';
 import 'package:marten/core/directories/directories_provider.dart';
+import 'package:marten/core/preferences/general_preferences.dart';
 import 'package:marten/core/preferences/preferences_provider.dart';
 import 'package:marten/features/connection/data/connection_data_providers.dart';
 import 'package:marten/features/profile/data/background_profile_refresh_scope.dart';
@@ -23,6 +24,10 @@ const profilesBackgroundRefreshUniqueName = 'subscription-refresh';
 const profilesBackgroundRefreshTask = 'app.marten.client.subscription.refresh';
 const profilesBackgroundRefreshFrequency = Duration(hours: 1);
 const profilesBackgroundRefreshFlex = Duration(minutes: 15);
+
+@visibleForTesting
+String profilesBackgroundRefreshRegistrationName({required bool isIOS}) =>
+    isIOS ? profilesBackgroundRefreshTask : profilesBackgroundRefreshUniqueName;
 
 @pragma('vm:entry-point')
 void profilesBackgroundCallbackDispatcher() {
@@ -74,7 +79,7 @@ Future<void> initializeProfilesBackgroundRefresh({required bool debug}) async {
   await SubscriptionCompatibility.primeAndroidMetadata();
   await Workmanager().initialize(profilesBackgroundCallbackDispatcher);
   await Workmanager().registerPeriodicTask(
-    profilesBackgroundRefreshUniqueName,
+    profilesBackgroundRefreshRegistrationName(isIOS: Platform.isIOS),
     profilesBackgroundRefreshTask,
     frequency: profilesBackgroundRefreshFrequency,
     flexInterval: profilesBackgroundRefreshFlex,
@@ -94,6 +99,17 @@ Future<bool> _runBackgroundRefresh({CancelToken? cancelToken}) async {
     await container.read(appDirectoriesProvider.future);
     await container.read(appInfoProvider.future);
     await container.read(sharedPreferencesProvider.future);
+    if (Platform.isAndroid &&
+        container.read(Preferences.startedByUser) &&
+        !container.read(Preferences.strictVpnRouteVerified)) {
+      // An active Android session may still own the full-route blocker while
+      // startup or recovery is awaiting a fresh route proof. The native worker
+      // retries until it can prove either that route or a terminal release.
+      // A terminally disconnected app is deliberately allowed to refresh over
+      // its ordinary network, otherwise a dead saved server can prevent the
+      // subscription from ever receiving its replacement route.
+      return true;
+    }
     await container.read(deviceIdentityProvider.future);
     await container.read(profileRepositoryProvider.future);
 

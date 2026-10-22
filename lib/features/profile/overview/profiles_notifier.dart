@@ -58,7 +58,7 @@ class ProfilesNotifier extends _$ProfilesNotifier with AppLogger {
   }
 
   Future<void> deleteProfile(ProfileEntity profile) async {
-    loggy.debug('deleting profile: ${profile.name}');
+    loggy.debug('deleting profile');
 
     if (profile.active) await ref.read(connectionNotifierProvider.notifier).abortConnection();
     if (profile case final RemoteProfileEntity remoteProfile) {

@@ -1,14 +1,747 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:fake_async/fake_async.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fpdart/fpdart.dart';
 import 'package:marten/features/connection/data/connection_repository.dart';
 import 'package:marten/features/connection/model/connection_failure.dart';
 import 'package:marten/features/connection/model/connection_status.dart';
+import 'package:marten/features/home/data/local_outbounds_provider.dart';
 import 'package:marten/singbox/model/core_status.dart';
 
 void main() {
+  group('retained runtime feature restoration', () {
+    test('arms TURNcoat only when the selected route depends on it', () {
+      const ordinaryRoute = '''
+        {"outbounds":[
+          {"type":"vless","tag":"selected"},
+          {"type":"turncoat","tag":"unused-helper"}
+        ]}
+      ''';
+      const turncoatRoute = '''
+        {"outbounds":[
+          {"type":"vless","tag":"selected","detour":"captcha-helper"},
+          {"type":"turncoat","tag":"captcha-helper"}
+        ]}
+      ''';
+
+      expect(selectedOutboundUsesTurncoat(ordinaryRoute, 'selected'), isFalse);
+      expect(selectedOutboundUsesTurncoat(turncoatRoute, 'selected'), isTrue);
+    });
+
+    test('restoration requires the exact active config and current lifecycle before arming once', () {
+      final source = File('lib/features/connection/data/connection_repository.dart').readAsStringSync();
+      final restoreStart = source.indexOf(
+        'Future<bool> restoreActiveRuntimeFeatures(ProfileEntity profile, {bool Function()? isCurrent}) async {',
+      );
+      final restoreEnd = source.indexOf(
+        '\n  Future<({String? selectedTag, bool usesTurncoat})?> _matchingActiveRuntimeRoute',
+        restoreStart,
+      );
+      final matcherEnd = source.indexOf('\n  @override\n  Future<int?> tryBeginFlutterRestart', restoreEnd);
+      expect(restoreStart, isNonNegative);
+      expect(restoreEnd, greaterThan(restoreStart));
+      expect(matcherEnd, greaterThan(restoreEnd));
+
+      final restore = source.substring(restoreStart, restoreEnd);
+      final matcher = source.substring(restoreEnd, matcherEnd);
+      final routeMatch = restore.indexOf('final route = await _matchingActiveRuntimeRoute(profile);');
+      final staleCheck = restore.indexOf('route == null || _isConnectionStale(generation)');
+      final callbackCheck = restore.indexOf('isCurrent?.call() == false', staleCheck);
+      final livenessRead = restore.indexOf('final liveness = ref.read(turncoatLivenessNotifierProvider.notifier);');
+      final duplicateArmGuard = restore.indexOf(
+        '_restoredRuntimeFeaturesGeneration != generation || _restoredRuntimeLivenessGeneration != liveness.generation',
+      );
+      final arm = restore.indexOf('_armTurncoatFeatures(route.usesTurncoat, selectedTag: route.selectedTag)');
+      final featuresGenerationSaved = restore.indexOf('_restoredRuntimeFeaturesGeneration = generation;', arm);
+      final livenessGenerationSaved = restore.indexOf('_restoredRuntimeLivenessGeneration = liveness.generation;', arm);
+
+      expect(restore, contains('if (isCurrent?.call() == false) return false;'));
+      expect(routeMatch, isNonNegative);
+      expect(staleCheck, greaterThan(routeMatch));
+      expect(callbackCheck, greaterThan(staleCheck));
+      expect(livenessRead, greaterThan(callbackCheck));
+      expect(duplicateArmGuard, greaterThan(livenessRead));
+      expect(arm, greaterThan(duplicateArmGuard));
+      expect(featuresGenerationSaved, greaterThan(arm));
+      expect(livenessGenerationSaved, greaterThan(arm));
+      expect(featuresGenerationSaved, lessThan(livenessGenerationSaved));
+
+      expect(matcher, contains('selectedOutboundUsesTurncoat(prepared, selectedTag)'));
+      expect(matcher, contains('singbox.matchesActiveConfigGeneration(preparedFile.path)'));
+      expect(matcher, contains('await preparedFile.delete()'));
+      expect(matcher, contains('return matches && !_isConnectionStale(generation) ? route : null;'));
+    });
+  });
+
+  group('pending CAPTCHA resolution wait', () {
+    test('completes when the pending CAPTCHA resolves before its deadline', () {
+      fakeAsync((async) {
+        final resolution = Completer<void>();
+        final result = waitForPendingCaptchaResolution(
+          pendingAt: DateTime.now(),
+          resolution: resolution.future,
+          maxWait: const Duration(seconds: 30),
+        );
+        bool? resolved;
+        result.then((value) => resolved = value);
+
+        resolution.complete();
+        async.flushMicrotasks();
+
+        expect(resolved, isTrue);
+      });
+    });
+
+    test('rejects an already expired CAPTCHA even when its resolution is complete', () {
+      fakeAsync((async) {
+        final result = waitForPendingCaptchaResolution(
+          pendingAt: DateTime.now().subtract(const Duration(seconds: 30)),
+          resolution: Future<void>.value(),
+          maxWait: const Duration(seconds: 30),
+        );
+        bool? resolved;
+        result.then((value) => resolved = value);
+
+        async.flushMicrotasks();
+
+        expect(resolved, isFalse);
+      });
+    });
+
+    test('times out without reporting success when no CAPTCHA resolution arrives', () {
+      fakeAsync((async) {
+        final resolution = Completer<void>();
+        final result = waitForPendingCaptchaResolution(
+          pendingAt: DateTime.now(),
+          resolution: resolution.future,
+          maxWait: const Duration(seconds: 30),
+        );
+        bool? resolved;
+        result.then((value) => resolved = value);
+
+        async.elapse(const Duration(seconds: 30));
+        async.flushMicrotasks();
+        resolution.complete();
+        async.flushMicrotasks();
+
+        expect(resolved, isFalse);
+      });
+    });
+  });
+
+  group('startup route CAPTCHA verification', () {
+    test('gives each post-CAPTCHA probe a fresh route budget and admits only a probe success', () {
+      fakeAsync((async) {
+        final clock = async.getClock(DateTime.utc(2026));
+        final firstResolution = Completer<void>();
+        final secondResolution = Completer<void>();
+        var challenge = (createdAt: clock.now(), resolution: firstResolution.future);
+        final budgets = <Duration>[];
+        var calls = 0;
+        bool? verified;
+
+        verifyStartupRouteWithCaptcha(
+          verifyRoute: (timeout) {
+            budgets.add(timeout);
+            calls += 1;
+            return switch (calls) {
+              1 => Future<bool>.delayed(const Duration(seconds: 12), () => false),
+              2 => Future<bool>.delayed(const Duration(seconds: 5), () {
+                challenge = (createdAt: clock.now(), resolution: secondResolution.future);
+                return false;
+              }),
+              3 => Future<bool>.delayed(const Duration(seconds: 5), () => true),
+              _ => throw StateError('unexpected route probe'),
+            };
+          },
+          latestChallenge: () => challenge,
+          isCancelled: () => false,
+          now: clock.now,
+        ).then((value) => verified = value);
+
+        async.elapse(const Duration(seconds: 12));
+        async.flushMicrotasks();
+        expect(verified, isNull, reason: 'a pending CAPTCHA alone must not admit the route');
+
+        async.elapse(const Duration(seconds: 47));
+        firstResolution.complete();
+        async.flushMicrotasks();
+        async.elapse(const Duration(seconds: 5));
+        async.flushMicrotasks();
+        expect(verified, isNull, reason: 'a replacement CAPTCHA alone must not admit the route');
+
+        async.elapse(const Duration(seconds: 2));
+        secondResolution.complete();
+        async.flushMicrotasks();
+        async.elapse(const Duration(seconds: 5));
+        async.flushMicrotasks();
+
+        expect(verified, isTrue);
+        expect(budgets, const [Duration(seconds: 12), Duration(seconds: 12), Duration(seconds: 12)]);
+      });
+    });
+
+    test('does not repeat a failed probe for the same challenge or without a challenge', () {
+      fakeAsync((async) {
+        final clock = async.getClock(DateTime.utc(2026));
+        final resolution = Completer<void>()..complete();
+        final challenge = (createdAt: clock.now(), resolution: resolution.future);
+        var calls = 0;
+        bool? sameChallengeResult;
+
+        verifyStartupRouteWithCaptcha(
+          verifyRoute: (_) async {
+            calls += 1;
+            return false;
+          },
+          latestChallenge: () => challenge,
+          isCancelled: () => false,
+          now: clock.now,
+        ).then((value) => sameChallengeResult = value);
+        async.flushMicrotasks();
+
+        expect(sameChallengeResult, isFalse);
+        expect(calls, 2);
+
+        calls = 0;
+        bool? noChallengeResult;
+        verifyStartupRouteWithCaptcha(
+          verifyRoute: (_) async {
+            calls += 1;
+            return false;
+          },
+          latestChallenge: () => null,
+          isCancelled: () => false,
+          now: clock.now,
+        ).then((value) => noChallengeResult = value);
+        async.flushMicrotasks();
+
+        expect(noChallengeResult, isFalse);
+        expect(calls, 1);
+      });
+    });
+
+    test('bounds endlessly revised CAPTCHA retries by the overall deadline and clips the final probe', () {
+      fakeAsync((async) {
+        final clock = async.getClock(DateTime.utc(2026));
+        final budgets = <Duration>[];
+        var calls = 0;
+        ({DateTime createdAt, Future<void> resolution})? challenge;
+        bool? verified;
+
+        verifyStartupRouteWithCaptcha(
+          verifyRoute: (timeout) {
+            budgets.add(timeout);
+            calls += 1;
+            return Future<bool>.delayed(timeout, () {
+              challenge = (createdAt: clock.now(), resolution: Future<void>.delayed(const Duration(seconds: 1)));
+              return false;
+            });
+          },
+          latestChallenge: () => challenge,
+          isCancelled: () => false,
+          overallTimeout: const Duration(seconds: 84),
+          now: clock.now,
+        ).then((value) => verified = value);
+
+        async.elapse(const Duration(seconds: 84));
+        async.flushMicrotasks();
+
+        expect(verified, isFalse);
+        expect(calls, 7);
+        expect(budgets.sublist(0, 6), List.filled(6, const Duration(seconds: 12)));
+        expect(budgets.last, const Duration(seconds: 6));
+      });
+    });
+
+    test('does not launch another probe when cancellation happens while awaiting a CAPTCHA', () {
+      fakeAsync((async) {
+        final clock = async.getClock(DateTime.utc(2026));
+        final resolution = Completer<void>();
+        final challenge = (createdAt: clock.now(), resolution: resolution.future);
+        var cancelled = false;
+        var calls = 0;
+        bool? verified;
+
+        verifyStartupRouteWithCaptcha(
+          verifyRoute: (_) async {
+            calls += 1;
+            return false;
+          },
+          latestChallenge: () => challenge,
+          isCancelled: () => cancelled,
+          now: clock.now,
+        ).then((value) => verified = value);
+        async.flushMicrotasks();
+
+        cancelled = true;
+        resolution.complete();
+        async.flushMicrotasks();
+
+        expect(verified, isFalse);
+        expect(calls, 1);
+      });
+    });
+
+    test('does not admit a positive route result after its start generation is superseded in flight', () {
+      fakeAsync((async) {
+        final clock = async.getClock(DateTime.utc(2026));
+        final inFlightProof = Completer<bool>();
+        var generationIsStale = false;
+        bool? verified;
+
+        verifyStartupRouteWithCaptcha(
+          verifyRoute: (_) => inFlightProof.future,
+          latestChallenge: () => null,
+          isCancelled: () => generationIsStale,
+          now: clock.now,
+        ).then((value) => verified = value);
+        async.flushMicrotasks();
+        expect(verified, isNull, reason: 'route proof is still pending for this generation');
+
+        generationIsStale = true;
+        inFlightProof.complete(true);
+        async.flushMicrotasks();
+
+        expect(verified, isFalse, reason: 'a stale successful probe must not open the route-ready gate');
+      });
+    });
+
+    test('fails when the unresolved CAPTCHA expires', () {
+      fakeAsync((async) {
+        final clock = async.getClock(DateTime.utc(2026));
+        final resolution = Completer<void>();
+        final challenge = (createdAt: clock.now(), resolution: resolution.future);
+        var calls = 0;
+        bool? verified;
+
+        verifyStartupRouteWithCaptcha(
+          verifyRoute: (_) async {
+            calls += 1;
+            return false;
+          },
+          latestChallenge: () => challenge,
+          isCancelled: () => false,
+          now: clock.now,
+        ).then((value) => verified = value);
+        async.flushMicrotasks();
+        async.elapse(const Duration(seconds: 60));
+        async.flushMicrotasks();
+
+        expect(verified, isFalse);
+        expect(calls, 1);
+      });
+    });
+
+    test('uses one fresh-progress probe after a failed 36-second route verification and admits only its success', () {
+      fakeAsync((async) {
+        final clock = async.getClock(DateTime.utc(2026));
+        final budgets = <Duration>[];
+        var freshProgress = false;
+        var calls = 0;
+        bool? verified;
+
+        verifyStartupRouteWithCaptcha(
+          routeTimeout: const Duration(seconds: 36),
+          verifyRoute: (timeout) {
+            budgets.add(timeout);
+            calls += 1;
+            return Future<bool>.delayed(
+              timeout == const Duration(seconds: 36) ? timeout : const Duration(seconds: 1),
+              () {
+                if (calls == 1) freshProgress = true;
+                return calls == 2;
+              },
+            );
+          },
+          latestChallenge: () => null,
+          hasFreshRouteProgress: () => freshProgress,
+          isCancelled: () => false,
+          now: clock.now,
+        ).then((value) => verified = value);
+
+        async.elapse(const Duration(seconds: 37));
+        async.flushMicrotasks();
+
+        expect(verified, isTrue);
+        expect(budgets, const [Duration(seconds: 36), Duration(seconds: 12)]);
+      });
+    });
+
+    test('allows only one failed fresh-progress probe', () {
+      fakeAsync((async) {
+        final clock = async.getClock(DateTime.utc(2026));
+        final budgets = <Duration>[];
+        bool? verified;
+
+        verifyStartupRouteWithCaptcha(
+          routeTimeout: const Duration(seconds: 36),
+          verifyRoute: (timeout) {
+            budgets.add(timeout);
+            return Future<bool>.value(false);
+          },
+          latestChallenge: () => null,
+          hasFreshRouteProgress: () => true,
+          isCancelled: () => false,
+          now: clock.now,
+        ).then((value) => verified = value);
+        async.flushMicrotasks();
+
+        expect(verified, isFalse);
+        expect(budgets, const [Duration(seconds: 36), Duration(seconds: 12)]);
+      });
+    });
+
+    test('does not add a progress probe when no fresh progress exists', () {
+      fakeAsync((async) {
+        final clock = async.getClock(DateTime.utc(2026));
+        final budgets = <Duration>[];
+        bool? verified;
+
+        verifyStartupRouteWithCaptcha(
+          routeTimeout: const Duration(seconds: 36),
+          verifyRoute: (timeout) {
+            budgets.add(timeout);
+            return Future<bool>.value(false);
+          },
+          latestChallenge: () => null,
+          hasFreshRouteProgress: () => false,
+          isCancelled: () => false,
+          now: clock.now,
+        ).then((value) => verified = value);
+        async.flushMicrotasks();
+
+        expect(verified, isFalse);
+        expect(budgets, const [Duration(seconds: 36)]);
+      });
+    });
+
+    test('does not add a progress probe after cancellation', () {
+      fakeAsync((async) {
+        final clock = async.getClock(DateTime.utc(2026));
+        final budgets = <Duration>[];
+        var cancelled = false;
+        bool? verified;
+
+        verifyStartupRouteWithCaptcha(
+          routeTimeout: const Duration(seconds: 36),
+          verifyRoute: (timeout) {
+            budgets.add(timeout);
+            cancelled = true;
+            return Future<bool>.value(false);
+          },
+          latestChallenge: () => null,
+          hasFreshRouteProgress: () => true,
+          isCancelled: () => cancelled,
+          now: clock.now,
+        ).then((value) => verified = value);
+        async.flushMicrotasks();
+
+        expect(verified, isFalse);
+        expect(budgets, const [Duration(seconds: 36)]);
+      });
+    });
+
+    test('clips the one progress probe to the remaining overall deadline', () {
+      fakeAsync((async) {
+        final clock = async.getClock(DateTime.utc(2026));
+        final budgets = <Duration>[];
+        bool? verified;
+
+        verifyStartupRouteWithCaptcha(
+          routeTimeout: const Duration(seconds: 36),
+          overallTimeout: const Duration(seconds: 40),
+          verifyRoute: (timeout) {
+            budgets.add(timeout);
+            return Future<bool>.delayed(timeout, () => false);
+          },
+          latestChallenge: () => null,
+          hasFreshRouteProgress: () => true,
+          isCancelled: () => false,
+          now: clock.now,
+        ).then((value) => verified = value);
+        async.elapse(const Duration(seconds: 40));
+        async.flushMicrotasks();
+
+        expect(verified, isFalse);
+        expect(budgets, const [Duration(seconds: 36), Duration(seconds: 4)]);
+      });
+    });
+
+    test('honors a new CAPTCHA that arrives after the progress probe while budget remains', () {
+      fakeAsync((async) {
+        final clock = async.getClock(DateTime.utc(2026));
+        final challengeResolution = Completer<void>()..complete();
+        ({DateTime createdAt, Future<void> resolution})? challenge;
+        final budgets = <Duration>[];
+        var calls = 0;
+        bool? verified;
+
+        verifyStartupRouteWithCaptcha(
+          routeTimeout: const Duration(seconds: 36),
+          verifyRoute: (timeout) {
+            budgets.add(timeout);
+            calls += 1;
+            return Future<bool>.delayed(timeout == const Duration(seconds: 36) ? timeout : Duration.zero, () {
+              if (calls == 2) challenge = (createdAt: clock.now(), resolution: challengeResolution.future);
+              return calls == 3;
+            });
+          },
+          latestChallenge: () => challenge,
+          hasFreshRouteProgress: () => calls >= 1,
+          isCancelled: () => false,
+          now: clock.now,
+        ).then((value) => verified = value);
+        async.elapse(const Duration(seconds: 72));
+        async.flushMicrotasks();
+
+        expect(verified, isTrue);
+        expect(budgets, const [Duration(seconds: 36), Duration(seconds: 12), Duration(seconds: 36)]);
+      });
+    });
+  });
+
+  group('bounded startup route probes', () {
+    test('allows one uninterrupted 36-second iOS TURNcoat probe to verify after 25 seconds', () {
+      fakeAsync((async) {
+        final clock = async.getClock(DateTime.utc(2026));
+        final budgets = <Duration>[];
+        ({bool connectionStale, bool routeVerified, bool endpointFallbackAllowed})? result;
+
+        runStartupRouteProbes(
+          timeout: const Duration(seconds: 36),
+          maxAttemptTimeout: const Duration(seconds: 36),
+          probe: (budget) {
+            budgets.add(budget);
+            return Future<StartupRouteProbeResult>.delayed(
+              const Duration(seconds: 25),
+              () => (connectionStale: false, error: null, delay: 25),
+            );
+          },
+          isCancelled: () => false,
+          now: clock.now,
+        ).then((value) => result = value);
+
+        async.elapse(const Duration(seconds: 25));
+        async.flushMicrotasks();
+
+        expect(result, (connectionStale: false, routeVerified: true, endpointFallbackAllowed: false));
+        expect(budgets, const [Duration(seconds: 36)]);
+      });
+    });
+
+    test('does not split a full 36-second iOS TURNcoat attempt into retries', () {
+      fakeAsync((async) {
+        final clock = async.getClock(DateTime.utc(2026));
+        final budgets = <Duration>[];
+        ({bool connectionStale, bool routeVerified, bool endpointFallbackAllowed})? result;
+
+        runStartupRouteProbes(
+          timeout: const Duration(seconds: 36),
+          maxAttemptTimeout: const Duration(seconds: 36),
+          probe: (budget) {
+            budgets.add(budget);
+            return Future<StartupRouteProbeResult>.delayed(
+              budget,
+              () => (connectionStale: false, error: 'network', delay: null),
+            );
+          },
+          isCancelled: () => false,
+          now: clock.now,
+        ).then((value) => result = value);
+
+        async.elapse(const Duration(seconds: 36));
+        async.flushMicrotasks();
+
+        expect(result, (connectionStale: false, routeVerified: false, endpointFallbackAllowed: false));
+        expect(budgets, const [Duration(seconds: 36)]);
+      });
+    });
+
+    test('keeps cancellation and the default 12-second attempt cap unchanged', () {
+      fakeAsync((async) {
+        final clock = async.getClock(DateTime.utc(2026));
+        final defaultBudgets = <Duration>[];
+        var cancelled = false;
+        ({bool connectionStale, bool routeVerified, bool endpointFallbackAllowed})? cancellationResult;
+
+        runStartupRouteProbes(
+          timeout: const Duration(seconds: 36),
+          probe: (budget) {
+            defaultBudgets.add(budget);
+            cancelled = true;
+            return Future<StartupRouteProbeResult>.value((connectionStale: false, error: 'network', delay: null));
+          },
+          isCancelled: () => cancelled,
+          now: clock.now,
+        ).then((value) => cancellationResult = value);
+        async.flushMicrotasks();
+
+        expect(cancellationResult, (connectionStale: true, routeVerified: false, endpointFallbackAllowed: false));
+        expect(defaultBudgets, const [Duration(seconds: 12)]);
+      });
+    });
+
+    test('retries after a full failed network attempt and admits only the next measured success', () {
+      fakeAsync((async) {
+        final clock = async.getClock(DateTime.utc(2026));
+        final budgets = <Duration>[];
+        var calls = 0;
+        ({bool connectionStale, bool routeVerified, bool endpointFallbackAllowed})? result;
+
+        runStartupRouteProbes(
+          timeout: const Duration(seconds: 36),
+          probe: (budget) {
+            budgets.add(budget);
+            calls += 1;
+            if (calls == 1) {
+              return Future<StartupRouteProbeResult>.delayed(
+                budget,
+                () => (connectionStale: false, error: 'network', delay: null),
+              );
+            }
+            return Future<StartupRouteProbeResult>.delayed(
+              const Duration(seconds: 1),
+              () => (connectionStale: false, error: null, delay: 42),
+            );
+          },
+          isCancelled: () => false,
+          now: clock.now,
+        ).then((value) => result = value);
+
+        async.elapse(const Duration(seconds: 13, milliseconds: 700));
+        async.flushMicrotasks();
+
+        expect(result, (connectionStale: false, routeVerified: true, endpointFallbackAllowed: false));
+        expect(budgets, const [Duration(seconds: 12), Duration(seconds: 12)]);
+      });
+    });
+
+    test('caps three failed network attempts at the 36-second overall budget', () {
+      fakeAsync((async) {
+        final clock = async.getClock(DateTime.utc(2026));
+        final budgets = <Duration>[];
+        ({bool connectionStale, bool routeVerified, bool endpointFallbackAllowed})? result;
+
+        runStartupRouteProbes(
+          timeout: const Duration(seconds: 36),
+          probe: (budget) {
+            budgets.add(budget);
+            return Future<StartupRouteProbeResult>.delayed(
+              budget,
+              () => (connectionStale: false, error: 'network', delay: null),
+            );
+          },
+          isCancelled: () => false,
+          now: clock.now,
+        ).then((value) => result = value);
+
+        async.elapse(const Duration(seconds: 36));
+        async.flushMicrotasks();
+
+        expect(result, (connectionStale: false, routeVerified: false, endpointFallbackAllowed: false));
+        expect(budgets, const [Duration(seconds: 12), Duration(seconds: 12), Duration(seconds: 10, milliseconds: 600)]);
+      });
+    });
+
+    test('keeps an ordinary 12-second budget to one stalled network attempt', () {
+      fakeAsync((async) {
+        final clock = async.getClock(DateTime.utc(2026));
+        final budgets = <Duration>[];
+        ({bool connectionStale, bool routeVerified, bool endpointFallbackAllowed})? result;
+
+        runStartupRouteProbes(
+          timeout: const Duration(seconds: 12),
+          probe: (budget) {
+            budgets.add(budget);
+            return Future<StartupRouteProbeResult>.delayed(
+              budget,
+              () => (connectionStale: false, error: 'network', delay: null),
+            );
+          },
+          isCancelled: () => false,
+          now: clock.now,
+        ).then((value) => result = value);
+
+        async.elapse(const Duration(seconds: 12));
+        async.flushMicrotasks();
+
+        expect(result, (connectionStale: false, routeVerified: false, endpointFallbackAllowed: false));
+        expect(budgets, const [Duration(seconds: 12)]);
+      });
+    });
+
+    test('does not launch another probe when cancellation arrives during retry backoff', () {
+      fakeAsync((async) {
+        final clock = async.getClock(DateTime.utc(2026));
+        var cancelled = false;
+        var calls = 0;
+        ({bool connectionStale, bool routeVerified, bool endpointFallbackAllowed})? result;
+
+        runStartupRouteProbes(
+          timeout: const Duration(seconds: 36),
+          probe: (_) async {
+            calls += 1;
+            return (connectionStale: false, error: 'network', delay: null);
+          },
+          isCancelled: () => cancelled,
+          now: clock.now,
+        ).then((value) => result = value);
+        async.flushMicrotasks();
+
+        cancelled = true;
+        async.elapse(const Duration(milliseconds: 700));
+        async.flushMicrotasks();
+
+        expect(result, (connectionStale: true, routeVerified: false, endpointFallbackAllowed: false));
+        expect(calls, 1);
+      });
+    });
+
+    test('never admits a stale success', () {
+      fakeAsync((async) {
+        final clock = async.getClock(DateTime.utc(2026));
+        ({bool connectionStale, bool routeVerified, bool endpointFallbackAllowed})? result;
+
+        runStartupRouteProbes(
+          timeout: const Duration(seconds: 36),
+          probe: (_) async => (connectionStale: true, error: null, delay: 1),
+          isCancelled: () => false,
+          now: clock.now,
+        ).then((value) => result = value);
+        async.flushMicrotasks();
+
+        expect(result, (connectionStale: true, routeVerified: false, endpointFallbackAllowed: false));
+      });
+    });
+
+    test('permits endpoint fallback only for a measured non-timeout zero delay', () {
+      fakeAsync((async) {
+        final clock = async.getClock(DateTime.utc(2026));
+        for (final sample in <({String? error, int? delay, bool fallback})>[
+          (error: null, delay: null, fallback: false),
+          (error: 'network', delay: 0, fallback: false),
+          (error: null, delay: 65535, fallback: false),
+          (error: null, delay: 0, fallback: true),
+        ]) {
+          ({bool connectionStale, bool routeVerified, bool endpointFallbackAllowed})? result;
+          runStartupRouteProbes(
+            timeout: const Duration(seconds: 1),
+            probe: (_) async => (connectionStale: false, error: sample.error, delay: sample.delay),
+            isCancelled: () => false,
+            now: clock.now,
+          ).then((value) => result = value);
+          async.elapse(const Duration(seconds: 1));
+          async.flushMicrotasks();
+
+          expect(result, (connectionStale: false, routeVerified: false, endpointFallbackAllowed: sample.fallback));
+        }
+      });
+    });
+  });
+
   group('native recovery route gate', () {
     test('reopens only after a running core completes Android recovery', () {
       final starting = nativeRecoveryRouteGateTransition(
@@ -83,8 +816,8 @@ void main() {
       expect(stoppedWithAlert, (pending: false, routeReady: false));
 
       final source = File('lib/features/connection/data/connection_repository.dart').readAsStringSync();
-      final platformStreamStart = source.indexOf('final platformStatus = singbox');
-      final combineStart = source.indexOf('return Rx.combineLatest3', platformStreamStart);
+      final platformStreamStart = source.indexOf('final platformEvents = singbox');
+      final combineStart = source.indexOf('return Rx.combineLatest2', platformStreamStart);
       expect(platformStreamStart, isNonNegative);
       expect(combineStart, greaterThan(platformStreamStart));
       final platformStream = source.substring(platformStreamStart, combineStart);
@@ -92,18 +825,68 @@ void main() {
       expect(platformStream, contains('previous: _lastObservedPlatformStatus'));
       expect(RegExp(r'pending:\s*_nativePlatformRecoveryRouteGatePending').hasMatch(platformStream), isTrue);
     });
+
+    test('iOS recovery keeps the route gate closed while a fresh startup verification is pending', () {
+      final restarting = nativeRecoveryRouteGateTransition(
+        previous: const CoreStatus.started(),
+        current: const CoreStatus.starting(),
+        pending: false,
+        startupVerificationInProgress: true,
+      );
+      final started = nativeRecoveryRouteGateTransition(
+        previous: const CoreStatus.starting(),
+        current: const CoreStatus.started(),
+        pending: restarting.pending,
+        startupVerificationInProgress: true,
+      );
+
+      expect(restarting, (pending: true, routeReady: false));
+      expect(started, (pending: false, routeReady: false));
+
+      final source = File('lib/features/connection/data/connection_repository.dart').readAsStringSync();
+      final coreStatusStart = source.indexOf('final coreStatus = resilientRuntimeStatus');
+      final platformBranch = source.indexOf('if (!Platform.isAndroid)', coreStatusStart);
+      final coreStatus = coreStatusStart < 0 || platformBranch < 0
+          ? ''
+          : source.substring(coreStatusStart, platformBranch);
+      expect(coreStatus, contains('startupVerificationInProgress: Platform.isIOS && _connectionOperationInProgress'));
+    });
+
+    test('native recovery preserves the legacy gate reopening when no startup verification is active', () {
+      final restarting = nativeRecoveryRouteGateTransition(
+        previous: const CoreStatus.started(),
+        current: const CoreStatus.starting(),
+        pending: false,
+      );
+      final started = nativeRecoveryRouteGateTransition(
+        previous: const CoreStatus.starting(),
+        current: const CoreStatus.started(),
+        pending: restarting.pending,
+      );
+
+      expect(started, (pending: false, routeReady: true));
+    });
+
+    test('a delayed duplicate Started event does not reopen an iOS verification gate', () {
+      final duplicate = nativeRecoveryRouteGateTransition(
+        previous: const CoreStatus.started(),
+        current: const CoreStatus.started(),
+        pending: false,
+        startupVerificationInProgress: true,
+      );
+
+      expect(duplicate, (pending: false, routeReady: null));
+    });
   });
 
   group('android route gate', () {
     test('platform service is authoritative for every Android connection status', () {
-      expect(connectionStatusFromAndroidPlatform(const CoreStatus.starting(), false), const Connecting());
-      expect(connectionStatusFromAndroidPlatform(const CoreStatus.started(), false), const Connecting());
-      expect(connectionStatusFromAndroidPlatform(const CoreStatus.started(), true), const Connected());
-      expect(connectionStatusFromAndroidPlatform(const CoreStatus.stopping(), true), const Disconnecting());
+      expect(connectionStatusFromAndroidPlatform(const CoreStatus.starting()), const Connecting());
+      expect(connectionStatusFromAndroidPlatform(const CoreStatus.started()), const Connected());
+      expect(connectionStatusFromAndroidPlatform(const CoreStatus.stopping()), const Disconnecting());
       expect(
         connectionStatusFromAndroidPlatform(
           const CoreStatus.stopped(alert: CoreAlert.startFailed, message: 'route failed'),
-          true,
         ),
         isA<Disconnected>(),
       );
@@ -119,26 +902,27 @@ void main() {
       expect(androidRouteGateReset(const CoreStatus.started()), isNull);
     });
 
-    test('route-gated Starting and Started remain separate raw lifecycle events despite the same visible status', () {
+    test('route-gated Starting and Started remain separate raw lifecycle events', () {
       final rawLifecycleStatuses = [
-        connectionStatusFromAndroidPlatform(const CoreStatus.starting(), false),
-        connectionStatusFromAndroidPlatform(const CoreStatus.started(), false),
+        connectionStatusFromAndroidPlatform(const CoreStatus.starting()),
+        connectionStatusFromAndroidPlatform(const CoreStatus.started()),
       ];
 
-      expect(rawLifecycleStatuses, [const Connecting(), const Connecting()]);
+      expect(rawLifecycleStatuses, [const Connecting(), const Connected()]);
+      expect(rawLifecycleStatuses.first, isNot(rawLifecycleStatuses.last));
       expect(
-        rawLifecycleStatuses.first,
         rawLifecycleStatuses.last,
-        reason: 'the notifier must see the final Started-derived Connecting to start route verification',
+        isA<Connected>(),
+        reason: 'platform Started is route-verified and directly visible',
       );
 
       final source = File('lib/features/connection/data/connection_repository.dart').readAsStringSync();
-      final androidBranch = source.indexOf('final platformStatus = singbox');
+      final androidBranch = source.indexOf('final platformEvents = singbox');
       final methodEnd = source.indexOf('\n  @override\n  TaskEither<ConnectionFailure, Unit> connect', androidBranch);
       expect(androidBranch, isNonNegative);
       expect(methodEnd, greaterThan(androidBranch));
       final androidStream = source.substring(androidBranch, methodEnd);
-      expect(androidStream, contains('Rx.combineLatest3<CoreStatus, bool, CoreStatus, ConnectionStatus>('));
+      expect(androidStream, contains('Rx.combineLatest2<CoreStatus, CoreStatus, ConnectionStatus>('));
       expect(
         androidStream,
         isNot(contains('.distinct()')),
@@ -158,12 +942,65 @@ void main() {
       expect(watch, contains('watchPlatformServiceStatus()'));
       expect(watch, contains('androidRouteGateReset('));
       expect(watch, contains('_startupRouteReadyController.stream'));
+      expect(watch, contains('return Rx.combineLatest2<CoreStatus, bool, ConnectionStatus>('));
+      expect(watch, contains('return Rx.combineLatest2<CoreStatus, CoreStatus, ConnectionStatus>('));
       expect(
         RegExp(r'watchStatus\(\)\.handleError|runtimeStatus\.handleError').hasMatch(watch),
         isTrue,
         reason: 'Android runtime stream transport errors must not terminate the UI stream during native recovery',
       );
       expect(watch, contains('watchPlatformServiceStatus()\n        .handleError'));
+      expect(watch, contains('androidPlatformStatusWithSnapshot('));
+      expect(watch, contains('singbox.platformServiceStatusSnapshot'));
+      final androidBranch = watch.indexOf('final platformEvents = singbox');
+      final routeReadyForNonAndroid = watch.indexOf('return Rx.combineLatest2<CoreStatus, bool, ConnectionStatus>(');
+      final routeReadyBranch = watch.indexOf('if (!Platform.isAndroid) {');
+      expect(androidBranch, isNonNegative);
+      expect(routeReadyForNonAndroid, isNonNegative);
+      expect(routeReadyBranch, isNonNegative);
+      expect(routeReadyBranch, lessThan(routeReadyForNonAndroid));
+      expect(routeReadyForNonAndroid, lessThan(androidBranch));
+      expect(watch, contains('return Rx.combineLatest2<CoreStatus, CoreStatus, ConnectionStatus>('));
+      expect(watch.substring(androidBranch), isNot(contains('_startupRouteReadyController.stream')));
+    });
+
+    test('seeded Started is emitted first and visible as Connected', () async {
+      final platformEvents = StreamController<CoreStatus>();
+      addTearDown(platformEvents.close);
+
+      final mapped = androidPlatformStatusWithSnapshot(
+        platformEvents.stream,
+        const CoreStatus.started(),
+      ).map(connectionStatusFromAndroidPlatform).take(3).toList();
+
+      platformEvents
+        ..add(const CoreStatus.starting())
+        ..add(const CoreStatus.started());
+      await platformEvents.close();
+
+      final states = await mapped;
+      expect(states.first, const Connected());
+      expect(states, [const Connected(), const Connecting(), const Connected()]);
+      expect(states.any((status) => status is Disconnected), isFalse);
+    });
+
+    test('null snapshot waits for a real event and does not emit synthetic Stopped', () async {
+      final platformEvents = StreamController<CoreStatus>();
+      addTearDown(platformEvents.close);
+
+      final mapped = androidPlatformStatusWithSnapshot(
+        platformEvents.stream,
+        null,
+      ).map(connectionStatusFromAndroidPlatform).take(2).toList();
+
+      await Future<void>.delayed(Duration.zero);
+      platformEvents.add(const CoreStatus.starting());
+      platformEvents.add(const CoreStatus.started());
+      await platformEvents.close();
+
+      final states = await mapped;
+      expect(states, [const Connecting(), const Connected()]);
+      expect(states.any((status) => status is Disconnected), isFalse);
     });
   });
 
@@ -201,18 +1038,24 @@ void main() {
       );
     });
 
-    test('cold attach gates already started Android core until route verification', () {
+    test('legacy startupRouteReady primitive is false on Android while presentation stays platform-authoritative', () {
       expect(initialStartupRouteReady, isTrue);
       expect(initialStartupRouteReadyForPlatform(isAndroid: false), isTrue);
       expect(initialStartupRouteReadyForPlatform(isAndroid: true), isFalse);
+      expect(connectionStatusFromAndroidPlatform(const CoreStatus.started()), const Connected());
     });
 
-    test('Android cold attach keeps retained started core connecting until route is verified', () {
+    test('Android cold attach with retained platform Started renders immediately connected', () async {
       final startupRouteReady = initialStartupRouteReadyForPlatform(isAndroid: true);
 
       expect(startupRouteReady, isFalse);
-      expect(connectionStatusFromCore(const CoreStatus.started(), startupRouteReady), const Connecting());
-      expect(connectionStatusFromCore(const CoreStatus.started(), true), const Connected());
+      expect(
+        await androidPlatformStatusWithSnapshot(
+          const Stream<CoreStatus>.empty(),
+          const CoreStatus.started(),
+        ).map(connectionStatusFromAndroidPlatform).first,
+        const Connected(),
+      );
     });
 
     test('started core status clears a previous disconnecting state', () {
@@ -359,6 +1202,16 @@ void main() {
       expect(probe.type, 'vless');
       expect(probe.server, 'de-01.example');
       expect(probe.serverPort, 443);
+      expect(
+        startupRouteVerificationFor(startupEndpoint: probe),
+        StartupRouteVerification.endpointFallback,
+        reason: 'non-iOS callers retain the established TCP endpoint fallback',
+      );
+      expect(
+        startupRouteVerificationFor(startupEndpoint: probe, requireHttpsProof: true),
+        StartupRouteVerification.urlTest,
+        reason: 'an open VLESS server port does not establish iOS HTTPS reachability',
+      );
     });
 
     test('uses endpoint probe for native VLESS startup', () {
@@ -393,10 +1246,91 @@ void main() {
       expect(selectedStartupEndpointProbe(raw, 'Hysteria'), isNull);
     });
 
+    test('TURNcoat Hysteria2 route with endpoint metadata remains on the URL test gate', () {
+      const raw = '''
+{
+  "outbounds": [
+    {"type": "selector", "tag": "select", "outbounds": ["Marten route"]},
+    {"type": "hysteria2", "tag": "Marten route", "server": "hy.example", "server_port": 443, "detour": "turncoat-helper"},
+    {"type": "turncoat", "tag": "turncoat-helper"}
+  ]
+}
+''';
+
+      final parsedRoute = parseLocalOutbounds(raw).singleWhere((outbound) => outbound.tag == 'Marten route');
+      expect(parsedRoute.type, 'hysteria2');
+      expect(parsedRoute.usesTurncoat, isTrue);
+      final endpoint = selectedStartupEndpointProbe(raw, 'Marten route');
+      expect(endpoint, isNull);
+      expect(startupRouteVerificationFor(startupEndpoint: endpoint), StartupRouteVerification.urlTest);
+      expect(
+        startupRouteVerificationFor(startupEndpoint: endpoint, requireHttpsProof: true),
+        StartupRouteVerification.urlTest,
+        reason: 'Hysteria2 has no endpoint fallback, and iOS must retain the URL proof',
+      );
+    });
+
+    test('VLESS with a TURNcoat dependency can still select endpoint startup verification', () {
+      const raw = '''
+{
+  "outbounds": [
+    {"type": "selector", "tag": "select", "outbounds": ["VLESS route"]},
+    {"type": "vless", "tag": "VLESS route", "server": "vless.example", "server_port": 443, "detour": "turncoat-helper"},
+    {"type": "turncoat", "tag": "turncoat-helper"}
+  ]
+}
+''';
+
+      final parsedRoute = parseLocalOutbounds(raw).singleWhere((outbound) => outbound.tag == 'VLESS route');
+      expect(parsedRoute.type, 'vless');
+      expect(parsedRoute.usesTurncoat, isTrue);
+      final endpoint = selectedStartupEndpointProbe(raw, 'VLESS route');
+      expect(endpoint, isNotNull);
+      expect(endpoint!.server, 'vless.example');
+      expect(endpoint.serverPort, 443);
+      expect(
+        startupRouteVerificationFor(startupEndpoint: endpoint),
+        StartupRouteVerification.endpointFallback,
+        reason: 'desktop behavior retains the TURNcoat VLESS TCP endpoint fallback',
+      );
+      expect(
+        startupRouteVerificationFor(startupEndpoint: endpoint, requireHttpsProof: true),
+        StartupRouteVerification.urlTest,
+        reason: 'TURNcoat presence cannot make an iOS TCP endpoint ping prove HTTPS',
+      );
+    });
+
+    test('iOS requests HTTPS startup verification at the connection call site', () {
+      final source = File('lib/features/connection/data/connection_repository.dart').readAsStringSync();
+      final verificationCall = source.indexOf('startupRouteVerificationFor(');
+      final verificationEnd = source.indexOf('\n              );', verificationCall);
+      final call = verificationCall < 0 || verificationEnd < 0
+          ? ''
+          : source.substring(verificationCall, verificationEnd);
+
+      expect(call, isNotEmpty);
+      expect(call, contains('requireHttpsProof: Platform.isIOS'));
+    });
+
     test('rejects failed selected route watchdog results', () {
       expect(selectedRouteHealthFailure('timeout', null), isNotNull);
       expect(selectedRouteHealthFailure(null, null), isNotNull);
       expect(selectedRouteHealthFailure(null, (tag: 'US 1', delay: 65535)), isNotNull);
+    });
+
+    test('does not retain selected-route identifiers or raw core errors in watchdog failures', () {
+      const privateTag = 'Synthetic [Private] Route';
+      const rawCoreError = 'synthetic private grpc diagnostic';
+      final urlTestFailure = selectedRouteHealthFailure(rawCoreError, (tag: privateTag, delay: 65535));
+      final delayFailure = selectedRouteHealthFailure(null, (tag: privateTag, delay: 65535));
+
+      for (final failure in [urlTestFailure, delayFailure]) {
+        final rendered = failure.toString();
+        expect(rendered, isNot(contains(privateTag)));
+        expect(rendered, isNot(contains(rawCoreError)));
+        expect(rendered, contains('selected route watchdog'));
+      }
+      expect(delayFailure.toString(), contains('delay=65535'));
     });
   });
 
@@ -424,6 +1358,40 @@ void main() {
           left(localCoreControlChannelFailureMessage),
           operation: 'select outbound',
         ),
+        throwsA(isA<BackgroundCoreNotAvailable>().having((failure) => failure.message, 'message', isNull)),
+      );
+    });
+
+    test('returns the selected outbound value unchanged', () {
+      expect(requirePreparedOutboundSelection<String>(right('prepared outbound')), 'prepared outbound');
+    });
+
+    test('turns selected outbound failures into a generic user-facing failure without route or core details', () {
+      const selectedTag = 'private-selected-route';
+      const coreError = 'grpc core rejected $selectedTag';
+
+      expect(
+        () => requirePreparedOutboundSelection<Unit>(left(coreError)),
+        throwsA(
+          isA<UnexpectedConnectionFailure>()
+              .having((failure) => failure.error, 'message', 'selected route could not be applied')
+              .having(
+                (failure) => failure.error.toString(),
+                'does not expose selected route',
+                isNot(contains(selectedTag)),
+              )
+              .having(
+                (failure) => failure.error.toString(),
+                'does not expose raw core error',
+                isNot(contains(coreError)),
+              ),
+        ),
+      );
+    });
+
+    test('preserves the typed unavailable-background-core failure for selected outbound selection', () {
+      expect(
+        () => requirePreparedOutboundSelection<Unit>(left(localCoreControlChannelFailureMessage)),
         throwsA(isA<BackgroundCoreNotAvailable>().having((failure) => failure.message, 'message', isNull)),
       );
     });
@@ -524,7 +1492,107 @@ void main() {
     test('interrupted in-flight start receives a final safety stop', () {
       expect(shouldRunFinalStopAfterInterrupt(previousOperationInProgress: true), isTrue);
     });
+
+    test('Android and iOS disconnect paths force platform cleanup when stopping core service', () {
+      final source = File('lib/features/connection/data/connection_repository.dart').readAsStringSync();
+      final stopCurrentStart = source.indexOf('Future<Either<ConnectionFailure, Unit>> _stopConnectionNow() {');
+      final stopCurrentEnd = source.indexOf('\n  void _resetStaleConnectionFeatures() {', stopCurrentStart);
+      expect(stopCurrentStart, isNonNegative);
+      expect(stopCurrentEnd, greaterThan(stopCurrentStart));
+      final stopCurrent = source.substring(stopCurrentStart, stopCurrentEnd);
+      final compactStopCurrent = stopCurrent.replaceAll(RegExp(r'\s+'), '');
+
+      expect(
+        compactStopCurrent,
+        contains('returnsingbox.stop(forcePlatformCleanup:PlatformUtils.isAndroid||PlatformUtils.isIOS)'),
+        reason: 'Android rejected starts and iOS pending VPN consent both require authoritative platform cleanup',
+      );
+      expect(compactStopCurrent, isNot(contains('returnsingbox.stop().')));
+    });
   });
+
+  test('failed start cleanup rechecks generation before surfacing either cleanup or startup failure', () {
+    final source = File('lib/features/connection/data/connection_repository.dart').readAsStringSync();
+    final preparedStart = source.indexOf('TaskEither<ConnectionFailure, Unit> _withPreparedConfig(');
+    final preparedEnd = source.indexOf('\n  TaskEither<ConnectionFailure, Unit> _unlessConnectionStale', preparedStart);
+    final prepared = source.substring(preparedStart, preparedEnd);
+    final cleanup = prepared.indexOf('final cleanupFailure = await _stopFailedStartupRoute(startupRoute);');
+    final staleAfterCleanup = prepared.indexOf('if (_isConnectionStale(generation)) {', cleanup);
+    final resetStale = prepared.indexOf('_resetStaleConnectionFeatures();', staleAfterCleanup);
+    final returnQuietly = prepared.indexOf('return unit;', resetStale);
+    final cleanupError = prepared.indexOf('if (cleanupFailure != null) throw cleanupFailure;', returnQuietly);
+    final originalError = prepared.indexOf('Error.throwWithStackTrace(error, stackTrace);', cleanupError);
+
+    expect(cleanup, isNonNegative);
+    expect(staleAfterCleanup, greaterThan(cleanup));
+    expect(resetStale, greaterThan(staleAfterCleanup));
+    expect(returnQuietly, greaterThan(resetStale));
+    expect(cleanupError, greaterThan(returnQuietly));
+    expect(originalError, greaterThan(cleanupError));
+  });
+
+  test('failed startup stop returns a typed failure instead of throwing before stale ownership can be checked', () {
+    final source = File('lib/features/connection/data/connection_repository.dart').readAsStringSync();
+    final start = source.indexOf('Future<ConnectionFailure?> _stopFailedStartupRoute(');
+    final end = source.indexOf('\n  void _setStartupRouteReady', start);
+    final cleanup = source.substring(start, end);
+
+    expect(cleanup, contains('final result = await singbox.stop().run();'));
+    expect(cleanup, contains('return result.match<ConnectionFailure?>('));
+    expect(cleanup, contains("ConnectionFailure.unexpected('failed to stop/close startup route"));
+    expect(cleanup, isNot(contains('throw ')));
+  });
+
+  test(
+    'prepared Android start carries its exact epoch and suppresses failure only for affirmative native Stop ownership',
+    () {
+      final source = File('lib/features/connection/data/connection_repository.dart').readAsStringSync();
+      final connectStart = source.indexOf('TaskEither<ConnectionFailure, Unit> connect(');
+      final connectEnd = source.indexOf(
+        '\n  TaskEither<ConnectionFailure, Unit> _serializedConnectionTask',
+        connectStart,
+      );
+      final connect = source.substring(connectStart, connectEnd);
+      final preparedStart = source.indexOf('TaskEither<ConnectionFailure, Unit> _withPreparedConfig(');
+      final preparedEnd = source.indexOf(
+        '\n  TaskEither<ConnectionFailure, Unit> _unlessConnectionStale',
+        preparedStart,
+      );
+      final prepared = source.substring(preparedStart, preparedEnd);
+      final markerHelperStart = source.indexOf('Future<bool> _wasExplicitlyStoppedByAndroid(');
+      final markerHelperEnd = source.indexOf('\n  Future<void> _stopStaleConnectionOperation', markerHelperStart);
+      final markerHelper = source.substring(markerHelperStart, markerHelperEnd);
+
+      expect(connect, contains('androidVpnStartEpoch: androidVpnStartEpoch'));
+      expect(
+        connect,
+        contains('singbox.start(path, displayName, disableMemoryLimit, androidVpnStartEpoch: androidVpnStartEpoch)'),
+      );
+      expect(markerHelper, contains('wasVpnUserSessionExplicitlyStopped(androidVpnStartEpoch)'));
+      expect(markerHelper, contains('return explicitlyStopped == true;'));
+      expect(markerHelper, isNot(contains('?? true')));
+
+      final markerBeforeCleanup = prepared.indexOf('if (await _wasExplicitlyStoppedByAndroid(androidVpnStartEpoch)) {');
+      final cleanup = prepared.indexOf(
+        'final cleanupFailure = await _stopFailedStartupRoute(startupRoute);',
+        markerBeforeCleanup,
+      );
+      final markerAfterCleanup = prepared.indexOf(
+        'if (await _wasExplicitlyStoppedByAndroid(androidVpnStartEpoch)) {',
+        cleanup,
+      );
+      final cleanupFailure = prepared.indexOf('if (cleanupFailure != null) throw cleanupFailure;', markerAfterCleanup);
+      final originalFailure = prepared.indexOf('Error.throwWithStackTrace(error, stackTrace);', cleanupFailure);
+
+      expect(markerBeforeCleanup, isNonNegative);
+      expect(cleanup, greaterThan(markerBeforeCleanup));
+      expect(markerAfterCleanup, greaterThan(cleanup));
+      expect(cleanupFailure, greaterThan(markerAfterCleanup));
+      expect(originalFailure, greaterThan(cleanupFailure));
+      expect(prepared.substring(markerBeforeCleanup, cleanup), contains('_resetSupersededConnectionFeatures();'));
+      expect(prepared.substring(markerAfterCleanup, cleanupFailure), contains('_resetSupersededConnectionFeatures();'));
+    },
+  );
 
   test('_interruptConnectionOperation marks stop intent before queued disconnect coalescing', () {
     final source = File('lib/features/connection/data/connection_repository.dart').readAsStringSync();
@@ -636,84 +1704,56 @@ void main() {
     ]);
   });
 
-  test('reconnectCoreForPlatform<String> uses Android stop+start ordering', () async {
-    final events = <String>[];
-    final stop = TaskEither<String, Unit>(() async {
-      events.add('stop');
-      return right(unit);
-    });
-    final start = TaskEither<String, Unit>(() async {
-      events.add('start');
-      return right(unit);
-    });
-    final restart = TaskEither<String, Unit>(() async {
-      events.add('restart');
-      return right(unit);
-    });
+  test('profile reconnect uses a single prepared-config restart on every platform', () {
+    final source = File('lib/features/connection/data/connection_repository.dart').readAsStringSync();
+    final reconnectStart = source.indexOf('@override\n  TaskEither<ConnectionFailure, Unit> reconnect(');
+    final reconnectEnd = source.indexOf(
+      '\n  @override\n  TaskEither<ConnectionFailure, Unit> syncNativeResumeConfig',
+      reconnectStart,
+    );
+    final preparedStart = source.indexOf('TaskEither<ConnectionFailure, Unit> _withPreparedConfig(');
+    final preparedEnd = source.indexOf('\n  TaskEither<ConnectionFailure, Unit> _unlessConnectionStale', preparedStart);
+    expect(reconnectStart, isNonNegative);
+    expect(reconnectEnd, greaterThan(reconnectStart));
+    expect(preparedStart, isNonNegative);
+    expect(preparedEnd, greaterThan(preparedStart));
+    final reconnect = source.substring(reconnectStart, reconnectEnd);
+    final prepared = source.substring(preparedStart, preparedEnd);
 
-    final result = await reconnectCoreForPlatform<String>(
-      isAndroid: true,
-      stop: stop,
-      start: start,
-      restart: restart,
-    ).run();
+    final applyOptions = reconnect.indexOf('applyConfigOption(activeProfile)');
+    final withPrepared = reconnect.indexOf('_withPreparedConfig(', applyOptions);
+    final restart = reconnect.indexOf('singbox.restart(path, displayName, disableMemoryLimit)', withPrepared);
+    expect(applyOptions, isNonNegative);
+    expect(withPrepared, greaterThan(applyOptions));
+    expect(restart, greaterThan(withPrepared));
+    expect(
+      reconnect,
+      isNot(contains('Platform.isAndroid')),
+      reason: 'Android and non-Android profile reloads must share the same atomic restart path',
+    );
+    expect(
+      reconnect,
+      isNot(contains('singbox.stop(')),
+      reason: 'profile reload must not retire the Android service-owned full-route TUN',
+    );
+    expect(reconnect, isNot(contains('singbox.start(')));
+    expect(reconnect, isNot(contains('reconnectCoreForPlatform')));
 
-    expect(result.isRight(), isTrue);
-    expect(events, ['stop', 'start']);
-    expect(events, isNot(contains('restart')));
-  });
-
-  test('reconnectCoreForPlatform<String> uses restart only on non-Android', () async {
-    final events = <String>[];
-    final stop = TaskEither<String, Unit>(() async {
-      events.add('stop');
-      return right(unit);
-    });
-    final start = TaskEither<String, Unit>(() async {
-      events.add('start');
-      return right(unit);
-    });
-    final restart = TaskEither<String, Unit>(() async {
-      events.add('restart');
-      return right(unit);
-    });
-
-    final result = await reconnectCoreForPlatform<String>(
-      isAndroid: false,
-      stop: stop,
-      start: start,
-      restart: restart,
-    ).run();
-
-    expect(result.isRight(), isTrue);
-    expect(events, ['restart']);
-    expect(events, isNot(contains('start')));
-    expect(events, isNot(contains('stop')));
-  });
-
-  test('reconnectCoreForPlatform<String> keeps a stop Left and skips downstream start', () async {
-    final events = <String>[];
-    final stop = TaskEither<String, Unit>(() async {
-      events.add('stop');
-      return left('stop failed');
-    });
-    final start = TaskEither<String, Unit>(() async {
-      events.add('start');
-      return right(unit);
-    });
-    final restart = TaskEither<String, Unit>(() async {
-      events.add('restart');
-      return right(unit);
-    });
-
-    final result = await reconnectCoreForPlatform<String>(
-      isAndroid: true,
-      stop: stop,
-      start: start,
-      restart: restart,
-    ).run();
-
-    result.match((failure) => expect(failure, 'stop failed'), (_) => fail('expected stop branch left to be preserved'));
-    expect(events, ['stop']);
+    final lifecycleMark = prepared.indexOf('singbox.beginManualBackgroundLifecycle();');
+    final clearRouteProof = prepared.indexOf('_setStartupRouteReady(false);', lifecycleMark);
+    final verifiedStart = prepared.indexOf('await singbox.notifyBackgroundStarted();', clearRouteProof);
+    final publishRouteProof = prepared.indexOf('_setStartupRouteReady(true);', verifiedStart);
+    expect(
+      lifecycleMark,
+      isNonNegative,
+      reason: 'restart must retain the fresh manual lifecycle admission in _withPreparedConfig',
+    );
+    expect(clearRouteProof, greaterThan(lifecycleMark));
+    expect(verifiedStart, greaterThan(clearRouteProof));
+    expect(
+      publishRouteProof,
+      greaterThan(verifiedStart),
+      reason: 'the new route may be published only after native markStarted/route proof succeeds',
+    );
   });
 }

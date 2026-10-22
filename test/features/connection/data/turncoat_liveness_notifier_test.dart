@@ -1,8 +1,80 @@
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
+import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:marten/features/connection/data/turncoat_liveness_notifier.dart';
+import 'package:marten/martencore/marten_core_service_provider.dart';
 
 void main() {
   group('turncoat liveness log detection', () {
+    late ProviderContainer container;
+
+    setUp(() {
+      container = ProviderContainer();
+      // Build the notifier against the production core-service provider, as
+      // the connection flow does before it arms a TURNcoat startup cycle.
+      container.read(martenCoreServiceProvider);
+      container.read(turncoatLivenessNotifierProvider);
+    });
+
+    tearDown(() {
+      container.dispose();
+    });
+
+    testWidgets('verified route proof settles the armed generation and cancels its timeout', (tester) async {
+      final notifier = container.read(turncoatLivenessNotifierProvider.notifier);
+
+      notifier.arm(inUse: true, selectedTag: 'selected-route');
+      final generation = notifier.generation;
+      notifier.acceptVerifiedRouteProof(expectedGeneration: generation);
+
+      expect(
+        container.read(turncoatLivenessNotifierProvider),
+        const TurncoatLivenessState(inUse: true, live: true, routeActive: true),
+      );
+
+      // testWidgets supplies fake time through WidgetTester, so this exercises
+      // the real timer callback without sleeping for 75 seconds.
+      await tester.pump(TurncoatLivenessNotifier.connectTimeout + const Duration(seconds: 1));
+      expect(container.read(turncoatLivenessNotifierProvider).timedOut, isFalse);
+    });
+
+    test('verified route proof rejects generations made stale by re-arm or reset', () {
+      final notifier = container.read(turncoatLivenessNotifierProvider.notifier);
+
+      notifier.arm(inUse: true, selectedTag: 'first-route');
+      final firstGeneration = notifier.generation;
+      notifier.arm(inUse: true, selectedTag: 'replacement-route');
+      final rearmedGeneration = notifier.generation;
+
+      notifier.acceptVerifiedRouteProof(expectedGeneration: firstGeneration);
+      expect(container.read(turncoatLivenessNotifierProvider), const TurncoatLivenessState(inUse: true));
+
+      notifier.reset();
+      notifier.acceptVerifiedRouteProof(expectedGeneration: rearmedGeneration);
+      expect(container.read(turncoatLivenessNotifierProvider), const TurncoatLivenessState());
+    });
+
+    test('Android ordinary-network admission settles route proof before its first async gate', () {
+      final source = File('lib/features/connection/notifier/connection_notifier.dart').readAsStringSync();
+      const admissionMethod = 'Future<void> _admitAndroidOrdinaryNetworking(int? epoch) async {';
+      final methodStart = source.indexOf(admissionMethod);
+      expect(methodStart, greaterThanOrEqualTo(0), reason: 'ordinary-network admission method must exist');
+
+      final routeProof = source.indexOf(
+        'turncoatLiveness.acceptVerifiedRouteProof(expectedGeneration: turncoatLivenessGeneration);',
+        methodStart,
+      );
+      final firstAsyncGate = source.indexOf('await strictVpnEgressGate.admitVerifiedVpnRoute()', methodStart);
+      expect(routeProof, greaterThanOrEqualTo(0), reason: 'verified Android route proof must settle TURNcoat liveness');
+      expect(
+        firstAsyncGate,
+        greaterThanOrEqualTo(0),
+        reason: 'ordinary-network admission must retain its strict VPN gate',
+      );
+      expect(routeProof, lessThan(firstAsyncGate));
+    });
+
     test('timed out state stops holding the UI in connecting', () {
       const state = TurncoatLivenessState(inUse: true, timedOut: true);
 

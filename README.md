@@ -42,11 +42,11 @@ More detail for contributors is in [docs/development.md](docs/development.md). F
 
 Native builds, including `flutter run`, need separately built artifacts from [marten-core](https://github.com/Cr0me1ve/marten-core) and its [marten-sing-box](https://github.com/Cr0me1ve/marten-sing-box) dependency. Native artifacts are intentionally not committed here, so a fresh clone is sufficient for Flutter and Dart work but not for running or packaging a native build. The platform preparation targets in [Makefile](Makefile) show where those artifacts are expected during a release build.
 
-The public Android workflow downloads a stripped, SHA256-pinned `marten-core.aar` from this repository's dependency release, verifies its embedded revisions, runs the Flutter and Android test suites, and builds an arm64 APK on a GitHub-hosted runner. A `vX.Y.Z` tag publishes the verified APK, checksum, signing-certificate report, and provenance metadata to [GitHub Releases](https://github.com/Cr0me1ve/marten-app/releases). Repository pushes and tags use the stable signing identity stored in GitHub Secrets, and the workflow rejects an unexpected certificate digest. The native core itself is built separately; the public app workflow only packages the pinned artifact.
+Source pushes and pull requests run the Flutter test suite on GitHub-hosted runners. Native Android packaging is started manually through the Android workflow with a matching `marten-core.aar` release, its SHA256 checksums, and its expected embedded revisions. The workflow verifies those inputs, runs Android tests, and packages an arm64 APK. An optional `vX.Y.Z` release tag publishes the verified APK and provenance after a successful manual build. Signing credentials remain in GitHub Secrets; native runtime artifacts are not committed to the source tree.
 
 ## Optional Firebase setup
 
-Firebase configuration files are intentionally excluded from the repository. Android push support and privacy-safe Crashlytics reporting are optional; without local Firebase configuration, both integrations are disabled gracefully and the rest of the app continues to work. Crash reporting is also disabled by default at runtime and requires explicit user opt-in.
+Firebase configuration files are intentionally excluded from the repository. Android push support and privacy-safe Crashlytics reporting are optional; without local Firebase configuration, both integrations are disabled gracefully and the rest of the app continues to work. When configured, crash reporting is enabled by default and can be disabled at any time in Settings.
 
 ## Subscription refresh API
 

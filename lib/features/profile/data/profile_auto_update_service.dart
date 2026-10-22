@@ -1,5 +1,6 @@
 import 'package:dio/dio.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
+import 'package:marten/core/network/strict_vpn_egress_gate.dart';
 import 'package:marten/features/profile/data/profile_data_providers.dart';
 import 'package:marten/features/profile/data/profile_parser.dart';
 import 'package:marten/features/profile/data/profile_refresh_diagnostics.dart';
@@ -16,9 +17,11 @@ typedef ProfileAutoUpdateResult = ({String id, String name, ProfileAutoUpdateOut
 typedef ProfileRefreshRequest = ({bool force, DateTime? now, bool validate});
 
 class ProfileAutoUpdateService with AppLogger {
-  ProfileAutoUpdateService(this._ref);
+  ProfileAutoUpdateService(this._ref, {StrictVpnEgressAdmission? egressAdmission})
+    : _egressAdmission = egressAdmission ?? strictVpnEgressGate;
 
   final Ref _ref;
+  final StrictVpnEgressAdmission _egressAdmission;
   final Map<String, _ProfileRefreshWork> _refreshWorkByProfile = {};
 
   Future<List<ProfileAutoUpdateResult>> updateProfiles({
@@ -106,9 +109,14 @@ class ProfileAutoUpdateService with AppLogger {
       return (id: profile.id, name: profile.name, outcome: ProfileAutoUpdateOutcome.skipped, failure: null);
     }
 
-    final result = await profilesRepo
-        .upsertRemote(profile.url, validate: request.validate, cancelToken: cancelToken)
-        .run();
+    // A profile reconnect deliberately seals ordinary Dart networking until
+    // Android proves the replacement VPN route. Keep refresh transaction work
+    // coalesced and dormant behind that exact admission instead of surfacing a
+    // zero-duration network error or attempting direct physical egress.
+    final result = await _egressAdmission.runWhenAdmitted(
+      'subscription refresh',
+      () => profilesRepo.refreshRemote(profile, validate: request.validate, cancelToken: cancelToken).run(),
+    );
     return result.match(
       (failure) {
         _logRefreshFailure(phase: 'download_or_persist', failure: failure);

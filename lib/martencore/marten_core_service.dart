@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart' show kDebugMode;
 import 'package:fpdart/fpdart.dart';
 import 'package:grpc/grpc.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
@@ -130,22 +131,49 @@ bool acceptsBackgroundLogGeneration({
   required int currentGeneration,
 }) => !isAndroid || listenerGeneration == null || listenerGeneration == currentGeneration;
 
+const _nativeRecoveryLogBridgeRetryDelays = <Duration>[
+  Duration(seconds: 2),
+  Duration(seconds: 4),
+  Duration(seconds: 8),
+  Duration(seconds: 16),
+  Duration(seconds: 32),
+  Duration(seconds: 60),
+];
+
+@visibleForTesting
+Duration nativeRecoveryLogBridgeRetryDelay(int consecutiveFailures) =>
+    _nativeRecoveryLogBridgeRetryDelays[consecutiveFailures.clamp(0, _nativeRecoveryLogBridgeRetryDelays.length - 1)];
+
+@visibleForTesting
+bool shouldSweepCoreLogRetention({required DateTime? lastSweepAt, required DateTime now}) =>
+    lastSweepAt == null || now.difference(lastSweepAt) >= const Duration(minutes: 1);
+
+@visibleForTesting
+List<T> boundedCoreLogSnapshot<T>(List<T> values, {int limit = 1000}) {
+  assert(limit > 0);
+  final start = values.length > limit ? values.length - limit : 0;
+  return List<T>.unmodifiable(values.getRange(start, values.length));
+}
+
 class MartenCoreService with InfraLogger {
-  MartenCoreService(this.ref);
+  MartenCoreService(this.ref, {CoreInterface? core}) : core = core ?? getCoreInterface();
   final Ref ref;
   static const _foregroundSetupTimeout = Duration(seconds: 14);
   static const _coreStartTimeout = Duration(seconds: 35);
   static const _platformStopTimeout = Duration(seconds: 35);
   static const _outboundInfoSnapshotTimeout = Duration(seconds: 2);
+  static const _observationPlatformSnapshotTimeout = Duration(milliseconds: 250);
   static const _coreStatusSnapshotTimeout = Duration(milliseconds: 900);
   static const _restartSettleTimeout = Duration(seconds: 8);
   static const _restartSettlePollInterval = Duration(milliseconds: 200);
   static const _startSettleTimeout = Duration(seconds: 10);
   static const _startSettlePollInterval = Duration(milliseconds: 200);
-  static const _nativeRecoveryLogBridgePollInterval = Duration(milliseconds: 400);
+  static const _coreLogBufferLimit = 1000;
+  static const _coreLogBufferSlack = 200;
+  static const _logUiSnapshotInterval = Duration(milliseconds: 250);
 
   // CoreMartenCoreService() {}
-  final core = getCoreInterface();
+  final CoreInterface core;
 
   CoreStatus currentState = const CoreStatus.stopped();
   final statusController = BehaviorSubject<CoreStatus>();
@@ -166,8 +194,14 @@ class MartenCoreService with InfraLogger {
   Future<void>? _platformTriggeredInitFuture;
   int _statusRevision = 0;
   int _nativeRecoveryLogBridgeGeneration = 0;
+  Completer<void>? _nativeRecoveryLogBridgeStopSignal;
+  Timer? _nativeRecoveryLogBridgeRetryTimer;
+  Completer<void>? _nativeRecoveryLogBridgeRetryWaiter;
   int? _startedBackgroundGeneration;
+  bool _frontAttached = true;
+  int _frontLifecycleGeneration = 0;
   bool _disposed = false;
+  DateTime? _lastCoreLogRetentionSweepAt;
 
   void _setCurrentState(CoreStatus next, {bool emit = true}) {
     _statusRevision++;
@@ -193,13 +227,39 @@ class MartenCoreService with InfraLogger {
 
   Future<bool> notifyBackgroundStarted() => core.notifyBackgroundStarted();
 
+  Future<int?> claimVpnStartLease() => core.claimVpnStartLease();
+
+  Future<void> cancelVpnStartLease(int token) => core.cancelVpnStartLease(token);
+
+  Future<int?> tryJoinVerifiedVpnAdmission() => core.tryJoinVerifiedVpnAdmission();
+
+  Future<int?> beginVpnStartAdmission({
+    bool resumeSession = false,
+    int? explicitStartLease,
+    bool nativeHandoffClaim = false,
+  }) => core.beginVpnStartAdmission(
+    resumeSession: resumeSession,
+    explicitStartLease: explicitStartLease,
+    nativeHandoffClaim: nativeHandoffClaim,
+  );
+
   Future<bool> storeNativeResumeConfig(String path, String name) => core.storeNativeResumeConfig(path, name);
 
   Future<bool> clearNativeResumeConfig() => core.clearNativeResumeConfig();
 
   Future<bool?> readPlatformStartedByUser() => core.readPlatformStartedByUser();
 
-  Future<CoreStatus?> readPlatformServiceStatus() => core.readPlatformServiceStatus();
+  Future<bool?> wasVpnUserSessionExplicitlyStopped(int epoch) => core.wasVpnUserSessionExplicitlyStopped(epoch);
+
+  CoreStatus? get platformServiceStatusSnapshot => _latestPlatformServiceStatus;
+
+  Future<CoreStatus?> readPlatformServiceStatus() async {
+    final status = await core.readPlatformServiceStatus();
+    if (status != null) _latestPlatformServiceStatus = status;
+    return status;
+  }
+
+  Future<bool> matchesActiveConfigGeneration(String path) => core.matchesActiveConfigGeneration(path);
 
   Stream<CoreStatus> watchPlatformServiceStatus() => core.watchServiceStatus();
 
@@ -230,6 +290,8 @@ class MartenCoreService with InfraLogger {
 
   Future<int?> tryBeginFlutterRestart() => core.tryBeginFlutterRestart();
 
+  Future<bool> validateFlutterRestart(int token) => core.validateFlutterRestart(token);
+
   Future<void> endFlutterRestart(int token) => core.endFlutterRestart(token);
 
   Future<void> init() async {
@@ -258,6 +320,23 @@ class MartenCoreService with InfraLogger {
         .run();
   }
 
+  Future<void> resumeFront() async {
+    final lifecycleGeneration = ++_frontLifecycleGeneration;
+    _frontAttached = true;
+    await init();
+    if (lifecycleGeneration != _frontLifecycleGeneration || !_frontAttached || !PlatformUtils.isAndroid) {
+      return;
+    }
+    final foregroundReady = await _ensureForegroundControlReady();
+    if (lifecycleGeneration != _frontLifecycleGeneration || !_frontAttached) return;
+    if (foregroundReady.isLeft()) {
+      loggy.warning("foreground core control channel was not restored after resume");
+      return;
+    }
+    if (core.isSingleChannel()) return;
+    await startListeningLogs("bg", core.bgClient);
+  }
+
   /// validates config by path and save it
   ///
   /// [path] is used to save validated config
@@ -266,25 +345,20 @@ class MartenCoreService with InfraLogger {
 
   TaskEither<String, Unit> validateConfigByPath(String path, String tempPath, bool debug) {
     return TaskEither(() async {
-      try {
-        final response = await core.fgClient.parse(ParseRequest(tempPath: tempPath, configPath: path, debug: false));
-        if (response.responseCode != ResponseCode.OK) return left("${response.responseCode} ${response.message}");
-      } catch (e) {
-        await setup().run();
-        final response = await core.fgClient.parse(ParseRequest(tempPath: tempPath, configPath: path, debug: false));
-        if (response.responseCode != ResponseCode.OK) return left("${response.responseCode} ${response.message}");
-      }
+      final foregroundReady = await _ensureForegroundControlReady();
+      final setupError = foregroundReady.match<String?>((err) => err, (_) => null);
+      if (setupError != null) return left(setupError);
+      final response = await core.fgClient.parse(ParseRequest(tempPath: tempPath, configPath: path, debug: false));
+      if (response.responseCode != ResponseCode.OK) return left("${response.responseCode} ${response.message}");
       return right(unit);
     });
   }
 
   TaskEither<String, String> generateFullConfigByPath(String path) {
     return TaskEither(() async {
-      if (!core.isInitialized()) {
-        final setupResult = await setup().run();
-        final setupError = setupResult.match<String?>((err) => err, (_) => null);
-        if (setupError != null) return left(setupError);
-      }
+      final foregroundReady = await _ensureForegroundControlReady();
+      final setupError = foregroundReady.match<String?>((err) => err, (_) => null);
+      if (setupError != null) return left(setupError);
 
       final response = await core.fgClient.parse(ParseRequest(configPath: path, debug: false));
       if (response.responseCode != ResponseCode.OK) return left("${response.responseCode} ${response.message}");
@@ -352,27 +426,67 @@ class MartenCoreService with InfraLogger {
     }
   }
 
+  Future<Either<String, Unit>> _ensureForegroundControlReady() async {
+    if (core.isInitialized()) {
+      try {
+        if (await core.isActiveFg()) return right(unit);
+      } catch (error) {
+        loggy.debug("foreground core control healthcheck failed: $error");
+      }
+      loggy.info("foreground core control channel is stale; restoring it before the next operation");
+    }
+    final setupResult = await setup().run();
+    final setupError = setupResult.match<String?>((err) => err, (_) => null);
+    if (setupError != null) return left(setupError);
+    try {
+      if (await core.isActiveFg()) return right(unit);
+    } catch (error) {
+      loggy.debug("foreground core control post-setup healthcheck failed: $error");
+    }
+    return left("foreground core control channel is unavailable after setup");
+  }
+
   TaskEither<String, Unit> changeOptions(SingboxConfigOption options) {
     return TaskEither(() async {
-      final wasInitialized = core.isInitialized();
-      if (!wasInitialized) {
-        final setupResult = await setup().run();
-        final setupError = setupResult.match<String?>((err) => err, (_) => null);
-        if (setupError != null) return left(setupError);
-      }
-
       loggy.debug("changing options");
-      if (wasInitialized && _latestOptions == options) {
-        loggy.debug("settings unchanged; skipping core settings update");
-        return right(unit);
-      }
+      // A retained Flutter engine can receive a successful subscription
+      // refresh after its Activity has paused and the foreground gRPC shell
+      // has intentionally been closed. Android's service-owned background
+      // core remains the only valid control plane for that live VPN session.
+      final useServiceOwnedBackgroundControl =
+          PlatformUtils.isAndroid && !_frontAttached && currentState is CoreStarted;
       try {
+        if (useServiceOwnedBackgroundControl) {
+          if (_latestOptions == options) {
+            loggy.debug("service-owned background settings unchanged; skipping core settings update");
+            return right(unit);
+          }
+          if (!await _shouldUpdateBackgroundSettings()) {
+            return left("background core control channel is unavailable");
+          }
+          final backgroundResponse = await core.backgroundControlClient.changeMartenSettings(
+            ChangeMartenSettingsRequest(martenSettingsJson: jsonEncode(options.toJson())),
+          );
+          if (backgroundResponse.messageType != MessageType.EMPTY) {
+            return left("${backgroundResponse.messageType} ${backgroundResponse.message}");
+          }
+          _latestOptions = options;
+          return right(unit);
+        }
+
+        final foregroundReady = await _ensureForegroundControlReady();
+        final setupError = foregroundReady.match<String?>((err) => err, (_) => null);
+        if (setupError != null) return left(setupError);
+        if (_latestOptions == options) {
+          loggy.debug("settings unchanged after foreground control recovery; skipping core settings update");
+          return right(unit);
+        }
         final res = await core.fgClient.changeMartenSettings(
           ChangeMartenSettingsRequest(martenSettingsJson: jsonEncode(options.toJson())),
         );
         if (res.messageType != MessageType.EMPTY) return left("${res.messageType} ${res.message}");
         if (await _shouldUpdateBackgroundSettings()) {
-          final backgroundResponse = await core.bgClient.changeMartenSettings(
+          final backgroundResponse = await core.backgroundControlClient.changeMartenSettings(
             ChangeMartenSettingsRequest(martenSettingsJson: jsonEncode(options.toJson())),
           );
           if (backgroundResponse.messageType != MessageType.EMPTY) {
@@ -401,11 +515,16 @@ class MartenCoreService with InfraLogger {
     }
   }
 
-  TaskEither<ConnectionFailure, Unit> start(String path, String name, bool disableMemoryLimit) {
+  TaskEither<ConnectionFailure, Unit> start(
+    String path,
+    String name,
+    bool disableMemoryLimit, {
+    int? androidVpnStartEpoch,
+  }) {
     return TaskEither(() async {
       _setCurrentState(const CoreStatus.starting());
       loggy.debug("starting");
-      final background = await core.setupBackground(path, name);
+      final background = await core.setupBackground(path, name, androidVpnStartEpoch: androidVpnStartEpoch);
       final backgroundGeneration = core.backgroundLifecycleGeneration;
       if (background case BackgroundCoreSetupFailed(:final status)) {
         _setCurrentState(const CoreStatus.stopped());
@@ -716,7 +835,7 @@ class MartenCoreService with InfraLogger {
       _setCurrentState(const CoreStatus.starting());
       // if (!await core.restart(path, name)) {
       try {
-        final res = await core.bgClient.restart(
+        final res = await core.backgroundControlClient.restart(
           StartRequest(configPath: path, configName: name, disableMemoryLimit: disableMemoryLimit),
           options: CallOptions(timeout: _coreStartTimeout),
         );
@@ -876,26 +995,124 @@ class MartenCoreService with InfraLogger {
 
     while (!_disposed && core.isInitialized()) {
       final observationClient = core.bgClient;
-      try {
-        yield* open(observationClient);
-      } catch (error, stackTrace) {
-        final action = classifyBackgroundObservationStreamError(
+      Future<BackgroundObservationStreamErrorAction> classify(Object error) async {
+        final generation = core.backgroundLifecycleGeneration;
+        final revision = _statusRevision;
+        BackgroundObservationStreamErrorAction classifyCurrent() => classifyBackgroundObservationStreamError(
           error: error,
           observationClientRetired: !identical(observationClient, core.bgClient),
           currentState: currentState,
           platformStatus: _latestPlatformServiceStatus,
           disposed: _disposed,
         );
-        switch (action) {
-          case BackgroundObservationStreamErrorAction.reattach:
-            loggy.debug("$label stream moved to the replacement background observation client");
-            continue;
-          case BackgroundObservationStreamErrorAction.finish:
-            loggy.debug("$label stream closed with the background lifecycle");
-            return;
-          case BackgroundObservationStreamErrorAction.propagate:
-            Error.throwWithStackTrace(error, stackTrace);
+        var action = classifyCurrent();
+        CoreStatus? confirmedPlatform;
+        if (action == BackgroundObservationStreamErrorAction.propagate &&
+            error is GrpcError &&
+            (error.code == StatusCode.cancelled || isExpectedLocalPostStartTransportShutdown(error))) {
+          // HTTP/2 can close before Binder death publishes Starting. Use a
+          // bounded snapshot/event reconciliation, without retry polling.
+          final elapsed = Stopwatch()..start();
+          Duration remaining() => _observationPlatformSnapshotTimeout - elapsed.elapsed;
+          bool isTransition(CoreStatus status) =>
+              status is CoreStarting || status is CoreStopping || status is CoreStopped;
+          try {
+            confirmedPlatform = await core.readPlatformServiceStatus().timeout(remaining());
+            if (confirmedPlatform is CoreStarted && remaining() > Duration.zero) {
+              final transition = Completer<void>();
+              final subscription = core.watchServiceStatus().listen(
+                (status) {
+                  if (isTransition(status) && !transition.isCompleted) transition.complete();
+                },
+                onError: (Object error, StackTrace stackTrace) {
+                  if (!transition.isCompleted) transition.completeError(error, stackTrace);
+                },
+                onDone: () {
+                  if (!transition.isCompleted) transition.completeError(StateError('platform status stream closed'));
+                },
+              );
+              try {
+                await transition.future.timeout(remaining());
+                if (remaining() > Duration.zero) {
+                  // The stream can replay an older value. Confirm with the
+                  // service owner before accepting it for this observation.
+                  confirmedPlatform = await core.readPlatformServiceStatus().timeout(remaining());
+                }
+              } finally {
+                await subscription.cancel();
+              }
+            }
+          } catch (_) {
+            // Unavailable/active snapshots preserve the original error.
+          }
+          action = classifyCurrent();
+          final snapshotIsCurrent =
+              identical(observationClient, core.bgClient) &&
+              generation == core.backgroundLifecycleGeneration &&
+              (revision == _statusRevision || currentState is! CoreStarted);
+          if (action == BackgroundObservationStreamErrorAction.propagate &&
+              snapshotIsCurrent &&
+              (confirmedPlatform is CoreStarting ||
+                  confirmedPlatform is CoreStopping ||
+                  confirmedPlatform is CoreStopped)) {
+            action = BackgroundObservationStreamErrorAction.finish;
+          }
         }
+        final retired = !identical(observationClient, core.bgClient);
+        if (error is GrpcError &&
+            (error.code == StatusCode.cancelled || isExpectedLocalPostStartTransportShutdown(error))) {
+          // Preserve the lifecycle snapshot at the failing stream boundary.
+          // Exception messages and endpoint/profile data are deliberately absent.
+          loggy.info(
+            '$label observation shutdown action=${action.name} code=${error.code} '
+            'state=${currentState.runtimeType} platform=${_latestPlatformServiceStatus.runtimeType} '
+            'confirmed_platform=${confirmedPlatform.runtimeType} retired=$retired recovery=$_nativePlatformRecoveryInProgress '
+            'front=$_frontAttached generation=${core.backgroundLifecycleGeneration} '
+            'started_generation=$_startedBackgroundGeneration',
+          );
+        }
+        return action;
+      }
+
+      BackgroundObservationStreamErrorAction? errorAction;
+      Object? sourceError;
+      StackTrace? sourceStackTrace;
+      try {
+        // Capture before yield* can forward the error. Retain yield* so
+        // cancellation also cancels the underlying idle RPC.
+        yield* open(observationClient).transform(
+          StreamTransformer<T, T>.fromHandlers(
+            handleError: (Object error, StackTrace stackTrace, EventSink<T> sink) {
+              sourceError = error;
+              sourceStackTrace = stackTrace;
+              sink.close();
+            },
+          ),
+        );
+      } catch (error, stackTrace) {
+        sourceError = error;
+        sourceStackTrace = stackTrace;
+      }
+      if (sourceError != null) {
+        errorAction = await classify(sourceError!);
+        if (errorAction == BackgroundObservationStreamErrorAction.propagate) {
+          // yield* is also a cancellation checkpoint after the native query.
+          // An observer disposed during reconciliation must not receive a
+          // late error (or leak that error through its cancellation future).
+          yield* Stream<T>.error(sourceError!, sourceStackTrace ?? StackTrace.current);
+        }
+      }
+      switch (errorAction) {
+        case BackgroundObservationStreamErrorAction.reattach:
+          loggy.debug("$label stream moved to the replacement background observation client");
+          continue;
+        case BackgroundObservationStreamErrorAction.finish:
+          loggy.debug("$label stream closed with the background lifecycle");
+          return;
+        case BackgroundObservationStreamErrorAction.propagate:
+          return;
+        case null:
+          break;
       }
 
       final currentLifecycleIsActive = currentState is CoreStarting || currentState is CoreStarted;
@@ -946,7 +1163,7 @@ class MartenCoreService with InfraLogger {
         return right(unit);
       } catch (e) {
         if (!isExpectedLocalPostStartTransportShutdown(e)) {
-          loggy.error("error selecting outbound: $e");
+          loggy.error("error selecting outbound (${e.runtimeType})");
           return left(e.toString());
         }
 
@@ -982,7 +1199,7 @@ class MartenCoreService with InfraLogger {
             }
             return left(localCoreControlChannelFailureMessage);
           case PostStartSelectRecovery.notApplicable:
-            loggy.error("error selecting outbound: $e");
+            loggy.error("error selecting outbound (${e.runtimeType})");
             return left(e.toString());
         }
       }
@@ -1060,7 +1277,7 @@ class MartenCoreService with InfraLogger {
         return _urlTestDelaySnapshot(outboundTag, selected, item);
       }
     } catch (e) {
-      loggy.warning("failed to read url test snapshot for [$groupTag/$outboundTag]: $e");
+      loggy.warning("failed to read url test snapshot (${e.runtimeType})");
     }
     return null;
   }
@@ -1093,7 +1310,7 @@ class MartenCoreService with InfraLogger {
         return _urlTestDelaySnapshot(selectedTag, group.selected, item);
       }
     } catch (e) {
-      loggy.warning("failed to read selected url test snapshot for [$groupTag]: $e");
+      loggy.warning("failed to read selected url test snapshot (${e.runtimeType})");
     }
     return null;
   }
@@ -1111,7 +1328,13 @@ class MartenCoreService with InfraLogger {
     await startListeningLogs("bg", core.bgClient);
     await startListeningLogs("fg", core.fgClient);
     try {
-      yield* logController.stream;
+      yield boundedCoreLogSnapshot(logBuffer);
+      // The native core can emit dozens of traffic lines per second. Keep the
+      // per-event signal cheap, then build a full rolling snapshot only for an
+      // attached Logs page and at a bounded UI refresh rate.
+      yield* logController.stream
+          .throttleTime(_logUiSnapshotInterval, leading: false, trailing: true)
+          .map((_) => boundedCoreLogSnapshot(logBuffer));
     } catch (e) {
       loggy.error("error watching logs: $e");
       rethrow;
@@ -1140,6 +1363,7 @@ class MartenCoreService with InfraLogger {
       loggy.debug("clearing logs");
       logBuffer.clear();
       runtimeLogBuffer.clear();
+      _lastCoreLogRetentionSweepAt = null;
       _coreLogDeduplicator.clear();
       final file = _coreLogFile;
       if (file != null) {
@@ -1271,7 +1495,11 @@ class MartenCoreService with InfraLogger {
     final recoveryInProgress = _nativePlatformRecoveryInProgress;
     final next = coreStatusAfterPlatformEvent(currentState, event, nativeRecoveryInProgress: recoveryInProgress);
     if (!recoveryInProgress && next is CoreStarted && currentState is! CoreStarted) {
-      loggy.info("Android route-verified Started replayed to late Flutter engine");
+      loggy.info(
+        Platform.isAndroid
+            ? "Android route-verified Started replayed to late Flutter engine"
+            : "Native route-verified Started replayed to late Flutter engine",
+      );
     }
     if (shouldInitializeCoreForPlatformEvent(event, coreInitialized: core.isInitialized())) {
       _initializeCoreForPlatformStart();
@@ -1302,47 +1530,91 @@ class MartenCoreService with InfraLogger {
   }
 
   void _startNativeRecoveryLogBridge() {
+    _stopNativeRecoveryLogBridge();
+    if (_disposed || !_frontAttached || !_nativePlatformRecoveryInProgress) return;
     final generation = ++_nativeRecoveryLogBridgeGeneration;
-    unawaited(_maintainNativeRecoveryLogBridge(generation));
+    final stopSignal = Completer<void>();
+    _nativeRecoveryLogBridgeStopSignal = stopSignal;
+    unawaited(_maintainNativeRecoveryLogBridge(generation, stopSignal));
   }
 
   void _stopNativeRecoveryLogBridge() {
     _nativeRecoveryLogBridgeGeneration++;
+    final stopSignal = _nativeRecoveryLogBridgeStopSignal;
+    _nativeRecoveryLogBridgeStopSignal = null;
+    if (stopSignal != null && !stopSignal.isCompleted) stopSignal.complete();
+    _nativeRecoveryLogBridgeRetryTimer?.cancel();
+    _nativeRecoveryLogBridgeRetryTimer = null;
+    final retryWaiter = _nativeRecoveryLogBridgeRetryWaiter;
+    _nativeRecoveryLogBridgeRetryWaiter = null;
+    if (retryWaiter != null && !retryWaiter.isCompleted) retryWaiter.complete();
   }
 
-  Future<void> _maintainNativeRecoveryLogBridge(int generation) async {
+  Future<void> _maintainNativeRecoveryLogBridge(int generation, Completer<void> stopSignal) async {
     var attachmentLogged = false;
+    var consecutiveFailures = 0;
     final logListenerKey = coreLogListenerKey(isAndroid: PlatformUtils.isAndroid, role: "bg");
-    while (!_disposed && _nativePlatformRecoveryInProgress && generation == _nativeRecoveryLogBridgeGeneration) {
-      // Mobile.setup replaces the background gRPC server before Android can
-      // verify the new route. Waiting for route-verified Started to reattach is
-      // a deadlock when that route itself needs CAPTCHA: the Go delivery hub has
-      // the unresolved URL, but Flutter cannot ask the persistent WebView to
-      // solve it. Keep the existing listener untouched while it is alive, then
-      // reconnect as soon as the registry observes its shutdown. The hub replays
-      // any unresolved CAPTCHA to this replacement listener.
-      if (subscriptions[logListenerKey] == null) {
+    try {
+      while (_ownsNativeRecoveryLogBridge(generation)) {
+        // Mobile.setup replaces the background gRPC server before Android can
+        // verify the new route. Waiting for route-verified Started to reattach
+        // is a deadlock when that route itself needs CAPTCHA. Preserve an exact
+        // live listener and suspend on its registry-removal event; never wake on
+        // a fixed polling interval.
+        if (subscriptions[logListenerKey] != null) {
+          await _subscriptionRegistry.waitUntilRemoved(logListenerKey, cancelSignal: stopSignal.future);
+          if (!_ownsNativeRecoveryLogBridge(generation)) return;
+          await _waitForNativeRecoveryLogBridgeRetry(nativeRecoveryLogBridgeRetryDelay(consecutiveFailures++));
+          continue;
+        }
+
         try {
           await startListeningLogs("bg", core.bgClient);
-          if (!attachmentLogged &&
-              _nativePlatformRecoveryInProgress &&
-              generation == _nativeRecoveryLogBridgeGeneration &&
-              subscriptions[logListenerKey] != null) {
+          if (!attachmentLogged && _ownsNativeRecoveryLogBridge(generation) && subscriptions[logListenerKey] != null) {
             attachmentLogged = true;
             loggy.info("Android native recovery attached CAPTCHA log bridge");
           }
         } catch (error) {
-          if (_nativePlatformRecoveryInProgress && generation == _nativeRecoveryLogBridgeGeneration) {
+          if (_ownsNativeRecoveryLogBridge(generation)) {
             loggy.debug("Android native recovery CAPTCHA log bridge not ready: $error");
           }
         }
+
+        if (subscriptions[logListenerKey] == null && _ownsNativeRecoveryLogBridge(generation)) {
+          await _waitForNativeRecoveryLogBridgeRetry(nativeRecoveryLogBridgeRetryDelay(consecutiveFailures++));
+        }
       }
-      await Future.delayed(_nativeRecoveryLogBridgePollInterval);
+    } finally {
+      if (identical(_nativeRecoveryLogBridgeStopSignal, stopSignal)) {
+        _nativeRecoveryLogBridgeStopSignal = null;
+      }
+      if (!stopSignal.isCompleted) stopSignal.complete();
     }
+  }
+
+  bool _ownsNativeRecoveryLogBridge(int generation) =>
+      !_disposed &&
+      _frontAttached &&
+      _nativePlatformRecoveryInProgress &&
+      generation == _nativeRecoveryLogBridgeGeneration;
+
+  Future<void> _waitForNativeRecoveryLogBridgeRetry(Duration delay) {
+    final waiter = Completer<void>();
+    final timer = Timer(delay, () {
+      if (identical(_nativeRecoveryLogBridgeRetryWaiter, waiter)) {
+        _nativeRecoveryLogBridgeRetryWaiter = null;
+        _nativeRecoveryLogBridgeRetryTimer = null;
+      }
+      if (!waiter.isCompleted) waiter.complete();
+    });
+    _nativeRecoveryLogBridgeRetryTimer = timer;
+    _nativeRecoveryLogBridgeRetryWaiter = waiter;
+    return waiter.future;
   }
 
   Future<void> _reattachAfterNativePlatformRecovery(int recoveryRevision) async {
     try {
+      if (PlatformUtils.isAndroid && !_frontAttached) return;
       final expectedGeneration = core.backgroundLifecycleGeneration;
       final status = await core.refreshBackgroundControlSession(expectedGeneration);
       if (status is! CoreStarted ||
@@ -1396,7 +1668,7 @@ class MartenCoreService with InfraLogger {
   }
 
   Future<void> startListeningLogs(String key, CoreClient cc) async {
-    if (_disposed) return;
+    if (_disposed || (PlatformUtils.isAndroid && !_frontAttached)) return;
     final listenKey = coreLogListenerKey(isAndroid: PlatformUtils.isAndroid, role: key);
     final listenerGeneration = PlatformUtils.isAndroid && key == "bg" ? core.backgroundLifecycleGeneration : null;
     if (PlatformUtils.isAndroid && key == "fg" && subscriptions[listenKey] != null) {
@@ -1429,12 +1701,18 @@ class MartenCoreService with InfraLogger {
           time: event.hasTime() ? event.time : null,
         );
         logBuffer.add(safeEvent);
-        _trimLogBuffer();
+        _maintainLogBuffers();
         _persistCoreLog(safeEvent);
-        runtimeLogController.add(List.unmodifiable(runtimeLogBuffer));
-        logController.add(List.unmodifiable(logBuffer));
-        for (final line in safeEvent.message.split('\n')) {
-          LoggerController.instance.onCoreLog(loggyl.LogRecord(getLogLevel(event.level), line, 'MartenCoreService'));
+        // Runtime consumers need every accepted event, not a fresh copy of the
+        // complete rolling buffer. Publishing a singleton batch keeps CAPTCHA
+        // and liveness detection lossless while making this hot path O(1).
+        runtimeLogController.add(List<LogMessage>.unmodifiable([event]));
+        logController.add(List<LogMessage>.unmodifiable([safeEvent]));
+        final diagnosticLevel = getLogLevel(event.level);
+        if (shouldForwardCoreLogToDiagnosticPrinters(diagnosticLevel, debugBuild: kDebugMode)) {
+          for (final line in safeEvent.message.split('\n')) {
+            LoggerController.instance.onCoreLog(loggyl.LogRecord(diagnosticLevel, line, 'MartenCoreService'));
+          }
         }
         return event;
       });
@@ -1445,25 +1723,37 @@ class MartenCoreService with InfraLogger {
     await _subscriptionRegistry.stop(key);
   }
 
-  void _trimLogBuffer() {
+  Future<void> stopListeningLogs(String role) async {
+    await stopListenSingle(coreLogListenerKey(isAndroid: PlatformUtils.isAndroid, role: role));
+  }
+
+  void _maintainLogBuffers() {
     final now = DateTime.now();
-    runtimeLogBuffer = LogFileRetention.retainItems<LogMessage>(
-      runtimeLogBuffer,
-      timestampOf: (message) => message.hasTime() ? message.time.toDateTime().toLocal() : null,
-      levelOf: (message) => message.level.name,
-      now: now,
-    );
-    logBuffer = LogFileRetention.retainItems<LogMessage>(
-      logBuffer,
-      timestampOf: (message) => message.hasTime() ? message.time.toDateTime().toLocal() : null,
-      levelOf: (message) => message.level.name,
-      now: now,
-    );
-    if (runtimeLogBuffer.length > 1000) {
-      runtimeLogBuffer = runtimeLogBuffer.sublist(runtimeLogBuffer.length - 1000);
+    if (shouldSweepCoreLogRetention(lastSweepAt: _lastCoreLogRetentionSweepAt, now: now)) {
+      runtimeLogBuffer = LogFileRetention.retainItems<LogMessage>(
+        runtimeLogBuffer,
+        timestampOf: (message) => message.hasTime() ? message.time.toDateTime().toLocal() : null,
+        levelOf: (message) => message.level.name,
+        now: now,
+      );
+      logBuffer = LogFileRetention.retainItems<LogMessage>(
+        logBuffer,
+        timestampOf: (message) => message.hasTime() ? message.time.toDateTime().toLocal() : null,
+        levelOf: (message) => message.level.name,
+        now: now,
+      );
+      _lastCoreLogRetentionSweepAt = now;
     }
-    if (logBuffer.length > 1000) {
-      logBuffer = logBuffer.sublist(logBuffer.length - 1000);
+
+    // Allow a small amount of slack so a busy tunnel does not allocate and
+    // copy a 1000-entry list for every new log line. Crossing the hard bound
+    // collapses the buffer back to the public 1000-entry window in one pass.
+    const hardLimit = _coreLogBufferLimit + _coreLogBufferSlack;
+    if (runtimeLogBuffer.length > hardLimit) {
+      runtimeLogBuffer = runtimeLogBuffer.sublist(runtimeLogBuffer.length - _coreLogBufferLimit);
+    }
+    if (logBuffer.length > hardLimit) {
+      logBuffer = logBuffer.sublist(logBuffer.length - _coreLogBufferLimit);
     }
   }
 
@@ -1530,17 +1820,23 @@ class MartenCoreService with InfraLogger {
   }
 
   Future<void> closeFront() async {
+    final lifecycleGeneration = ++_frontLifecycleGeneration;
+    _frontAttached = false;
+    _stopNativeRecoveryLogBridge();
     if (!core.isInitialized()) {
       return;
     }
+    // Android exposes foreground/background core logs through one process-wide
+    // key. Stop that exact subscription before any role-prefixed cleanup.
+    await stopListeningLogs("bg");
+    if (lifecycleGeneration != _frontLifecycleGeneration || _frontAttached) return;
     if (!core.isSingleChannel()) {
       await stopListenSingle("fg");
-      // Android keeps its service-owned background LogListener alive while the
-      // activity is paused. TURNcoat CAPTCHA requirements are replayable on the
-      // native side, but stopping this stream here prevented a live challenge
-      // from reaching the already-mounted background WebView until the user
-      // manually foregrounded Marten.
+      // TURNcoat CAPTCHA delivery is service-owned on Android and no longer
+      // needs a Flutter LogListener while the Activity is stopped.
       if (!PlatformUtils.isAndroid) {
+        await stopListeningLogs("fg");
+        await stopListeningLogs("bg");
         await stopListenSingle("bg");
       }
       try {
@@ -1647,9 +1943,9 @@ CoreStatus coreStatusAfterPlatformEvent(
   // Android publishes Started only after the native runtime, Android TUN and
   // selected route have passed their readiness gate. A new Flutter engine can
   // attach after that transition, so this retained service state must promote
-  // its local core snapshot. ConnectionRepository still keeps Android cold
-  // attach in Connecting until its own fresh selected-route verification.
-  // Do not resurrect a manual stop from a delayed retained callback.
+  // its local core snapshot and render Connected immediately. Reattaching the
+  // UI does not create a new VPN generation or invalidate that proof. Do not
+  // resurrect a manual stop from a delayed retained callback.
   if (platform is CoreStarted) {
     if (current is CoreStopping) return current;
     return const CoreStatus.started();

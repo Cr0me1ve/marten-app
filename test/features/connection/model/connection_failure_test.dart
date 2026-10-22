@@ -38,6 +38,15 @@ void main() {
 
     expect(error.type, 'сервер недоступен');
     expect(error.message, isNull);
+    expect(t.errors.connection.selectedRouteFailedMsg, 'Выбранный сервер недоступен. Подключение остановлено.');
+  });
+
+  test('selected-route failure copy must be canonical in ru/en', () async {
+    final ru = await AppLocale.ru.build();
+    final en = await AppLocale.en.build();
+
+    expect(ru.errors.connection.selectedRouteFailedMsg, 'Выбранный сервер недоступен. Подключение остановлено.');
+    expect(en.errors.connection.selectedRouteFailedMsg, 'The selected server is unavailable. Connection was stopped.');
   });
 
   test('presents missing profile config file as profile not found', () async {

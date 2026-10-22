@@ -25,10 +25,10 @@ class ServicePresentationReattachSourceGuardTest {
         val restore = functionBody(activity, "restoreServicePresentation")
 
         val statusRead = restore.indexOf("serviceStatus.value = BoxService.currentPlatformStatus()")
-        val reconnect = restore.indexOf("connection.connect()")
+        val reconnect = restore.indexOf("connectServicePresentation()")
 
         assertTrue("restoreServicePresentation should sync from service owner", statusRead >= 0)
-        assertTrue("restoreServicePresentation should immediately reconnect", reconnect >= 0)
+        assertTrue("restoreServicePresentation should immediately reconnect through the lifecycle gate", reconnect >= 0)
         assertTrue("service status must be refreshed before reconnecting", statusRead < reconnect)
     }
 
@@ -41,43 +41,93 @@ class ServicePresentationReattachSourceGuardTest {
         assertTrue(onStart.contains("restoreServicePresentation()"))
         assertTrue(onResume.contains("restoreServicePresentation()"))
         assertTrue(onStart.indexOf("super.onStart()") < onStart.indexOf("restoreServicePresentation()"))
+        assertTrue(onStart.indexOf("servicePresentationActive = true") < onStart.indexOf("restoreServicePresentation()"))
         assertTrue(onResume.indexOf("super.onResume()") < onResume.indexOf("restoreServicePresentation()"))
     }
 
     @Test
-    fun `permission callbacks retain pending config identity until start service zero or an explicit denial`() {
+    fun `onStop disconnects presentation binding while lifecycle reattachment remains available`() {
         val activity = sourceFile("MainActivity.kt")
-        val notificationCallback = sourceSection(
-            activity,
-            "private val notificationPermissionLauncher =",
-            "private val prepareLauncher =",
-        )
-        val vpnCallback = sourceSection(
-            activity,
-            "private val prepareLauncher =",
-            "private fun clearPendingStartConfigIdentity()",
-        )
-        val requestPermissions = functionBody(activity, "onRequestPermissionsResult")
-        val activityResult = functionBody(activity, "onActivityResult")
+        val onStop = functionBody(activity, "onStop")
 
-        listOf(notificationCallback, vpnCallback, requestPermissions, activityResult).forEach { callback ->
-            assertTrue(
-                "permission grant must preserve the pending route identity through startService0",
-                callback.contains("startService0()"),
-            )
+        val deactivatePresentation = onStop.indexOf("servicePresentationActive = false")
+        val disconnect = onStop.indexOf("connection.disconnect()")
+        assertTrue("onStop must deactivate presentation before late service callbacks can connect", deactivatePresentation >= 0)
+        assertTrue("onStop must release the activity-owned service binding", disconnect >= 0)
+        assertTrue("onStop must deactivate presentation before disconnecting", deactivatePresentation < disconnect)
+        assertTrue("onStop must still call through to the Activity lifecycle", onStop.contains("super.onStop()"))
+    }
+
+    @Test
+    fun `presentation connection helpers and late service dispatch respect lifecycle activity`() {
+        val activity = sourceFile("MainActivity.kt")
+        val reconnect = functionBody(activity, "reconnect")
+        val connectPresentation = functionBody(activity, "connectServicePresentation")
+        val startService = functionBody(activity, "startService0")
+
+        assertTrue(reconnect.contains("if (servicePresentationActive) connection.reconnect()"))
+        assertTrue(connectPresentation.contains("if (servicePresentationActive) connection.connect()"))
+        assertTrue("late service dispatch must use the lifecycle-gated connection helper", startService.contains("connectServicePresentation()"))
+        assertFalse("late service dispatch must not bypass the presentation connection gate", startService.contains("connection.connect()"))
+        assertFalse("late service dispatch must not bypass the presentation reconnection gate", startService.contains("connection.reconnect()"))
+    }
+
+    @Test
+    fun `main activity does not retain or fan out service logs to an unused Flutter channel`() {
+        val activity = sourceFile("MainActivity.kt")
+
+        listOf(
+            "LogHandler()",
+            "logList",
+            "logCallback",
+            "onServiceWriteLog",
+            "onServiceResetLogs",
+            "runOnUiThread",
+        ).forEach { legacyLogFanOut ->
             assertFalse(
-                "permission callback must not restart through startService() and discard its identity",
-                callback.contains("startService()"),
-            )
-            assertTrue(
-                "permission denial must clear the pending route identity",
-                callback.contains("clearPendingStartConfigIdentity()"),
+                "MainActivity must not retain or deliver unused service logs through $legacyLogFanOut",
+                activity.contains(legacyLogFanOut),
             )
         }
     }
 
     @Test
-    fun `status observation in EventHandler restores service presentation before observeForever`() {
+    fun `only VPN permission callbacks retain pending config identity until start service zero or an explicit denial`() {
+        val activity = sourceFile("MainActivity.kt")
+        val vpnCallback = sourceSection(
+            activity,
+            "private val prepareLauncher =",
+            "private fun clearPendingStartConfigIdentity()",
+        )
+
+        assertTrue(
+            "VPN permission grant must preserve the pending route identity through startService0",
+            vpnCallback.contains("startService0()"),
+        )
+        assertFalse(
+            "VPN permission callback must not restart through startService() and discard its identity",
+            vpnCallback.contains("startService()"),
+        )
+        assertTrue(
+            "VPN permission denial must clear the pending route identity",
+            vpnCallback.contains("clearPendingStartConfigIdentity()"),
+        )
+        listOf(
+            "awaitStrictNotificationPermission",
+            "notificationPermissionLauncher",
+            "pendingStrictNotificationPermission",
+            "POST_NOTIFICATIONS",
+            "RequestNotificationPermission",
+        ).forEach { notificationAdmissionArtifact ->
+            assertFalse(
+                "MainActivity VPN admission must not retain or request notification permission through $notificationAdmissionArtifact",
+                activity.contains(notificationAdmissionArtifact),
+            )
+        }
+    }
+
+    @Test
+    fun `status observation in EventHandler uses the service-owned platform status source`() {
         val source = sourceFile("EventHandler.kt")
         val statusHandler = sourceSection(
             source,
@@ -91,17 +141,30 @@ class ServicePresentationReattachSourceGuardTest {
             "override fun onCancel(arguments: Any?) {",
         )
 
-        assertTrue(onListen.contains("activity.restoreServicePresentation()"))
+        assertTrue(onListen.contains("statusObserver?.let(BoxService::removePlatformStatusObserver)"))
         assertTrue(onListen.contains("statusObserver = Observer"))
-        assertTrue(onListen.contains("activity.serviceStatus.observeForever(statusObserver!!)"))
-        assertFalse(onListen.indexOf("activity.restoreServicePresentation()") > onListen.indexOf("activity.serviceStatus.observeForever(statusObserver!!)"))
+        assertTrue(onListen.contains("BoxService.observePlatformStatus(statusObserver!!)"))
 
-        val restore = onListen.indexOf("activity.restoreServicePresentation()")
+        val removePreviousObserver = onListen.indexOf("statusObserver?.let(BoxService::removePlatformStatusObserver)")
         val attachObserver = onListen.indexOf("statusObserver = Observer")
-        val observeForever = onListen.indexOf("activity.serviceStatus.observeForever(statusObserver!!)")
-        assertTrue("restoration must happen before creating the observer", restore < attachObserver)
-        assertTrue("observation must happen after observer creation", attachObserver < observeForever)
-        assertTrue(restore < observeForever)
+        val observePlatformStatus = onListen.indexOf("BoxService.observePlatformStatus(statusObserver!!)")
+        assertTrue("the previous service-owned observer must be removed before creating a replacement", removePreviousObserver < attachObserver)
+        assertTrue("observation must happen after observer creation", attachObserver < observePlatformStatus)
+        assertTrue("the previous service-owned observer must be removed before observing again", removePreviousObserver < observePlatformStatus)
+
+        val onCancel = sourceSection(
+            statusHandler,
+            "override fun onCancel(arguments: Any?) {",
+            "        })",
+        )
+        val removeCancelledObserver = onCancel.indexOf("statusObserver?.let(BoxService::removePlatformStatusObserver)")
+        val clearObserver = onCancel.indexOf("statusObserver = null")
+        assertTrue("cancelling must remove the service-owned observer", removeCancelledObserver >= 0)
+        assertTrue("cancelling must clear the stored observer", clearObserver >= 0)
+        assertTrue("cancelling must remove the observer before clearing it", removeCancelledObserver < clearObserver)
+
+        assertFalse("EventHandler must not observe MainActivity's cached status", statusHandler.contains("serviceStatus.observeForever"))
+        assertFalse("EventHandler must not restore activity presentation for status streams", statusHandler.contains("restoreServicePresentation()"))
     }
 
     private fun sourceFile(name: String): String {

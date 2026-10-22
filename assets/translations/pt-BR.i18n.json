@@ -589,7 +589,8 @@
       "notFound": "Perfil não encontrado",
       "invalidConfig": "Configurações inválidas",
       "invalidUrl": "URL inválida",
-      "canceledByUser": "Cancelado pelo usuário"
+      "canceledByUser": "Cancelado pelo usuário",
+      "deviceLimit": "O limite de dispositivos desta assinatura foi atingido"
     },
     "connectivity": {
       "unexpected": "Falha inesperada",

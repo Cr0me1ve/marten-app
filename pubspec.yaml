@@ -1,7 +1,7 @@
 name: marten
 description: Cross-platform multi-protocol network client.
 publish_to: "none"
-version: 0.7.11+711
+version: 0.8.102+902
 
 environment:
   sdk: ^3.10.4
@@ -12,6 +12,8 @@ environment:
   flutter: ^3.38.5
   
 dependencies:
+  archive: 4.0.4
+  vm_service: 15.0.0
   flutter:
     sdk: flutter
   marten_native_resume:
@@ -98,7 +100,12 @@ dependencies:
   flutter_markdown_plus: ^1.0.6
   # platform-specific  settings
   # https://github.com/miguelpruivo/flutter_file_picker/wiki/Setup
-  file_picker: ^8.1.7
+  # 10.3.8+ renames the iOS Objective-C FileUtils symbol that collides with
+  # OSAnalytics on iOS 26. Stay below 11 to preserve the instance-based API.
+  file_picker:
+    git:
+      url: https://github.com/miguelpruivo/flutter_file_picker.git
+      ref: 97e4c8d904be181fc4cf8adc73d1ec889db0f287
   installed_apps: # ^1.5.2
     git: https://github.com/VB10/installed_apps
 
@@ -109,7 +116,8 @@ dependencies:
   # Used for managing deep links on desktop platforms
   # platform-specific settings
   # https://github.com/llfbandit/app_links/tree/master/doc
-  app_links: ^6.4.0
+  # 7.x forwards links through Flutter's UIScene lifecycle on iOS.
+  app_links: 7.0.0
   # Used for registering custom schemes in the Windows registry
   win32: ^5.12.0
   # Working with Wifi(get LAN IP address)
@@ -138,6 +146,11 @@ dev_dependencies:
   dart_mappable_builder: ^4.2.1
   # protoc_builder: ^0.4.1
   # google_protobuf: ^3.20.1;
+
+# app_links 7.0 supports Flutter 3.38, while its newest compatible interface
+# release has already raised the SDK floor. Keep Marten's declared toolchain.
+dependency_overrides:
+  app_links_platform_interface: 2.0.2
 
 flutter:
   uses-material-design: true

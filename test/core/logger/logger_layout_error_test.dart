@@ -38,6 +38,7 @@ void main() {
     );
 
     Logger.logFlutterError(details);
+    await reporter.flush();
     await reporter.disable();
 
     expect(backend.reports, hasLength(1));

@@ -53,23 +53,41 @@ class EnableAnalyticsPrefTile extends ConsumerWidget {
 
     final t = ref.watch(translationsProvider).requireValue;
 
-    final enabled = ref.watch(analyticsControllerProvider).requireValue;
+    final analytics = ref.watch(analyticsControllerProvider);
 
-    return SwitchListTile.adaptive(
-      title: Text(t.pages.settings.general.enableAnalytics),
-      subtitle: Text(t.pages.settings.general.enableAnalyticsMsg, style: Theme.of(context).textTheme.bodySmall),
-      secondary: const Icon(Icons.bug_report_outlined),
-      value: enabled,
-      onChanged: (value) async {
-        if (onChanged != null) {
-          return onChanged!(value);
-        }
-        if (enabled) {
-          await ref.read(analyticsControllerProvider.notifier).disableAnalytics();
-        } else {
-          await ref.read(analyticsControllerProvider.notifier).enableAnalytics();
-        }
-      },
+    Widget tile({required bool enabled, required ValueChanged<bool>? change, Widget? secondary}) =>
+        SwitchListTile.adaptive(
+          title: Text(t.pages.settings.general.enableAnalytics),
+          subtitle: Text(t.pages.settings.general.enableAnalyticsMsg, style: Theme.of(context).textTheme.bodySmall),
+          secondary: secondary ?? const Icon(Icons.bug_report_outlined),
+          value: enabled,
+          onChanged: change,
+        );
+
+    return analytics.when(
+      data: (enabled) => tile(
+        enabled: enabled,
+        change: (value) async {
+          if (onChanged != null) {
+            onChanged!(value);
+            return;
+          }
+          if (value) {
+            await ref.read(analyticsControllerProvider.notifier).enableAnalytics();
+          } else {
+            await ref.read(analyticsControllerProvider.notifier).disableAnalytics();
+          }
+        },
+      ),
+      loading: () => tile(
+        enabled: false,
+        change: null,
+        secondary: const SizedBox.square(
+          dimension: 24,
+          child: Padding(padding: EdgeInsets.all(3), child: CircularProgressIndicator(strokeWidth: 2)),
+        ),
+      ),
+      error: (_, _) => tile(enabled: false, change: null, secondary: const Icon(Icons.error_outline_rounded)),
     );
   }
 }

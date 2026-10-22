@@ -1,8 +1,8 @@
 import 'dart:async';
 
-import 'package:flutter/scheduler.dart';
 import 'package:installed_apps/index.dart';
 import 'package:marten/core/preferences/general_preferences.dart';
+import 'package:marten/core/utils/ui_idle_gate.dart';
 import 'package:marten/features/per_app_proxy/data/selected_data_provider.dart';
 import 'package:marten/features/per_app_proxy/model/per_app_proxy_mode.dart';
 import 'package:riverpod_annotation/riverpod_annotation.dart';
@@ -20,8 +20,10 @@ class PerAppProxyService extends _$PerAppProxyService {
   @override
   Future<void> build() async {
     var disposed = false;
+    UiIdleGate? startupIdle;
     ref.onDispose(() {
       disposed = true;
+      startupIdle?.cancel();
       _includeSubscription?.cancel();
       _excludeSubscription?.cancel();
       _timer?.cancel();
@@ -29,7 +31,9 @@ class PerAppProxyService extends _$PerAppProxyService {
 
     await Future<void>.delayed(initialStartupDelay);
     if (disposed) return;
-    await SchedulerBinding.instance.scheduleTask<void>(() {}, Priority.idle, debugLabel: 'installed apps maintenance');
+    final idle = UiIdleGate(debugLabel: 'installed apps maintenance');
+    startupIdle = idle;
+    if (!await idle.ready) return;
     if (disposed) return;
 
     final phonePkgs = (await InstalledApps.getInstalledApps(false)).map((e) => e.packageName).toSet();

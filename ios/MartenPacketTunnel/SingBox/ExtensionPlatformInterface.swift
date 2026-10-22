@@ -220,28 +220,28 @@ public class ExtensionPlatformInterface: NSObject, LibboxPlatformInterfaceProtoc
     public func usePlatformAutoDetectControl() -> Bool {
         false
     }
-    public func findConnectionOwner(_ ipProtocol: Int32, sourceAddress: String?, sourcePort: Int32, destinationAddress: String?, destinationPort: Int32) throws -> LibboxConnectionOwner {
-        #if os(macOS)
-            if Variant.useSystemExtension {
-                guard let sourceAddress, let destinationAddress else {
-                    throw NSError(domain: "findConnectionOwner", code: 0, userInfo: [
-                        NSLocalizedDescriptionKey: "Missing source or destination address",
-                    ])
-                }
-                let owner = try RootHelperClient.shared.findConnectionOwner(
-                    ipProtocol: ipProtocol,
-                    sourceAddress: sourceAddress,
-                    sourcePort: sourcePort,
-                    destinationAddress: destinationAddress,
-                    destinationPort: destinationPort
-                )
-                let result = LibboxConnectionOwner()
-                result.userId = owner.userId
-                result.userName = owner.userName
-                result.processPath = owner.processPath
-                return result
-            }
-        #endif
+    public func autoDetectControl(_: Int32) throws {
+    }
+
+    public func findConnectionOwner(_: Int32, sourceAddress _: String?, sourcePort _: Int32, destinationAddress _: String?, destinationPort _: Int32, ret0_: UnsafeMutablePointer<Int32>?) throws {
+        ret0_?.pointee = -1
+        throw NSError(domain: "ExtensionPlatformInterface", code: 0, userInfo: [NSLocalizedDescriptionKey: String(localized: "Not implemented")])
+    }
+
+    public func protectSocket(_: Int32) throws {
+    }
+
+    public func packageName(byUid _: Int32, error errorPointer: NSErrorPointer) -> String {
+        errorPointer?.pointee = NSError(
+            domain: "ExtensionPlatformInterface",
+            code: 0,
+            userInfo: [NSLocalizedDescriptionKey: String(localized: "Not implemented")]
+        )
+        return ""
+    }
+
+    public func uid(byPackageName _: String?, ret0_: UnsafeMutablePointer<Int32>?) throws {
+        ret0_?.pointee = -1
         throw NSError(domain: "ExtensionPlatformInterface", code: 0, userInfo: [NSLocalizedDescriptionKey: String(localized: "Not implemented")])
     }
 
@@ -275,10 +275,10 @@ public class ExtensionPlatformInterface: NSObject, LibboxPlatformInterfaceProtoc
         guard path.status != .unsatisfied,
               let defaultInterface = path.availableInterfaces.first(where: { path.usesInterfaceType($0.type) }) ?? path.availableInterfaces.first
         else {
-            listener.updateDefaultInterface("", interfaceIndex: -1, isExpensive: false, isConstrained: false)
+            listener.updateDefaultInterface("", interfaceIndex: -1)
             return
         }
-        listener.updateDefaultInterface(defaultInterface.name, interfaceIndex: Int32(defaultInterface.index), isExpensive: path.isExpensive, isConstrained: path.isConstrained)
+        listener.updateDefaultInterface(defaultInterface.name, interfaceIndex: Int32(defaultInterface.index))
     }
 
     public func closeDefaultInterfaceMonitor(_: LibboxInterfaceUpdateListenerProtocol?) throws {
@@ -337,12 +337,19 @@ public class ExtensionPlatformInterface: NSObject, LibboxPlatformInterfaceProtoc
         true
     }
 
+    public func usePlatformDefaultInterfaceMonitor() -> Bool {
+        true
+    }
+
+    public func useGetter() -> Bool {
+        false
+    }
+
     public func includeAllNetworks() -> Bool {
         #if os(tvOS)
             return false
         #else
-            return false
-//            return tunnel.overridePreferences?.includeAllNetworks ?? false
+            return true
         #endif
     }
 
@@ -503,35 +510,41 @@ public class ExtensionPlatformInterface: NSObject, LibboxPlatformInterfaceProtoc
     public func systemCertificates() -> (any LibboxStringIteratorProtocol)? {
         nil
     }
-    public func autoDetectControl(_: Int32) throws {}
-
-    public func loadTurncoatCredential(_ storageKey: String?) throws -> String {
-        guard let storageKey, Self.validTurncoatStorageKey(storageKey) else {
-            throw NSError(domain: "MartenTurncoatCredentialStore", code: 1)
+    public func loadTurncoatCredential(_ storageKey: String?, error errorPointer: NSErrorPointer) -> String {
+        do {
+            guard let storageKey, Self.validTurncoatStorageKey(storageKey) else {
+                throw NSError(domain: "MartenTurncoatCredentialStore", code: 1)
+            }
+            Self.turncoatCredentialLock.lock()
+            defer { Self.turncoatCredentialLock.unlock() }
+            return try Self.loadTurncoatCredentialLocked(storageKey)
+        } catch {
+            errorPointer?.pointee = error as NSError
+            return ""
         }
-        Self.turncoatCredentialLock.lock()
-        defer { Self.turncoatCredentialLock.unlock() }
-        return try Self.loadTurncoatCredentialLocked(storageKey)
     }
 
     public func compareAndSwapTurncoatCredential(
         _ storageKey: String?,
         expected: String?,
-        replacement: String?
-    ) throws -> Bool {
-        guard let storageKey, let expected, let replacement,
+        replacement: String?,
+        ret0_: UnsafeMutablePointer<ObjCBool>?
+    ) throws {
+        guard let storageKey, let expected, let replacement, let ret0_,
               Self.validTurncoatStorageKey(storageKey) else {
             throw NSError(domain: "MartenTurncoatCredentialStore", code: 1)
         }
         Self.turncoatCredentialLock.lock()
         defer { Self.turncoatCredentialLock.unlock() }
         if try Self.loadTurncoatCredentialLocked(storageKey) != expected {
-            return false
+            ret0_.pointee = false
+            return
         }
         let query = Self.turncoatCredentialQuery(storageKey)
         if replacement.isEmpty {
             let status = SecItemDelete(query as CFDictionary)
-            return status == errSecSuccess || status == errSecItemNotFound
+            ret0_.pointee = ObjCBool(status == errSecSuccess || status == errSecItemNotFound)
+            return
         }
         let data = Data(replacement.utf8)
         let updateStatus = SecItemUpdate(
@@ -539,7 +552,8 @@ public class ExtensionPlatformInterface: NSObject, LibboxPlatformInterfaceProtoc
             [kSecValueData as String: data] as CFDictionary
         )
         if updateStatus == errSecSuccess {
-            return true
+            ret0_.pointee = true
+            return
         }
         guard updateStatus == errSecItemNotFound else {
             throw NSError(domain: NSOSStatusErrorDomain, code: Int(updateStatus))
@@ -551,7 +565,7 @@ public class ExtensionPlatformInterface: NSObject, LibboxPlatformInterfaceProtoc
         if addStatus != errSecSuccess {
             throw NSError(domain: NSOSStatusErrorDomain, code: Int(addStatus))
         }
-        return true
+        ret0_.pointee = true
     }
 
     private static func validTurncoatStorageKey(_ value: String) -> Bool {

@@ -2,6 +2,11 @@ name: Desktop
 
 on:
   workflow_dispatch:
+    inputs:
+      native_runtime:
+        description: "JSON object with the native runtime artifact pins declared in this workflow"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -12,11 +17,11 @@ concurrency:
 
 env:
   FLUTTER_VERSION: "3.38.5"
-  CORE_RELEASE_TAG: "core-desktop-0.7.8"
-  LINUX_CORE_ARCHIVE: "marten-core-linux-amd64-20260818.tar.gz"
-  LINUX_CORE_SHA256: "ae17263c06cd3d8e64a9d6b4be2c465a3b73881bd51077f99fadb7c052a757fc"
-  WINDOWS_CORE_ARCHIVE: "marten-core-windows-amd64-20260818.tar.gz"
-  WINDOWS_CORE_SHA256: "4de67e0e6b32c571b53092810693e59d9715efc1e4294ac26e6e80ebdba3b317"
+  CORE_RELEASE_TAG: ${{ fromJSON(inputs.native_runtime).CORE_RELEASE_TAG }}
+  LINUX_CORE_ARCHIVE: ${{ fromJSON(inputs.native_runtime).LINUX_CORE_ARCHIVE }}
+  LINUX_CORE_SHA256: ${{ fromJSON(inputs.native_runtime).LINUX_CORE_SHA256 }}
+  WINDOWS_CORE_ARCHIVE: ${{ fromJSON(inputs.native_runtime).WINDOWS_CORE_ARCHIVE }}
+  WINDOWS_CORE_SHA256: ${{ fromJSON(inputs.native_runtime).WINDOWS_CORE_SHA256 }}
 
 jobs:
   linux:

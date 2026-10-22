@@ -9,7 +9,19 @@ String _extractFunctionBlock(String source, String signature) {
   final marker = source.indexOf(signature);
   if (marker < 0) return '';
 
-  final open = source.indexOf('{', marker);
+  var parenthesisDepth = 0;
+  var open = -1;
+  for (var index = marker; index < source.length; index++) {
+    switch (source[index]) {
+      case '(':
+        parenthesisDepth++;
+      case ')':
+        parenthesisDepth--;
+      case '{' when parenthesisDepth == 0:
+        open = index;
+    }
+    if (open >= 0) break;
+  }
   if (open < 0) return '';
 
   var depth = 0;
@@ -28,6 +40,93 @@ String _extractFunctionBlock(String source, String signature) {
 }
 
 void main() {
+  group('Android detached foreground control', () {
+    test('profile option changes use the service-owned background control path while the foreground is paused', () {
+      final source = File('lib/martencore/marten_core_service.dart').readAsStringSync();
+      final changeOptions = _extractFunctionBlock(
+        source,
+        'TaskEither<String, Unit> changeOptions(SingboxConfigOption options)',
+      );
+
+      expect(changeOptions, isNotEmpty);
+      final serviceOwnedPolicy = changeOptions.indexOf('final useServiceOwnedBackgroundControl =');
+      final policyEnd = changeOptions.indexOf(';', serviceOwnedPolicy);
+      expect(serviceOwnedPolicy, isNonNegative);
+      expect(policyEnd, greaterThan(serviceOwnedPolicy));
+      final policy = changeOptions.substring(serviceOwnedPolicy, policyEnd);
+      expect(
+        policy,
+        contains('PlatformUtils.isAndroid && !_frontAttached'),
+        reason: 'a paused Android Activity must not issue configuration RPCs on its foreground transport',
+      );
+      expect(
+        policy,
+        contains('currentState is CoreStarted'),
+        reason:
+            'only a stable started service may own a paused-Activity setting update; other states must restore foreground control',
+      );
+
+      final detachedPath = changeOptions.indexOf('if (useServiceOwnedBackgroundControl)');
+      final foregroundRecovery = changeOptions.indexOf('await _ensureForegroundControlReady()');
+      final foregroundUpdate = changeOptions.indexOf('core.fgClient.changeMartenSettings');
+      expect(detachedPath, isNonNegative);
+      expect(foregroundRecovery, greaterThan(detachedPath));
+      expect(foregroundUpdate, greaterThan(foregroundRecovery));
+
+      final detachedSection = changeOptions.substring(detachedPath, foregroundRecovery);
+      expect(detachedSection, contains('await _shouldUpdateBackgroundSettings()'));
+      expect(detachedSection, contains('core.backgroundControlClient.changeMartenSettings'));
+      expect(
+        detachedSection,
+        isNot(contains('core.fgClient.changeMartenSettings')),
+        reason: 'a detached foreground channel can be terminally paused or already closed',
+      );
+    });
+
+    test('ordinary foreground Connect restores a live foreground control channel after terminal stop', () {
+      final source = File('lib/martencore/marten_core_service.dart').readAsStringSync();
+      final ensureForeground = _extractFunctionBlock(
+        source,
+        'Future<Either<String, Unit>> _ensureForegroundControlReady() async',
+      );
+      final resumeFront = _extractFunctionBlock(source, 'Future<void> resumeFront() async');
+      final changeOptions = _extractFunctionBlock(
+        source,
+        'TaskEither<String, Unit> changeOptions(SingboxConfigOption options)',
+      );
+
+      expect(ensureForeground, isNotEmpty);
+      final healthCheck = ensureForeground.indexOf('await core.isActiveFg()');
+      final reSetup = ensureForeground.indexOf('await setup().run()', healthCheck);
+      expect(healthCheck, isNonNegative);
+      expect(
+        reSetup,
+        greaterThan(healthCheck),
+        reason: 'a stale foreground transport must be rebuilt before Connect can reuse it',
+      );
+
+      expect(resumeFront, contains('await _ensureForegroundControlReady();'));
+      final foregroundRecovery = changeOptions.indexOf('await _ensureForegroundControlReady()');
+      final foregroundUpdate = changeOptions.indexOf('core.fgClient.changeMartenSettings', foregroundRecovery);
+      expect(foregroundRecovery, isNonNegative);
+      expect(foregroundUpdate, greaterThan(foregroundRecovery));
+    });
+  });
+
+  group('front-channel shutdown', () {
+    test('always releases the background log listener when closing the front channel', () {
+      final source = File('lib/martencore/marten_core_service.dart').readAsStringSync();
+      final closeFront = _extractFunctionBlock(source, 'Future<void> closeFront() async');
+      final stopListeningLogs = _extractFunctionBlock(source, 'Future<void> stopListeningLogs(String role) async');
+
+      expect(closeFront, isNotEmpty);
+      expect(closeFront, contains('_frontAttached = false;'));
+      expect(closeFront, contains('_stopNativeRecoveryLogBridge();'));
+      expect(closeFront, contains('await stopListeningLogs("bg");'));
+      expect(stopListeningLogs, contains('coreLogListenerKey(isAndroid: PlatformUtils.isAndroid, role: role)'));
+    });
+  });
+
   group('Android CAPTCHA recovery log bridge', () {
     test('filters superseded Android background log generations without filtering foreground or desktop logs', () {
       expect(acceptsBackgroundLogGeneration(isAndroid: true, listenerGeneration: 41, currentGeneration: 42), isFalse);
@@ -83,6 +182,72 @@ void main() {
       expect(deferredProfile, isNot(contains('profileRepositoryProvider')));
     });
 
+    test('Android authoritative VPN status is awaited before UI bootstrap release', () {
+      final bootstrap = File('lib/bootstrap.dart').readAsStringSync();
+      final bootstrapBlock = _extractFunctionBlock(bootstrap, 'Future<void> lazyBootstrap');
+      expect(bootstrapBlock, isNotEmpty);
+
+      final preserve = bootstrapBlock.indexOf('FlutterNativeSplash.preserve');
+      final awaitedStatus = bootstrapBlock.indexOf('await _init("authoritative Android VPN status"');
+      final androidIf = bootstrapBlock.lastIndexOf('if (PlatformUtils.isAndroid) {', awaitedStatus);
+      final launchReady = bootstrapBlock.indexOf('startup phase=bootstrap_prerequisites_ready');
+      final runApp = bootstrapBlock.indexOf('runApp(');
+      final removeSplash = bootstrapBlock.indexOf('FlutterNativeSplash.remove()');
+
+      expect(preserve, isNonNegative);
+      expect(androidIf, isNonNegative);
+      expect(awaitedStatus, isNonNegative);
+      expect(launchReady, isNonNegative);
+      expect(runApp, isNonNegative);
+      expect(removeSplash, isNonNegative);
+
+      expect(preserve, lessThan(androidIf));
+      expect(androidIf, lessThan(awaitedStatus));
+      expect(awaitedStatus, lessThan(launchReady));
+      expect(awaitedStatus, lessThan(runApp));
+      expect(awaitedStatus, lessThan(removeSplash));
+    });
+
+    test('authoritative Android VPN bootstrap is confined to Android and does not hold non-Android startup', () {
+      final bootstrap = File('lib/bootstrap.dart').readAsStringSync();
+      final bootstrapBlock = _extractFunctionBlock(bootstrap, 'Future<void> lazyBootstrap');
+      expect(bootstrapBlock, isNotEmpty);
+
+      final awaitedStatus = bootstrapBlock.indexOf('await _init("authoritative Android VPN status"');
+      expect(awaitedStatus, isNonNegative);
+      final androidIf = bootstrapBlock.lastIndexOf('if (PlatformUtils.isAndroid) {', awaitedStatus);
+      expect(androidIf, isNonNegative);
+
+      final conditionalBlock = _extractFunctionBlock(
+        bootstrapBlock.substring(androidIf),
+        'if (PlatformUtils.isAndroid) {',
+      );
+      expect(conditionalBlock, isNotEmpty);
+      expect(
+        conditionalBlock,
+        contains(
+          'await _init("authoritative Android VPN status", () => container.read(connectionNotifierProvider.future));',
+        ),
+      );
+      expect(bootstrapBlock.substring(0, androidIf), isNot(contains('authoritative Android VPN status')));
+      expect(conditionalBlock, isNot(contains('runApp(')));
+      expect(conditionalBlock, isNot(contains('FlutterNativeSplash.remove()')));
+    });
+
+    test('authoritative Android VPN bootstrap keeps startup strict with no timeout/disconnected fallback', () {
+      final bootstrap = File('lib/bootstrap.dart').readAsStringSync();
+      final awaitStart = bootstrap.indexOf('await _init("authoritative Android VPN status"');
+      expect(awaitStart, isNonNegative);
+      final awaitEnd = bootstrap.indexOf('\n', awaitStart);
+      final awaitedLine = awaitEnd < 0 ? bootstrap.substring(awaitStart) : bootstrap.substring(awaitStart, awaitEnd);
+
+      expect(awaitedLine, contains('_init("authoritative Android VPN status"'));
+      expect(awaitedLine, isNot(contains('timeout:')));
+      expect(awaitedLine, isNot(contains('_safeInit')));
+      expect(awaitedLine, isNot(contains('CoreStatus.stopped')));
+      expect(awaitedLine, isNot(contains('Disconnected()')));
+    });
+
     test('foreground profile scheduler waits for startup delay while manual triggers stay available', () {
       final source = File('lib/features/profile/notifier/profiles_update_notifier.dart').readAsStringSync();
       final buildStart = source.indexOf('Stream<ProfileUpdateStatus?> build()');
@@ -91,7 +256,7 @@ void main() {
       expect(fieldsStart, isNonNegative);
       final build = source.substring(buildStart, fieldsStart);
 
-      expect(source, contains('initialStartupDelay = Duration(seconds: 45)'));
+      expect(source, contains('initialStartupDelay = Duration(seconds: 10)'));
       expect(build, contains('Timer(initialStartupDelay'));
       expect(build, contains('_initialStartTimer?.cancel()'));
       expect(build, isNot(contains('checkDueNow(')));
@@ -247,8 +412,8 @@ void main() {
       final idleGate = bootstrap.substring(idleGateStart, initStart);
       final deferredProfile = bootstrap.substring(profileStart, platformStart);
       final deferredPlatform = bootstrap.substring(platformStart, idleGateStart);
-      expect(idleGate, contains('SchedulerBinding.instance.scheduleTask<void>'));
-      expect(idleGate, contains('Priority.idle'));
+      expect(idleGate, contains('UiIdleGate'));
+      expect(bootstrap, isNot(contains('scheduleTask')));
       expect(deferredProfile.indexOf('Duration(seconds: 30)'), isNonNegative);
       expect(deferredProfile.indexOf('_waitForUiIdle'), greaterThan(deferredProfile.indexOf('Duration(seconds: 30)')));
       expect(deferredPlatform.indexOf('Duration(seconds: 10)'), isNonNegative);
@@ -263,23 +428,22 @@ void main() {
       final foregroundBuild = _extractFunctionBlock(foreground, 'Stream<ProfileUpdateStatus?> build()');
       expect(foregroundBuild, isNotEmpty);
       expect(foregroundBuild.indexOf('Timer(initialStartupDelay'), isNonNegative);
-      expect(
-        foregroundBuild.indexOf('SchedulerBinding.instance.scheduleTask<void>'),
-        greaterThan(foregroundBuild.indexOf('Timer(initialStartupDelay')),
-      );
-      expect(foregroundBuild, contains('Priority.idle'));
+      expect(foregroundBuild.indexOf('UiIdleGate(debugLabel:'), greaterThan(foregroundBuild.indexOf('Timer(initialStartupDelay')));
+      expect(foregroundBuild, contains('startupIdle?.cancel()'));
+      expect(foregroundBuild, isNot(contains('scheduleTask')));
       expect(foregroundBuild, isNot(contains('Timer.periodic')));
 
       final perApp = File('lib/features/per_app_proxy/overview/per_app_proxy_service_notifier.dart').readAsStringSync();
       final perAppBuild = _extractFunctionBlock(perApp, 'Future<void> build() async');
       expect(perAppBuild, isNotEmpty);
       final delay = perAppBuild.indexOf('delayed(initialStartupDelay)');
-      final idleTask = perAppBuild.indexOf('SchedulerBinding.instance.scheduleTask<void>');
+      final idleTask = perAppBuild.indexOf('UiIdleGate(debugLabel:');
       final enumerate = perAppBuild.indexOf('InstalledApps.getInstalledApps');
       expect(delay, isNonNegative);
       expect(idleTask, greaterThan(delay));
       expect(enumerate, greaterThan(idleTask));
-      expect(perAppBuild, contains('Priority.idle'));
+      expect(perAppBuild, contains('startupIdle?.cancel()'));
+      expect(perAppBuild, isNot(contains('scheduleTask')));
       expect(
         RegExp(r'Timer\.periodic').allMatches(perAppBuild),
         hasLength(1),
@@ -325,6 +489,22 @@ void main() {
       expect(terminalBlock, contains('_stopNativeRecoveryLogBridge()'));
       expect(apply, contains('if (event case CoreStopped(alert: final alert?))'));
       expect(apply, contains('Preferences.startedByUser.notifier).update(false)'));
+    });
+
+    test('direct platform status reads are cached for late listener seeding', () {
+      final source = File('lib/martencore/marten_core_service.dart').readAsStringSync();
+      final readStart = source.indexOf('Future<CoreStatus?> readPlatformServiceStatus() async {');
+      final readEnd = source.indexOf('\n  Stream<CoreStatus> watchPlatformServiceStatus()', readStart);
+      expect(readStart, isNonNegative);
+      expect(readEnd, greaterThan(readStart));
+
+      final readBlock = source.substring(readStart, readEnd);
+      expect(readBlock, contains('final status = await core.readPlatformServiceStatus();'));
+      final cache = readBlock.indexOf('if (status != null) _latestPlatformServiceStatus = status;');
+      final returnStatus = readBlock.indexOf('return status;', cache);
+      expect(cache, isNonNegative);
+      expect(returnStatus, isNonNegative);
+      expect(cache, lessThan(returnStatus));
     });
 
     test('tracks a native recovery only when a running core enters platform starting', () {
@@ -869,7 +1049,9 @@ void main() {
       final startBlock = _extractFunctionBlock(source, 'TaskEither<ConnectionFailure, Unit> start(');
       expect(startBlock, isNotEmpty);
 
-      final setupResultIdx = startBlock.indexOf('final background = await core.setupBackground(path, name);');
+      final setupResultIdx = startBlock.indexOf(
+        'final background = await core.setupBackground(path, name, androidVpnStartEpoch: androidVpnStartEpoch);',
+      );
       final attachedBranchIdx = startBlock.indexOf('if (background case BackgroundCoreAttached(:final status)) {');
       final attachedReturnIdx = startBlock.indexOf('return right(unit);', attachedBranchIdx);
       final portReleaseIdx = startBlock.indexOf('await _waitForCoreLocalPortsRelease()');
@@ -877,6 +1059,11 @@ void main() {
       final bgStartIdx = startBlock.indexOf('final res = await core.bgClient.start(');
 
       expect(setupResultIdx, isNonNegative);
+      expect(
+        startBlock.indexOf('androidVpnStartEpoch: androidVpnStartEpoch'),
+        greaterThanOrEqualTo(setupResultIdx),
+        reason: 'the exact Android terminal-session epoch must reach native background setup',
+      );
       expect(attachedBranchIdx, isNonNegative);
       expect(attachedReturnIdx, isNonNegative);
       expect(startBlock, contains('if (background case BackgroundCoreAttached(:final status)) {'));
@@ -984,45 +1171,155 @@ void main() {
       );
     });
 
-    test('native recovery maintains the background CAPTCHA log bridge before route verification', () {
+    test('native recovery CAPTCHA bridge uses the capped cancellable exponential backoff', () {
+      expect(nativeRecoveryLogBridgeRetryDelay(-1), const Duration(seconds: 2));
+      expect(nativeRecoveryLogBridgeRetryDelay(0), const Duration(seconds: 2));
+      expect(nativeRecoveryLogBridgeRetryDelay(1), const Duration(seconds: 4));
+      expect(nativeRecoveryLogBridgeRetryDelay(2), const Duration(seconds: 8));
+      expect(nativeRecoveryLogBridgeRetryDelay(3), const Duration(seconds: 16));
+      expect(nativeRecoveryLogBridgeRetryDelay(4), const Duration(seconds: 32));
+      expect(nativeRecoveryLogBridgeRetryDelay(5), const Duration(seconds: 60));
+      expect(nativeRecoveryLogBridgeRetryDelay(99), const Duration(seconds: 60));
+    });
+
+    test(
+      'native recovery maintains the background CAPTCHA log bridge by exact removal events before route verification',
+      () {
+        final source = File('lib/martencore/marten_core_service.dart').readAsStringSync();
+        final apply = _extractFunctionBlock(source, 'void _applyPlatformServiceStatus(CoreStatus event)');
+        final bridge = _extractFunctionBlock(
+          source,
+          'Future<void> _maintainNativeRecoveryLogBridge(int generation, Completer<void> stopSignal) async',
+        );
+        final stopBridge = _extractFunctionBlock(source, 'void _stopNativeRecoveryLogBridge()');
+        final retryWait = _extractFunctionBlock(
+          source,
+          'Future<void> _waitForNativeRecoveryLogBridgeRetry(Duration delay)',
+        );
+        final logs = _extractFunctionBlock(source, 'Future<void> startListeningLogs(String key, CoreClient cc) async');
+
+        expect(apply, isNotEmpty);
+        expect(bridge, isNotEmpty);
+        expect(stopBridge, isNotEmpty);
+        expect(retryWait, isNotEmpty);
+        expect(logs, isNotEmpty);
+
+        final recoveryStart = apply.indexOf('if (startsNativePlatformRecovery(currentState, event))');
+        final bridgeStart = apply.indexOf('_startNativeRecoveryLogBridge();');
+        final recoveryCompleted = apply.indexOf(
+          'final recoveryCompleted = recoveryInProgress && event is CoreStarted;',
+        );
+        expect(recoveryStart, isNonNegative);
+        expect(bridgeStart, greaterThan(recoveryStart));
+        expect(bridgeStart, lessThan(recoveryCompleted));
+
+        expect(bridge, contains('while (_ownsNativeRecoveryLogBridge(generation))'));
+        expect(
+          bridge,
+          contains('final logListenerKey = coreLogListenerKey(isAndroid: PlatformUtils.isAndroid, role: "bg")'),
+        );
+        expect(bridge, contains('if (subscriptions[logListenerKey] != null)'));
+        expect(
+          bridge,
+          contains('await _subscriptionRegistry.waitUntilRemoved(logListenerKey, cancelSignal: stopSignal.future)'),
+        );
+        expect(bridge, contains('await startListeningLogs("bg", core.bgClient)'));
+        expect(
+          bridge,
+          contains(
+            'await _waitForNativeRecoveryLogBridgeRetry(nativeRecoveryLogBridgeRetryDelay(consecutiveFailures++))',
+          ),
+        );
+        expect(bridge, isNot(contains('Future.delayed')));
+        expect(bridge, isNot(contains('_nativeRecoveryLogBridgePollInterval')));
+        expect(bridge, isNot(contains('Duration(milliseconds: 400)')));
+        expect(bridge, isNot(contains('stopListenSingle("bg")')));
+
+        expect(stopBridge, contains('_nativeRecoveryLogBridgeRetryTimer?.cancel();'));
+        expect(stopBridge, contains('if (retryWaiter != null && !retryWaiter.isCompleted) retryWaiter.complete();'));
+        expect(retryWait, contains('final timer = Timer(delay, () {'));
+
+        expect(apply, contains('_stopNativeRecoveryLogBridge();'));
+        expect(apply.lastIndexOf('_stopNativeRecoveryLogBridge();'), greaterThan(recoveryCompleted));
+        expect(logs, contains("event.message.contains('MARTEN_TURNCOAT_CAPTCHA')"));
+        expect(
+          logs,
+          contains('if (!isCaptchaControlEvent && !_coreLogDeduplicator.shouldAccept(event)) return event;'),
+        );
+      },
+    );
+  });
+
+  group('core log hot-path retention and snapshots', () {
+    test('bounded snapshot retains only the newest requested entries and is immutable', () {
+      final source = List<int>.generate(1005, (index) => index);
+
+      final defaultSnapshot = boundedCoreLogSnapshot(source);
+      final customSnapshot = boundedCoreLogSnapshot(source, limit: 3);
+
+      expect(defaultSnapshot, hasLength(1000));
+      expect(defaultSnapshot.first, 5);
+      expect(defaultSnapshot.last, 1004);
+      expect(customSnapshot, <int>[1002, 1003, 1004]);
+      expect(() => defaultSnapshot.add(1005), throwsUnsupportedError);
+      expect(() => customSnapshot[0] = 0, throwsUnsupportedError);
+      expect(source, hasLength(1005), reason: 'taking a UI snapshot must not mutate the rolling buffer');
+    });
+
+    test('retention sweep runs initially and no more often than once per minute', () {
+      final startedAt = DateTime.utc(2026, 9, 7, 12);
+
+      expect(shouldSweepCoreLogRetention(lastSweepAt: null, now: startedAt), isTrue);
+      expect(
+        shouldSweepCoreLogRetention(lastSweepAt: startedAt, now: startedAt.add(const Duration(seconds: 59))),
+        isFalse,
+      );
+      expect(
+        shouldSweepCoreLogRetention(lastSweepAt: startedAt, now: startedAt.add(const Duration(minutes: 1))),
+        isTrue,
+      );
+    });
+
+    test('log listener emits immutable singleton deltas and avoids release debug/info line splitting', () {
       final source = File('lib/martencore/marten_core_service.dart').readAsStringSync();
-      final apply = _extractFunctionBlock(source, 'void _applyPlatformServiceStatus(CoreStatus event)');
-      final bridge = _extractFunctionBlock(
+      final listener = _extractFunctionBlock(
         source,
-        'Future<void> _maintainNativeRecoveryLogBridge(int generation) async',
+        'Future<void> startListeningLogs(String key, CoreClient cc) async',
       );
-      final logs = _extractFunctionBlock(source, 'Future<void> startListeningLogs(String key, CoreClient cc) async');
 
-      expect(apply, isNotEmpty);
-      expect(bridge, isNotEmpty);
-      expect(logs, isNotEmpty);
+      expect(listener, isNotEmpty);
+      expect(listener, contains('runtimeLogController.add(List<LogMessage>.unmodifiable([event]))'));
+      expect(listener, contains('logController.add(List<LogMessage>.unmodifiable([safeEvent]))'));
+      expect(listener, isNot(contains('List.unmodifiable(runtimeLogBuffer)')));
+      expect(listener, isNot(contains('List.unmodifiable(logBuffer)')));
+      expect(listener, isNot(contains('List<LogMessage>.unmodifiable(runtimeLogBuffer)')));
+      expect(listener, isNot(contains('List<LogMessage>.unmodifiable(logBuffer)')));
 
-      final recoveryStart = apply.indexOf('if (startsNativePlatformRecovery(currentState, event))');
-      final bridgeStart = apply.indexOf('_startNativeRecoveryLogBridge();');
-      final recoveryCompleted = apply.indexOf('final recoveryCompleted = recoveryInProgress && event is CoreStarted;');
-      expect(recoveryStart, isNonNegative);
-      expect(bridgeStart, greaterThan(recoveryStart));
-      expect(bridgeStart, lessThan(recoveryCompleted));
-
+      final diagnosticLevel = listener.indexOf('final diagnosticLevel = getLogLevel(event.level);');
+      final releaseFilter = listener.indexOf(
+        'shouldForwardCoreLogToDiagnosticPrinters(diagnosticLevel, debugBuild: kDebugMode)',
+      );
+      final split = listener.indexOf("safeEvent.message.split('\\n')");
+      expect(diagnosticLevel, isNonNegative);
+      expect(releaseFilter, greaterThan(diagnosticLevel));
       expect(
-        bridge,
-        contains(
-          'while (!_disposed && _nativePlatformRecoveryInProgress && generation == _nativeRecoveryLogBridgeGeneration)',
-        ),
+        split,
+        greaterThan(releaseFilter),
+        reason: 'release DEBUG/INFO logs must be rejected before line splitting',
       );
-      expect(
-        bridge,
-        contains('final logListenerKey = coreLogListenerKey(isAndroid: PlatformUtils.isAndroid, role: "bg")'),
-      );
-      expect(bridge, contains('if (subscriptions[logListenerKey] == null)'));
-      expect(bridge, contains('await startListeningLogs("bg", core.bgClient)'));
-      expect(bridge, contains('await Future.delayed(_nativeRecoveryLogBridgePollInterval)'));
-      expect(bridge, isNot(contains('stopListenSingle("bg")')));
+    });
 
-      expect(apply, contains('_stopNativeRecoveryLogBridge();'));
-      expect(apply.lastIndexOf('_stopNativeRecoveryLogBridge();'), greaterThan(recoveryCompleted));
-      expect(logs, contains("event.message.contains('MARTEN_TURNCOAT_CAPTCHA')"));
-      expect(logs, contains('if (!isCaptchaControlEvent && !_coreLogDeduplicator.shouldAccept(event)) return event;'));
+    test('log watcher throttles incremental signals before producing a bounded snapshot', () {
+      final source = File('lib/martencore/marten_core_service.dart').readAsStringSync();
+      final watcher = _extractFunctionBlock(source, 'Stream<List<LogMessage>> watchLogs(String path) async*');
+
+      expect(watcher, isNotEmpty);
+      final stream = watcher.indexOf('logController.stream');
+      final throttle = watcher.indexOf('.throttleTime(_logUiSnapshotInterval, leading: false, trailing: true)', stream);
+      final snapshot = watcher.indexOf('.map((_) => boundedCoreLogSnapshot(logBuffer))');
+      expect(stream, isNonNegative);
+      expect(throttle, greaterThan(stream));
+      expect(snapshot, greaterThan(throttle));
     });
   });
 }

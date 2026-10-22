@@ -5,6 +5,7 @@ import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
 import 'package:fpdart/fpdart.dart';
+import 'package:marten/core/analytics/crash_diagnostics.dart';
 import 'package:marten/core/logger/log_file_retention.dart';
 import 'package:marten/core/logger/logger_controller.dart';
 import 'package:marten/core/utils/exception_handler.dart';
@@ -94,9 +95,14 @@ class LogRepositoryImpl with ExceptionHandler, InfraLogger implements LogReposit
   }
 
   @override
-  Future<File> prepareShareFile(LogExportMetadata metadata) {
+  Future<File> prepareShareFile(LogExportMetadata metadata) async {
+    // Query system exit history on the existing platform background queue before
+    // log locks. This works while disconnected, without touching Firebase/core.
+    final diagnostics = await CrashDiagnostics.snapshot();
     return singbox.runCoreLogSynchronized(
-      () => LoggerController.instance.runAppLogSynchronized(() => logPathResolver.prepareShareFile(metadata: metadata)),
+      () => LoggerController.instance.runAppLogSynchronized(
+        () => logPathResolver.prepareShareFile(metadata: metadata, crashDiagnostics: diagnostics),
+      ),
     );
   }
 

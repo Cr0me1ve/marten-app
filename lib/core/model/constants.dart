@@ -3,13 +3,13 @@ import 'package:flutter/services.dart';
 
 abstract class Constants {
   static const appName = "Marten";
-  static const githubUrl = "https://github.com/Cr0me1ve/marten-app";
-  static const licenseUrl = "https://github.com/Cr0me1ve/marten-app/blob/main/LICENSE.md";
-  static const githubReleasesApiUrl = "https://api.github.com/repos/Cr0me1ve/marten-app/releases";
-  static const githubLatestReleaseUrl = "https://github.com/Cr0me1ve/marten-app/releases/latest";
-  static const appCastUrl = "https://raw.githubusercontent.com/Cr0me1ve/marten-app/main/appcast.xml";
+  static const githubUrl = "https://github.com/Cr0me1ve/Marten";
+  static const licenseUrl = "https://github.com/Cr0me1ve/Marten?tab=License-1-ov-file#readme";
+  static const githubReleasesApiUrl = "https://api.github.com/repos/Cr0me1ve/Marten/releases";
+  static const githubLatestReleaseUrl = "https://github.com/Cr0me1ve/Marten/releases/latest";
+  static const appCastUrl = "https://raw.githubusercontent.com/Cr0me1ve/Marten/main/appcast.xml";
   static const privacyPolicyUrl = "https://app.marten.pw/privacy";
-  static const termsAndConditionsUrl = "https://github.com/Cr0me1ve/marten-app/blob/main/LICENSE.md";
+  static const termsAndConditionsUrl = "https://github.com/Cr0me1ve/Marten";
 }
 
 const kAnimationDuration = Duration(milliseconds: 250);

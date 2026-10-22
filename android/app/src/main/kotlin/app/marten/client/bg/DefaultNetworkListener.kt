@@ -2,6 +2,7 @@ package app.marten.client.bg
 
 import android.annotation.TargetApi
 import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
@@ -16,6 +17,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.ObsoleteCoroutinesApi
 import kotlinx.coroutines.channels.SendChannel
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.actor
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -36,7 +38,13 @@ object DefaultNetworkListener {
             val response = CompletableDeferred<Network>()
         }
 
+        class CancelGet(val request: Get) : NetworkMessage()
+
         class Stop(val key: Any) : NetworkMessage()
+
+        class Refresh(val key: Any) : NetworkMessage() {
+            val response = CompletableDeferred<Boolean>()
+        }
 
         class Put(val network: Network) : NetworkMessage()
 
@@ -50,7 +58,7 @@ object DefaultNetworkListener {
 
     @OptIn(DelicateCoroutinesApi::class, ObsoleteCoroutinesApi::class)
     private val networkActor: SendChannel<NetworkMessage> =
-        GlobalScope.actor<NetworkMessage>(Dispatchers.Unconfined) {
+        GlobalScope.actor<NetworkMessage>(Dispatchers.Unconfined, capacity = Channel.UNLIMITED) {
             val listeners = mutableMapOf<Any, (Network?) -> Unit>()
             var network: Network? = null
             var lostToken = 0
@@ -66,6 +74,7 @@ object DefaultNetworkListener {
                     }
 
                     is NetworkMessage.Get -> {
+                        if (!message.response.isActive) continue
                         if (listeners.isEmpty()) {
                             val currentNetwork = findUsableNetwork()
                             if (currentNetwork != null) {
@@ -88,6 +97,8 @@ object DefaultNetworkListener {
                         }
                     }
 
+                    is NetworkMessage.CancelGet -> pendingRequests.remove(message.request)
+
                     is NetworkMessage.Stop ->
                         if (listeners.isNotEmpty() &&
                             // was not empty
@@ -104,6 +115,24 @@ object DefaultNetworkListener {
                             pendingRequests.clear()
                             unregister()
                         }
+
+                    is NetworkMessage.Refresh -> {
+                        val restarted = if (listeners.containsKey(message.key)) {
+                            lostToken++
+                            network = null
+                            unregister()
+                            runCatching {
+                                register()
+                                true
+                            }.getOrElse {
+                                Log.w(TAG, "physical network request refresh failed")
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                        message.response.complete(restarted)
+                    }
 
                     is NetworkMessage.Put -> {
                         if (listeners.isNotEmpty()) {
@@ -171,12 +200,46 @@ object DefaultNetworkListener {
             ?: error("missing default network") // failed to listen, return current if available
     } else {
         NetworkMessage.Get().run {
-            networkActor.send(this)
-            response.await()
+            val request = this
+            response.invokeOnCompletion {
+                if (response.isCancelled) networkActor.trySend(NetworkMessage.CancelGet(request))
+            }
+            try {
+                networkActor.send(request)
+                response.await()
+            } finally {
+                response.cancel()
+            }
         }
     }
 
     suspend fun stop(key: Any) = networkActor.send(NetworkMessage.Stop(key))
+
+    /** Re-registers the physical-network request after netd rejects its cached Network. */
+    internal suspend fun refresh(key: Any): Boolean = NetworkMessage.Refresh(key).run {
+        networkActor.send(this)
+        response.await()
+    }
+
+    /**
+     * Returns the best physical network visible to ConnectivityManager now.
+     *
+     * Some OEM builds can miss an onAvailable callback after a cellular handoff.
+     * The owner-scoped monitor uses this side-effect-free snapshot to reconcile
+     * that lost callback without requiring airplane mode to recreate the network.
+     */
+    internal fun snapshot(excluded: Network? = null): Network? = findUsableNetwork(excluded)
+
+    internal fun isUsable(network: Network?): Boolean {
+        if (network == null) return false
+        val capabilities = runCatching {
+            Application.connectivity.getNetworkCapabilities(network)
+        }.getOrNull() ?: return false
+        if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return false
+        return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED) &&
+            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+    }
 
     // NB: this runs in ConnectivityThread, and this behavior cannot be changed until API 26
     private object Callback : ConnectivityManager.NetworkCallback() {
@@ -190,6 +253,13 @@ object DefaultNetworkListener {
 
         override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
             // it's a good idea to refresh capabilities
+            runBlocking { networkActor.send(NetworkMessage.Update(network)) }
+        }
+
+        override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+            // DNS servers and routes can become usable after onAvailable while
+            // Android keeps the same Network object. Publish that readiness
+            // edge so fail-closed recovery can resume without polling.
             runBlocking { networkActor.send(NetworkMessage.Update(network)) }
         }
 
@@ -272,19 +342,11 @@ object DefaultNetworkListener {
     }
 
     @Suppress("DEPRECATION")
-    private fun findUsableNetwork(): Network? {
-        fun Network.isUsable(): Boolean {
-            val capabilities = Application.connectivity.getNetworkCapabilities(this) ?: return false
-            if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return false
-            return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
-                capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED) &&
-                capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
-        }
-
+    private fun findUsableNetwork(excluded: Network? = null): Network? {
         return Application.connectivity.activeNetwork
-            ?.takeIf { it.isUsable() }
+            ?.takeIf { it != excluded && isUsable(it) }
             ?: Application.connectivity.allNetworks.firstOrNull {
-                it.isUsable()
+                it != excluded && isUsable(it)
             }
     }
 

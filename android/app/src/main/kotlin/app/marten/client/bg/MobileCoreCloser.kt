@@ -1,7 +1,8 @@
 package app.marten.client.bg
 
 import android.util.Log
-import app.marten.core.mobile.Mobile
+import app.marten.client.bg.RemoteMobile as Mobile
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
@@ -25,6 +26,7 @@ internal class MobileCloseCoordinator(
 ) {
     private class Operation {
         val error = AtomicReference<Throwable?>(null)
+        val completion = CompletableDeferred<Throwable?>()
         lateinit var thread: Thread
     }
 
@@ -52,6 +54,19 @@ internal class MobileCloseCoordinator(
         return waitFor(current, timeoutMs)
     }
 
+    suspend fun awaitCloseCompletion(): MobileCloseResult {
+        val current = synchronized(lock) {
+            operation ?: return MobileCloseResult(
+                finished = true,
+                error = lastCompletedError,
+            )
+        }
+        return MobileCloseResult(
+            finished = true,
+            error = current.completion.await(),
+        )
+    }
+
     private fun currentOrStart(): Pair<Operation, Boolean> {
         synchronized(lock) {
             operation?.let { return it to false }
@@ -63,12 +78,14 @@ internal class MobileCloseCoordinator(
                 } catch (error: Throwable) {
                     created.error.set(error)
                 } finally {
+                    val completedError = created.error.get()
                     synchronized(lock) {
-                        lastCompletedError = created.error.get()
+                        lastCompletedError = completedError
                         if (operation === created) {
                             operation = null
                         }
                     }
+                    created.completion.complete(completedError)
                 }
             }, threadName).apply {
                 isDaemon = true
@@ -92,22 +109,40 @@ internal class MobileCloseCoordinator(
 object MobileCoreCloser {
     private const val TAG = "A/MobileCoreCloser"
     private const val CLOSE_WAIT_TIMEOUT_MS = 15_000L
+    private val closePhase = AtomicReference("idle")
 
     private val coordinator = MobileCloseCoordinator("marten-mobile-core-close") {
-        runBlocking {
-            // Native teardown is serialized with setup/start, but callers never
-            // hold this lifecycle mutex while waiting for it. A stuck native
-            // operation therefore leaves one tracked close pending instead of
-            // trapping manual Stop behind the recovery coroutine that requested
-            // it. The Android TUN has already been released by that point.
-            MobileCoreLifecycle.run {
-                try {
-                    Mobile.close(4L)
-                } catch (error: Throwable) {
-                    Log.w(TAG, "Mobile.close failed on native close thread", error)
-                    throw error
+        closePhase.set("cancel_start")
+        runCatching { Mobile.cancelStart() }
+            .onSuccess { cancelled ->
+                if (cancelled) {
+                    Log.i(TAG, "cancelled in-flight Mobile.start before exact close")
                 }
             }
+            .onFailure { error ->
+                Log.w(TAG, "failed to signal in-flight Mobile.start cancellation", error)
+            }
+        closePhase.set("lifecycle_barrier")
+        try {
+            runBlocking {
+                // Native teardown is serialized with setup/start, but callers never
+                // hold this lifecycle mutex while waiting for it. A stuck native
+                // operation therefore leaves one tracked close pending instead of
+                // trapping manual Stop behind the recovery coroutine that requested
+                // it. Android keeps the full-route descriptor fail-closed until the
+                // terminal stop owner replaces and releases the platform VPN.
+                MobileCoreLifecycle.run {
+                    closePhase.set("native_close")
+                    try {
+                        Mobile.close(4L)
+                    } catch (error: Throwable) {
+                        Log.w(TAG, "Mobile.close failed on native close thread", error)
+                        throw error
+                    }
+                }
+            }
+        } finally {
+            closePhase.set("idle")
         }
     }
 
@@ -131,7 +166,7 @@ object MobileCoreCloser {
             return@withContext false
         }
         if (!result.finished) {
-            Log.w(TAG, "Mobile.close did not finish within ${timeoutMs}ms during $reason")
+            Log.w(TAG, "Mobile.close did not finish within ${timeoutMs}ms during $reason phase=${closePhase.get()}")
         }
         return@withContext result.finished
     }
@@ -146,8 +181,22 @@ object MobileCoreCloser {
             return@withContext false
         }
         if (!result.finished) {
-            Log.w(TAG, "previous Mobile.close is still running before $reason")
+            Log.w(TAG, "previous Mobile.close is still running before $reason phase=${closePhase.get()}")
         }
         return@withContext result.finished
+    }
+
+    /**
+     * Suspends without polling until the one process-wide native close owner
+     * completes. Passive fail-closed recovery uses this path so a wedged close
+     * consumes neither periodic wakeups nor another native teardown thread.
+     */
+    suspend fun awaitCloseToFinish(reason: String): Boolean {
+        val result = coordinator.awaitCloseCompletion()
+        result.error?.let {
+            Log.w(TAG, "Mobile.close failed before $reason", it)
+            return false
+        }
+        return result.finished
     }
 }

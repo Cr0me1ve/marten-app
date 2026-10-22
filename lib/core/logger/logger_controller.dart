@@ -1,6 +1,6 @@
 import 'dart:async';
 
-import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:flutter/foundation.dart' show kDebugMode, kIsWeb;
 import 'package:loggy/loggy.dart';
 import 'package:marten/core/analytics/analytics_logger.dart';
 import 'package:marten/core/logger/custom_logger.dart';
@@ -63,6 +63,12 @@ class LoggerController extends LoggyPrinter with InfraLogger {
   /// Sends native-core diagnostics to the console and analytics without
   /// duplicating them in app.log; the canonical copy lives in box.log.
   void onCoreLog(LogRecord record) {
+    // The core stream is already persisted before it reaches this method.
+    // Re-printing every verbose startup/traffic line in a release build runs
+    // synchronous console and diagnostic printers on the Flutter UI isolate,
+    // which can starve connection-button frames. Keep the full developer
+    // console in debug builds and retain actionable warnings/errors everywhere.
+    if (!shouldForwardCoreLogToDiagnosticPrinters(record.level, debugBuild: kDebugMode)) return;
     consolePrinter.onLog(record);
     for (final entry in otherPrinters.entries) {
       if (entry.key == 'app') continue;
@@ -78,3 +84,6 @@ class LoggerController extends LoggyPrinter with InfraLogger {
     return operation();
   }
 }
+
+bool shouldForwardCoreLogToDiagnosticPrinters(LogLevel level, {required bool debugBuild}) =>
+    debugBuild || level.priority >= LogLevel.warning.priority;

@@ -1,10 +1,11 @@
 import 'dart:async';
 
-import 'package:flutter/scheduler.dart';
 import 'package:marten/core/localization/translations.dart';
 import 'package:marten/core/notification/in_app_notification_controller.dart';
 import 'package:marten/core/preferences/general_preferences.dart';
+import 'package:marten/core/utils/ui_idle_gate.dart';
 import 'package:marten/features/profile/data/profile_auto_update_service.dart';
+import 'package:marten/features/profile/model/profile_failure.dart';
 import 'package:marten/utils/custom_loggers.dart';
 import 'package:meta/meta.dart';
 import 'package:neat_periodic_task/neat_periodic_task.dart';
@@ -17,11 +18,13 @@ typedef ProfileUpdateStatus = ({String name, bool success});
 @Riverpod(keepAlive: true)
 class ForegroundProfilesUpdateNotifier extends _$ForegroundProfilesUpdateNotifier with AppLogger {
   static const interval = Duration(minutes: 15);
-  static const initialStartupDelay = Duration(seconds: 45);
+  static const initialStartupDelay = Duration(seconds: 10);
 
   @override
   Stream<ProfileUpdateStatus?> build() {
     var cycleCount = 0;
+    var disposed = false;
+    UiIdleGate? startupIdle;
     _scheduler = NeatPeriodicTaskScheduler(
       name: 'profiles update worker',
       interval: interval,
@@ -33,6 +36,8 @@ class ForegroundProfilesUpdateNotifier extends _$ForegroundProfilesUpdateNotifie
     );
 
     ref.onDispose(() async {
+      disposed = true;
+      startupIdle?.cancel();
       _initialStartTimer?.cancel();
       if (_schedulerStarted) {
         await _scheduler?.stop();
@@ -43,17 +48,17 @@ class ForegroundProfilesUpdateNotifier extends _$ForegroundProfilesUpdateNotifie
     if (ref.watch(Preferences.introCompleted)) {
       loggy.debug("intro done, deferring startup maintenance");
       _initialStartTimer = Timer(initialStartupDelay, () {
+        final scheduler = _scheduler;
+        final idle = UiIdleGate(debugLabel: 'foreground profile maintenance');
+        startupIdle = idle;
         unawaited(
-          SchedulerBinding.instance.scheduleTask<void>(
-            () {
-              final scheduler = _scheduler;
-              if (scheduler == null || _schedulerStarted) return;
-              _schedulerStarted = true;
-              scheduler.start();
-            },
-            Priority.idle,
-            debugLabel: 'foreground profile maintenance',
-          ),
+          idle.ready.then((admitted) {
+            if (!admitted || disposed || scheduler == null || !identical(_scheduler, scheduler) || _schedulerStarted) {
+              return;
+            }
+            _schedulerStarted = true;
+            scheduler.start();
+          }),
         );
       });
     } else {
@@ -106,7 +111,10 @@ class ForegroundProfilesUpdateNotifier extends _$ForegroundProfilesUpdateNotifie
           notification.showSuccessToast(t.pages.profiles.msg.update.successNamed(name: result.name));
           state = AsyncData((name: result.name, success: true));
         case ProfileAutoUpdateOutcome.failed:
-          notification.showErrorToast(t.pages.profiles.msg.update.failureNamed(name: result.name));
+          final action = t.pages.profiles.msg.update.failureNamed(name: result.name);
+          notification.showErrorToast(
+            result.failure == null ? action : presentProfileUpdateError(t, result.failure!, action: action),
+          );
           state = AsyncData((name: result.name, success: false));
         case ProfileAutoUpdateOutcome.skipped:
           break;

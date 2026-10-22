@@ -88,7 +88,64 @@ internal fun isOwnedTunRuntimeHealthy(
         isTunRuntimeHealthy(descriptorValid, interfaceUp, globalCandidateCount)
     }
 
-internal fun coreRecoveryRetryDelayMs(@Suppress("UNUSED_PARAMETER") failedAttempts: Int): Long = 2_000L
+/** Identifies the framework VPN generation owned by a retained packet sink. */
+internal enum class FailClosedVpnKind {
+    STARTUP,
+    RETIREMENT,
+}
+
+/** Exact framework generation marker installed on one fail-closed VPN Network. */
+internal data class FailClosedVpnGeneration(
+    val kind: FailClosedVpnKind,
+    val markerAddress: String,
+)
+
+internal enum class PlatformVpnRetirementOutcome {
+    RELEASED,
+    RETAINED,
+    FAILED,
+}
+
+/**
+ * A retained descriptor is reusable as Marten's packet sink only when Android
+ * has published the exact fail-closed VPN generation that owns it.
+ *
+ * Builder.establish() can replace the framework VPN network before the old
+ * ParcelFileDescriptor becomes invalid. A unique address marker, rather than
+ * the reusable startup/retirement kind, prevents a stale Network of the same
+ * kind from authorizing a native restart or another VPN replacement.
+ */
+internal fun isFailClosedVpnBarrierReady(
+    retainedGeneration: FailClosedVpnGeneration?,
+    publishedMarkerAddresses: Set<String>,
+    tunRuntimeHealthy: Boolean,
+): Boolean =
+    retainedGeneration != null &&
+        retainedGeneration.markerAddress in publishedMarkerAddresses &&
+        tunRuntimeHealthy
+
+internal fun coreRecoveryRetryDelayMs(failedAttempts: Int): Long {
+    val exponentialStep = (failedAttempts.coerceAtLeast(1) - 1).coerceAtMost(5)
+    return (2_000L shl exponentialStep).coerceAtMost(60_000L)
+}
+
+/** Maps verbose in-memory recovery reasons to fixed privacy-safe diagnostics. */
+internal fun coreRecoveryReasonCategory(reason: String): String {
+    val normalized = reason.lowercase()
+    return when {
+        "runtime watchdog lost marten vpn" in normalized -> "vpn_ownership"
+        "verified route did not produce a healthy android tun" in normalized -> "tun_health"
+        "network route recovery" in normalized -> "network_route"
+        "native" in normalized && "reset" in normalized -> "native_reset"
+        "native startup route" in normalized ||
+            "selected-route" in normalized ||
+            "selected server unavailable" in normalized -> "startup_route"
+        "route watchdog" in normalized -> "route_watchdog"
+        "local core runtime" in normalized -> "core_runtime"
+        "core did not start" in normalized || "core remained starting" in normalized -> "core_start"
+        else -> "unknown"
+    }
+}
 
 internal fun isCoreRuntimeHealthy(coreState: CoreStates?): Boolean = coreState == CoreStates.STARTED
 
@@ -104,6 +161,36 @@ internal fun isCurrentNetworkRouteProof(
 
 internal fun shouldEscalateRouteRecovery(failedChecks: Int, threshold: Int): Boolean =
     failedChecks >= threshold
+
+/**
+ * Keeps a stable, already verified VPN user-visible while one periodic proof
+ * has a transient failure but the same healthy TUN is still carrying traffic.
+ *
+ * This grace is deliberately one-shot. A second check, an already degraded
+ * route, a missing proof, or an unhealthy/idle TUN must use the normal
+ * fail-closed degradation path.
+ */
+internal fun shouldPreserveVerifiedRouteAfterTransientProbeFailure(
+    platformStarted: Boolean,
+    routeAlreadyDegraded: Boolean,
+    priorFailedChecks: Int,
+    currentProofAvailable: Boolean,
+    tunHealthy: Boolean,
+    tunTrafficAdvanced: Boolean,
+): Boolean =
+    platformStarted &&
+        !routeAlreadyDegraded &&
+        priorFailedChecks == 0 &&
+        currentProofAvailable &&
+        tunHealthy &&
+        tunTrafficAdvanced
+
+/** Publishes recovery only for hard evidence or a confirmed failure count. */
+internal fun shouldPublishRouteRecoveryStatus(
+    failedChecks: Int,
+    recoveryThreshold: Int,
+    hardFailure: Boolean,
+): Boolean = hardFailure || shouldEscalateRouteRecovery(failedChecks, recoveryThreshold)
 
 internal data class TunInterfaceState(
     val name: String,
@@ -181,15 +268,21 @@ internal fun shouldRecoverUnverifiedRunningCore(
     coreState == CoreStates.STARTED &&
     elapsedMs >= timeoutMs
 
-internal fun shouldFailStalledCoreRecovery(
+/**
+ * Applies one deadline to the whole continuously-online recovery generation.
+ * Individual native attempts and their backoff must never renew this budget.
+ * A missing physical network is parked separately on Android's network callback
+ * and therefore does not consume or expire the online recovery window.
+ */
+internal fun shouldTerminateExpiredCoreRecovery(
     recoveryInProgress: Boolean,
     userSessionActive: Boolean,
-    coreState: CoreStates?,
+    underlyingNetworkAvailable: Boolean,
     elapsedMs: Long,
     timeoutMs: Long,
 ): Boolean = recoveryInProgress &&
     userSessionActive &&
-    coreState != CoreStates.STARTED &&
+    underlyingNetworkAvailable &&
     elapsedMs >= timeoutMs
 
 internal fun isLiveTurncoatCarrier(

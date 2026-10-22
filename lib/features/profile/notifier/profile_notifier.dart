@@ -60,6 +60,7 @@ class AddProfileNotifier extends _$AddProfileNotifier with AppLogger {
   Future<void> addClipboard(String rawInput) async {
     if (state.isLoading) return;
     state = const AsyncLoading();
+    final token = _cancelToken = CancelToken();
     state = await AsyncValue.guard(() async {
       final profilesRepo = await ref.read(profileRepositoryProvider.future);
       final markAsActive = await _shouldMarkImportedProfileActive();
@@ -73,20 +74,21 @@ class AddProfileNotifier extends _$AddProfileNotifier with AppLogger {
           task = profilesRepo.upsertRemote(
             rs.url,
             userOverride: userOverride,
-            cancelToken: _cancelToken = CancelToken(),
+            cancelToken: token,
             markAsActive: markAsActive,
           );
         } else {
           loggy.debug("adding wrapped local profile content, mark as active? [$markAsActive]");
           task = profilesRepo.addLocal(
             safeDecodeBase64(rs.url),
+            cancelToken: token,
             userOverride: userOverride,
             markAsActive: markAsActive,
           );
         }
       } else {
         loggy.debug("adding profile, content, mark as active? [$markAsActive]");
-        task = profilesRepo.addLocal(safeDecodeBase64(rawInput), markAsActive: markAsActive);
+        task = profilesRepo.addLocal(safeDecodeBase64(rawInput), markAsActive: markAsActive, cancelToken: token);
       }
       return await task
           .match(
@@ -106,10 +108,16 @@ class AddProfileNotifier extends _$AddProfileNotifier with AppLogger {
   Future<void> addManual({required String url, required UserOverride userOverride}) async {
     if (state.isLoading) return;
     state = const AsyncLoading();
+    final token = _cancelToken = CancelToken();
     state = await AsyncValue.guard(() async {
       final profilesRepo = await ref.read(profileRepositoryProvider.future);
       final markAsActive = await _shouldMarkImportedProfileActive();
-      final task = profilesRepo.upsertRemote(url, userOverride: userOverride, markAsActive: markAsActive);
+      final task = profilesRepo.upsertRemote(
+        url,
+        userOverride: userOverride,
+        markAsActive: markAsActive,
+        cancelToken: token,
+      );
       return await task
           .match(
             (err) {
@@ -161,7 +169,10 @@ class UpdateProfileNotifier extends _$UpdateProfileNotifier with AppLogger {
       if (next case AsyncError(:final error)) {
         ref
             .read(inAppNotificationControllerProvider)
-            .showErrorToast(t.presentShortError(error, action: t.pages.profiles.msg.update.failure), filled: true);
+            .showErrorToast(
+              presentProfileUpdateError(t, error, action: t.pages.profiles.msg.update.failure),
+              filled: true,
+            );
       }
     });
     return const AsyncData(null);

@@ -31,6 +31,7 @@ void main() {
               name: 'Family VPN',
               url: 'https://edge.example.com/sub/token',
               lastUpdate: DateTime.utc(2026, 7, 14),
+              revision: 0,
               expire: expiresAt,
             ).toEntity()
             as RemoteProfileEntity;

@@ -96,6 +96,41 @@ class PlatformSettingsHandler : FlutterPlugin, MethodChannel.MethodCallHandler, 
     @SuppressLint("BatteryLife")
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
         when (call.method) {
+            "get_crash_diagnostics" -> {
+                result.success(app.marten.client.crashreporting.EarlyCrashReports.snapshot(Application.application))
+            }
+            "set_crash_reporting_phase" -> {
+                app.marten.client.crashreporting.EarlyCrashReports.notePhase(Application.application, call.arguments as? String ?: "unknown")
+                result.success(null)
+            }
+            "discard_early_crash_reports" -> {
+                app.marten.client.crashreporting.EarlyCrashReports.clear(Application.application)
+                result.success(null)
+            }
+            "get_local_crash_directory" -> {
+                result.success(java.io.File(app.marten.client.crashreporting.EarlyCrashReports.directory(Application.application), "flutter").path)
+            }
+            "is_crash_reporting_admitted" -> {
+                result.success(app.marten.client.crashreporting.NativeCrashDiagnostics.isNetworkAdmissionAllowed() &&
+                    app.marten.client.bg.BoxService.hasVerifiedRouteForOptionalBackgroundWork())
+            }
+            "read_early_crash_reports" -> {
+                result.success(app.marten.client.crashreporting.EarlyCrashReports.read(Application.application))
+            }
+            "acknowledge_early_crash_reports" -> {
+                app.marten.client.crashreporting.EarlyCrashReports.acknowledge(Application.application,
+                    (call.arguments as? List<*>)?.filterIsInstance<String>().orEmpty())
+                result.success(null)
+            }
+            "mark_crash_reporting_ready" -> {
+                app.marten.client.crashreporting.EarlyCrashReports.markSdkReady(Application.application)
+                result.success(null)
+            }
+            "set_core_crash_reporting" -> {
+                app.marten.client.crashreporting.EarlyCrashReports.setCollectionEnabled(Application.application, call.arguments == true)
+                app.marten.client.bg.RemoteMobile.updateCrashReporting(call.arguments as? Boolean ?: false)
+                result.success(null)
+            }
             Trigger.IsIgnoringBatteryOptimizations.method -> {
                 result.runCatching {
                     success(

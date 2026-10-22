@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:marten/core/db/provider/db_providers.dart';
 import 'package:marten/core/device/device_identity.dart';
@@ -9,6 +10,7 @@ import 'package:marten/features/profile/data/profile_path_resolver.dart';
 import 'package:marten/features/profile/data/profile_repository.dart';
 import 'package:marten/features/settings/data/config_option_data_providers.dart';
 import 'package:marten/martencore/marten_core_service_provider.dart';
+import 'package:marten_native_resume/marten_native_resume.dart';
 import 'package:riverpod_annotation/riverpod_annotation.dart';
 
 part 'profile_data_providers.g.dart';
@@ -23,6 +25,10 @@ Future<ProfileRepository> profileRepository(Ref ref) async {
     readConfigOptionRepository: () => ref.read(configOptionRepositoryProvider),
     profileParser: ref.watch(profileParserProvider),
     deviceIdentity: deviceIdentity,
+    canonicalizeSubscription: !kIsWeb && defaultTargetPlatform == TargetPlatform.android
+        ? ({required content, required settingsJson}) =>
+              MartenNativeResume.canonicalizeSubscription(content: content, settingsJson: settingsJson)
+        : null,
   );
   await repo.init().getOrElse((l) => throw l).run();
   return repo;
@@ -35,7 +41,10 @@ ProfileDataSource profileDataSource(Ref ref) {
 
 @Riverpod(keepAlive: true)
 ProfilePathResolver profilePathResolver(Ref ref) {
-  return ProfilePathResolver(ref.watch(appDirectoriesProvider).requireValue.workingDir);
+  return ProfilePathResolver.forDirectories(
+    ref.watch(appDirectoriesProvider).requireValue,
+    isIOS: !kIsWeb && defaultTargetPlatform == TargetPlatform.iOS,
+  );
 }
 
 @Riverpod(keepAlive: true)

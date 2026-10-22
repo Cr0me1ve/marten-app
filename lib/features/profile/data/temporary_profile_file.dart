@@ -11,6 +11,7 @@ TaskEither<ProfileFailure, T> withTemporaryProfileFile<T>(
 ) {
   return TaskEither(() async {
     try {
+      await file.parent.create(recursive: true);
       return await operation().run();
     } catch (error, stackTrace) {
       return left(ProfileFailure.unexpected(error, stackTrace));

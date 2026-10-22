@@ -115,7 +115,7 @@ void main() {
       final driver = between(script, "post('driver-installed')", 'var autoClickInterval = setInterval');
       final attempt = between(script, 'function attemptAutoClick()', 'var autoClickInterval = setInterval');
 
-      expect(driver, matches(RegExp(r'maxRetries\s*=\s*1\b')));
+      expect(driver, contains('var maxRetries = window.__martenCaptchaHostReplayUsed ? 0 : 1;'));
       expect(driver, contains('var retries = readRetryCount();'));
       expect(retryStorage, contains("window.sessionStorage.getItem(retryStorageKey) === '1' ? 1 : 0"));
       expect(retryStorage, contains("window.sessionStorage.setItem(retryStorageKey, '1')"));
@@ -236,10 +236,11 @@ void main() {
       }
     });
 
-    test('failed core marker closes the pending captcha before prefix matching and permits a fresh URL', () {
+    test('terminal core markers are revision-aware, ignore stale terminals, and permit a fresh required event', () {
       final notifier = File('lib/features/captcha/data/captcha_notifier.dart').readAsStringSync();
       final classify = between(notifier, '_CaptchaCandidate? _classify(String text)', 'String? _extractUrl(');
       final onLogs = between(notifier, 'void _onLogs(List<pb.LogMessage> events)', 'int _nextLogStartIndex(');
+      final terminalMatches = between(notifier, 'bool _terminalMatches(', 'int _nextLogStartIndex(');
 
       final failed = classify.indexOf('if (text.contains(_captchaFailedMarker))');
       final resolved = classify.indexOf('if (text.contains(_captchaDoneMarker))');
@@ -247,17 +248,42 @@ void main() {
       expect(failed, greaterThanOrEqualTo(0));
       expect(resolved, greaterThan(failed));
       expect(generic, greaterThan(resolved));
-      expect(classify, contains('return const _CaptchaCandidate(done: true, failed: true);'));
 
-      expect(onLogs, contains('if (done) {'));
+      // A terminal event from an old attempt must not close the active
+      // challenge. Every terminal marker, including unversioned legacy ones,
+      // must match the exact active revision before it can clear state.
+      expect(onLogs, contains('candidate.revision'));
+      expect(onLogs, contains('_terminalMatches(candidate.revision, current?.revision)'));
+      expect(terminalMatches, contains('return terminalRevision == activeRevision;'));
+      expect(onLogs, contains(r'ignoring stale captcha terminal revision=${candidate.revision}'));
       expect(onLogs, contains('state = null;'));
-      expect(onLogs, contains('if (url != null && url != state?.url)'));
-      expect(onLogs, contains('state = CaptchaEvent(url: url, createdAt: DateTime.now());'));
+      expect(onLogs, contains('state = CaptchaEvent('));
+      expect(onLogs, contains('revision: candidate.revision'));
       expect(
-        onLogs.indexOf('if (url != null && url != state?.url)'),
-        greaterThan(onLogs.indexOf('if (done) {')),
-        reason: 'a later fresh captcha URL must be accepted after the FAILED terminal event clears pending state',
+        onLogs,
+        isNot(contains('if (done) {')),
+        reason: 'ordered event handling must not collapse terminal and required events into a URL-only aggregate',
       );
+    });
+
+    test('app CAPTCHA lifecycle diagnostics retain revision but not challenge data', () {
+      final sources = [
+        sourceFile(),
+        File('lib/features/captcha/widget/captcha_listener.dart').readAsStringSync(),
+        File('lib/features/captcha/data/captcha_notifier.dart').readAsStringSync(),
+      ].join('\n');
+
+      expect(sources, contains('MARTEN_CAPTCHA_LIFECYCLE'));
+      for (final event in const ['listener', 'load', 'clear', 'automation']) {
+        expect(sources, contains('event=$event'));
+      }
+      expect(sources, contains('revision='));
+      for (final line in sources.split('\n').where((line) => line.contains('MARTEN_CAPTCHA_LIFECYCLE'))) {
+        final normalized = line.toLowerCase();
+        for (final forbidden in const ['url', 'token', 'cookie', 'script', 'exception']) {
+          expect(normalized, isNot(contains(forbidden)), reason: 'app lifecycle format leaked `$forbidden`: $line');
+        }
+      }
     });
   });
 }

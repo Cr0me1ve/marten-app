@@ -7,6 +7,7 @@ import 'dart:math' as math;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
+import 'package:marten/core/network/strict_vpn_egress_gate.dart';
 import 'package:marten/core/preferences/preferences_provider.dart';
 import 'package:marten/features/profile/data/profile_data_providers.dart';
 import 'package:marten/features/profile/notifier/active_profile_notifier.dart';
@@ -71,7 +72,7 @@ final localOutboundsByProfileProvider = FutureProvider.family<List<LocalOutbound
   // a different profile becomes active.
   ref.watch(activeProfileProvider);
   final repo = await ref.watch(profileRepositoryProvider.future);
-  final raw = await repo.getRawConfig(profileId).run().then((e) => e.getOrElse((_) => ''));
+  final raw = await repo.getRawConfig(profileId).run().then((e) => e.getOrElse((failure) => throw failure));
   return parseLocalOutboundsResponsively(raw);
 });
 
@@ -730,7 +731,7 @@ String? firstNonEmptyString(Iterable<Object?> values) {
   return null;
 }
 
-/// Strip marten-server metadata markers like ` §id:abc123§` from a raw tag,
+/// Strip subscription metadata markers like ` §id:abc123§` from a raw tag,
 /// returning a clean display name.
 String stripTagMetadata(String tag) {
   final idx = tag.indexOf('§');
@@ -1049,12 +1050,17 @@ class LocalPingNotifier extends Notifier<Map<String, Map<String, int>>> with Inf
   @override
   Map<String, Map<String, int>> build() => const {};
 
-  final Map<String, Object> _activeRuns = {};
+  final Map<String, _LocalPingRun> _activeRuns = {};
   final _scheduler = _LocalPingScheduler(_maxConcurrentPings);
+  Future<void>? _nativeProbeRetirement;
+  bool _nativeProbeRetirementKeepsBlocked = false;
 
   void clear(String profileId) {
     if (profileId.isEmpty) return;
-    _activeRuns.remove(profileId);
+    final activeRun = _activeRuns.remove(profileId);
+    if (activeRun != null) {
+      unawaited(_retireRun(activeRun, keepNativeAdmissionBlocked: false));
+    }
     if (!state.containsKey(profileId)) return;
     final next = Map<String, Map<String, int>>.from(state)..remove(profileId);
     state = Map<String, Map<String, int>>.unmodifiable(next);
@@ -1074,14 +1080,38 @@ class LocalPingNotifier extends Notifier<Map<String, Map<String, int>>> with Inf
     String profileId,
     List<LocalOutbound> outbounds, {
     LocalPingMode mode = LocalPingMode.preConnect,
+  }) {
+    final run = _LocalPingRun();
+    return strictVpnEgressGate
+        .run(
+          'local outbound probes',
+          () => _pingAllAdmitted(profileId, run, outbounds, mode: mode),
+          retire: () => _retireRun(run, keepNativeAdmissionBlocked: true),
+        )
+        .onError((error, stackTrace) {
+          // A Ping button press can race Connect/Disconnect after the widget
+          // observed the previous state. The strict gate already provided the
+          // required fail-closed behavior; this expected cancellation must not
+          // escape to PlatformDispatcher/Crashlytics.
+          if (error is StrictVpnEgressSealedException) return;
+          Error.throwWithStackTrace(error ?? StateError('local outbound probe failed without an error'), stackTrace);
+        });
+  }
+
+  Future<void> _pingAllAdmitted(
+    String profileId,
+    _LocalPingRun run,
+    List<LocalOutbound> outbounds, {
+    required LocalPingMode mode,
   }) async {
     if (profileId.isEmpty || _activeRuns.containsKey(profileId)) return;
-    final run = Object();
     _activeRuns[profileId] = run;
     try {
       _replaceProfileResults(profileId, {for (final outbound in outbounds) outbound.tag: 0});
       await Future.wait(
-        outbounds.map((outbound) => _scheduler.schedule(profileId, () => _pingOne(profileId, run, outbound, mode))),
+        outbounds.map(
+          (outbound) => _scheduler.schedule(run, profileId, () => _pingOne(profileId, run, outbound, mode)),
+        ),
       );
     } finally {
       if (identical(_activeRuns[profileId], run)) {
@@ -1090,9 +1120,52 @@ class LocalPingNotifier extends Notifier<Map<String, Map<String, int>>> with Inf
     }
   }
 
-  Future<void> _pingOne(String profileId, Object run, LocalOutbound o, LocalPingMode mode) async {
-    final delay = await _measure(o, mode);
-    if (identical(_activeRuns[profileId], run)) {
+  Future<void> _retireRun(_LocalPingRun run, {required bool keepNativeAdmissionBlocked}) async {
+    run.cancel();
+    _scheduler.cancel(run);
+    if (!run.nativeProbeStarted) return;
+
+    final activeRetirement = _nativeProbeRetirement;
+    if (activeRetirement != null) {
+      if (!keepNativeAdmissionBlocked || _nativeProbeRetirementKeepsBlocked) {
+        return activeRetirement;
+      }
+      // Upgrade an overlapping profile-clear cancellation to the stronger VPN
+      // transition state after its exact join, without polling or a timer.
+      final upgraded = activeRetirement.then(
+        (_) => _martenMethodChannel.invokeMethod<void>('cancel_local_probes', {'keepBlocked': true}),
+      );
+      _nativeProbeRetirement = upgraded;
+      _nativeProbeRetirementKeepsBlocked = true;
+      try {
+        await upgraded;
+      } finally {
+        if (identical(_nativeProbeRetirement, upgraded)) {
+          _nativeProbeRetirement = null;
+          _nativeProbeRetirementKeepsBlocked = false;
+        }
+      }
+      return;
+    }
+    final retirement = _martenMethodChannel.invokeMethod<void>('cancel_local_probes', {
+      'keepBlocked': keepNativeAdmissionBlocked,
+    });
+    _nativeProbeRetirement = retirement;
+    _nativeProbeRetirementKeepsBlocked = keepNativeAdmissionBlocked;
+    try {
+      await retirement;
+    } finally {
+      if (identical(_nativeProbeRetirement, retirement)) {
+        _nativeProbeRetirement = null;
+        _nativeProbeRetirementKeepsBlocked = false;
+      }
+    }
+  }
+
+  Future<void> _pingOne(String profileId, _LocalPingRun run, LocalOutbound o, LocalPingMode mode) async {
+    if (run.isCancelled) return;
+    final delay = await _measure(run, o, mode);
+    if (!run.isCancelled && identical(_activeRuns[profileId], run)) {
       _record(profileId, o.tag, delay);
     }
   }
@@ -1106,17 +1179,20 @@ class LocalPingNotifier extends Notifier<Map<String, Map<String, int>>> with Inf
     _replaceProfileResults(profileId, {...profileResults, tag: delay});
   }
 
-  Future<int> _measure(LocalOutbound o, LocalPingMode mode) async {
+  Future<int> _measure(_LocalPingRun run, LocalOutbound o, LocalPingMode mode) async {
+    if (run.isCancelled) return -1;
     if (mode == LocalPingMode.connectedRoute) {
-      return _measureConnectedRoute(o);
+      return _measureConnectedRoute(run, o);
     }
     if (localOutboundUsesICMPEchoPing(o)) {
+      run.nativeProbeStarted = true;
       return nativeICMPEchoProbe(o.server);
     }
     if (o.usesTurncoat) {
-      return scaledTurncoatPingDelay(await _tcpProbeTurncoat(o));
+      return scaledTurncoatPingDelay(await _tcpProbeTurncoat(run, o));
     }
     if (localOutboundUsesServerPortPing(o)) {
+      run.nativeProbeStarted = true;
       return nativeTLSHandshakeProbe(
         o.server,
         o.serverPort,
@@ -1125,63 +1201,88 @@ class LocalPingNotifier extends Notifier<Map<String, Map<String, int>>> with Inf
       );
     }
     if (o.tunnelPingUrl != null && o.tunnelPingUrl!.isNotEmpty) {
-      final delay = await _httpTunnelPing(o.tunnelPingUrl!);
+      final delay = await _httpTunnelPing(run, o.tunnelPingUrl!);
       if (delay >= 0) return delay;
     }
-    return _tcpProbe(o.server, o.serverPort);
+    return _tcpProbe(run, o.server, o.serverPort);
   }
 
-  Future<int> _measureConnectedRoute(LocalOutbound o) async {
+  Future<int> _measureConnectedRoute(_LocalPingRun run, LocalOutbound o) async {
     if (o.tunnelPingUrl != null && o.tunnelPingUrl!.isNotEmpty) {
-      final delay = await _httpTunnelPing(o.tunnelPingUrl!);
+      final delay = await _httpTunnelPing(run, o.tunnelPingUrl!);
       if (delay >= 0) return delay;
     }
     if (o.server.trim().isNotEmpty && o.serverPort > 0) {
-      final delay = await _tcpProbe(o.server, o.serverPort);
+      final delay = await _tcpProbe(run, o.server, o.serverPort);
       if (delay >= 0 || !o.usesTurncoat) return delay;
     }
     if (o.usesTurncoat) {
-      return scaledTurncoatPingDelay(await _tcpProbeTurncoat(o));
+      return scaledTurncoatPingDelay(await _tcpProbeTurncoat(run, o));
     }
     return -1;
   }
 
-  Future<int> _tcpProbe(String host, int port) async {
-    if (host.isEmpty || port <= 0) return -1;
+  Future<int> _tcpProbe(_LocalPingRun run, String host, int port) async {
+    if (run.isCancelled || host.isEmpty || port <= 0) return -1;
     final sw = Stopwatch()..start();
+    ConnectionTask<Socket>? connectionTask;
+    Socket? socket;
     try {
-      final socket = await Socket.connect(host, port, timeout: _pingTimeout);
+      connectionTask = await Socket.startConnect(host, port);
+      if (run.isCancelled) {
+        connectionTask.cancel();
+        return -1;
+      }
+      run.connectionTasks.add(connectionTask);
+      socket = await connectionTask.socket.timeout(
+        _pingTimeout,
+        onTimeout: () {
+          connectionTask?.cancel();
+          throw TimeoutException('local TCP probe timed out');
+        },
+      );
+      run.connectionTasks.remove(connectionTask);
+      if (run.isCancelled) return -1;
+      run.sockets.add(socket);
       sw.stop();
-      socket.destroy();
       return sw.elapsedMilliseconds;
     } catch (err, st) {
       loggy.debug('tcp ping failed [$host:$port]', err, st);
       return -1;
+    } finally {
+      if (connectionTask != null) run.connectionTasks.remove(connectionTask);
+      if (socket != null) {
+        run.sockets.remove(socket);
+        socket.destroy();
+      }
     }
   }
 
-  Future<int> _tcpProbeTurncoat(LocalOutbound o) async {
+  Future<int> _tcpProbeTurncoat(_LocalPingRun run, LocalOutbound o) async {
     var hasCallUrl = false;
     for (final raw in o.callUrls) {
+      if (run.isCancelled) return -1;
       final endpoint = turncoatPingEndpointFromUrl(raw);
       if (endpoint == null) continue;
       hasCallUrl = true;
-      final delay = await _tcpProbe(endpoint.host, endpoint.port);
+      final delay = await _tcpProbe(run, endpoint.host, endpoint.port);
       if (delay >= 0) return delay;
     }
     if (hasCallUrl) return -1;
-    return _tcpProbe(o.server, o.serverPort);
+    return _tcpProbe(run, o.server, o.serverPort);
   }
 
-  Future<int> _httpTunnelPing(String url) async {
+  Future<int> _httpTunnelPing(_LocalPingRun run, String url) async {
     final uri = Uri.tryParse(url);
-    if (uri == null) return -1;
+    if (run.isCancelled || uri == null) return -1;
     HttpClient? client;
     final sw = Stopwatch()..start();
     try {
       client = HttpClient()
         ..connectionTimeout = _pingTimeout
         ..idleTimeout = const Duration(seconds: 1);
+      run.httpClients.add(client);
+      if (run.isCancelled) return -1;
       final req = await client.getUrl(uri).timeout(_pingTimeout);
       final resp = await req.close().timeout(_pingTimeout);
       final body = await utf8.decoder.bind(resp).join().timeout(_pingTimeout);
@@ -1199,6 +1300,7 @@ class LocalPingNotifier extends Notifier<Map<String, Map<String, int>>> with Inf
       loggy.debug('http tunnel ping failed (${error.runtimeType})');
       return -1;
     } finally {
+      if (client != null) run.httpClients.remove(client);
       client?.close(force: true);
     }
   }
@@ -1214,11 +1316,23 @@ class _LocalPingScheduler {
   int _active = 0;
   String? _lastProfileId;
 
-  Future<void> schedule(String profileId, Future<void> Function() task) {
+  Future<void> schedule(_LocalPingRun owner, String profileId, Future<void> Function() task) {
     final completer = Completer<void>();
-    (_queues[profileId] ??= Queue<_ScheduledPing>()).add(_ScheduledPing(task, completer));
+    (_queues[profileId] ??= Queue<_ScheduledPing>()).add(_ScheduledPing(owner, task, completer));
     _drain();
     return completer.future;
+  }
+
+  void cancel(_LocalPingRun owner) {
+    for (final profileId in _queues.keys.toList(growable: false)) {
+      final queue = _queues[profileId]!;
+      final cancelled = queue.where((scheduled) => identical(scheduled.owner, owner)).toList(growable: false);
+      queue.removeWhere((scheduled) => identical(scheduled.owner, owner));
+      for (final scheduled in cancelled) {
+        if (!scheduled.completer.isCompleted) scheduled.completer.complete();
+      }
+      if (queue.isEmpty) _queues.remove(profileId);
+    }
   }
 
   void _drain() {
@@ -1246,10 +1360,36 @@ class _LocalPingScheduler {
 }
 
 class _ScheduledPing {
-  const _ScheduledPing(this.task, this.completer);
+  const _ScheduledPing(this.owner, this.task, this.completer);
 
+  final _LocalPingRun owner;
   final Future<void> Function() task;
   final Completer<void> completer;
+}
+
+final class _LocalPingRun {
+  bool isCancelled = false;
+  bool nativeProbeStarted = false;
+  final Set<ConnectionTask<Socket>> connectionTasks = <ConnectionTask<Socket>>{};
+  final Set<Socket> sockets = <Socket>{};
+  final Set<HttpClient> httpClients = <HttpClient>{};
+
+  void cancel() {
+    if (isCancelled) return;
+    isCancelled = true;
+    for (final task in connectionTasks.toList(growable: false)) {
+      task.cancel();
+    }
+    connectionTasks.clear();
+    for (final socket in sockets.toList(growable: false)) {
+      socket.destroy();
+    }
+    sockets.clear();
+    for (final client in httpClients.toList(growable: false)) {
+      client.close(force: true);
+    }
+    httpClients.clear();
+  }
 }
 
 int scaledTurncoatPingDelay(int delay, {double? randomFraction}) {
